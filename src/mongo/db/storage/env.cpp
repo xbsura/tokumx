@@ -237,7 +237,7 @@ namespace mongo {
                 } else if (str == "none") {
                     compression = TOKU_NO_COMPRESSION;
                 } else {
-                    uassert(16442, "compression must be one of: lzma, quicklz, zlib, none.", false);
+                    uassert(16806, "compression must be one of: lzma, quicklz, zlib, none.", false);
                 }
                 TOKULOG(1) << "db " << name << ", using compression method \"" << str << "\"" << endl;
             }
@@ -305,7 +305,7 @@ namespace mongo {
         void db_remove(const string &name) {
             int r = env->dbremove(env, cc().txn().db_txn(), name.c_str(), NULL, 0);
             if (r == ENOENT) {
-                uasserted(16444, "TODO: dbremove bug, should crash but won't right now");
+                uasserted(16807, "TODO: dbremove bug, should crash but won't right now");
             }
             if (r != 0) {
                 handle_ydb_error(r);
