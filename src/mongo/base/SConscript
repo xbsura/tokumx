@@ -4,6 +4,7 @@ Import("env")
 
 env.StaticLibrary('base', ['initializer_dependency_graph.cpp',
                            'make_string_vector.cpp',
+                           'parse_number.cpp',
                            'status.cpp'])
 
 env.CppUnitTest('initializer_dependency_graph_test',
