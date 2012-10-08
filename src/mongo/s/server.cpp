@@ -45,6 +45,7 @@
 #include "cursors.h"
 #include "shard_version.h"
 #include "../util/processinfo.h"
+#include "mongo/db/fail_point_service.h"
 #include "mongo/db/lasterror.h"
 #include "mongo/util/stacktrace.h"
 
@@ -445,6 +446,10 @@ int _main(int argc, char* argv[]) {
             out() << "configdb: " << e.what() << endl;
             return 9;
         }
+    }
+
+    if (params.count("enableFaultInjection")) {
+        enableFailPointCmd();
     }
 
 #if defined(_WIN32)

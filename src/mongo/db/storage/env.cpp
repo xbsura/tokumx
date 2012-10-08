@@ -222,7 +222,7 @@ namespace mongo {
             e = info["pageSize"];
             if (e.ok() && !e.isNull()) {
                 pageSize = e.numberInt();
-                uassert(16445, "pageSize must be a number > 0.", e.isNumber () && pageSize > 0);
+                uassert(16808, "pageSize must be a number > 0.", e.isNumber () && pageSize > 0);
                 TOKULOG(1) << "db " << name << ", using page size " << pageSize << endl;
             }
             e = info["compression"];
