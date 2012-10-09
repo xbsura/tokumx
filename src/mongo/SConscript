@@ -72,6 +72,12 @@ env.StaticLibrary('bson', [
 env.CppUnitTest('safe_num_test', ['util/safe_num_test.cpp'],
                 LIBDEPS=['bson'])
 
+env.CppUnitTest('string_map_test', ['util/string_map_test.cpp'],
+                LIBDEPS=['bson','foundation'])
+
+env.CppUnitTest('bson_validate_test', ['bson/bson_validate_test.cpp'],
+                LIBDEPS=['bson'])
+
 commonFiles = [ "pch.cpp",
                 "buildinfo.cpp",
                 "db/hasher.cpp",
