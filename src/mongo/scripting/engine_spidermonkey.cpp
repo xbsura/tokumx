@@ -1364,6 +1364,10 @@ namespace mongo {
         globalScriptEngine = globalSMEngine;
     }
 
+    std::string ScriptEngine::getInterpreterVersionString() {
+        return "SpiderMonkey 1.7";
+    }
+
 
     // ------ scope ------
 
