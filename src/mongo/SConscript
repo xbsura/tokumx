@@ -432,15 +432,6 @@ env.StaticLibrary("notmongodormongos", everythingButMongodAndMongosFiles)
 
 mongodOnlyFiles = [ "db/db.cpp", "db/commands/touch.cpp" ]
 
-# create a library per module, and add it as a dependency
-# for the mongod target; as of now, modules are only included
-# in mongod, as though they were part of serverOnlyFiles
-modules = []
-for modName, modSources in env["MONGO_MODULES"].items():
-    libName = "mod%s" % modName
-    env.StaticLibrary(libName, modSources)
-    modules.append(libName)
-
 # ----- TARGETS ------
 
 env.StaticLibrary("gridfs", "client/gridfs.cpp")
@@ -460,7 +451,7 @@ mongod = env.Install(
                                 "mongodandmongos",
                                 "ntservice",
                                 "serveronly",
-                                ] + modules ) )
+                                ] + env['MODULE_LIBDEPS_MONGOD'] ) )
 Default( mongod )
 
 # tools
@@ -490,7 +481,7 @@ env.Install( '#/', [
 mongos = env.Program(
     "mongos", [ "s/server.cpp"] , LIBS=tokulibs,
     LIBDEPS=["mongoscore", "coreserver", "coredb", "mongocommon", "coreshard", "dbcmdline", "ntservice",
-             "mongodandmongos", "db/auth/auth"])
+             "mongodandmongos", "db/auth/auth"] + env['MODULE_LIBDEPS_MONGOS'])
 env.Install( '#/', mongos )
 
 env.Library("clientandshell", ["client/authentication_table_client.cpp",
@@ -557,7 +548,7 @@ if shellEnv is not None:
         "mongo",
         coreShellFiles,
         LIBDEPS=["coreserver", "clientandshell",
-                 "$BUILD_DIR/third_party/pcrecpp"] )
+                 "$BUILD_DIR/third_party/pcrecpp"] + env['MODULE_LIBDEPS_MONGOSHELL'] )
 
     shellEnv.Install( '#/', mongo_shell )
 
