@@ -198,7 +198,8 @@ env.StaticLibrary("coredb", [
         "db/storage/env.cpp",
         "db/storage/key.cpp",
         "s/shardconnection.cpp",
-        ])
+        ],
+                  LIBDEPS=['db/auth/serverauth'])
 
 coreServerFiles = [ "db/common.cpp",
                     "util/net/miniwebserver.cpp",

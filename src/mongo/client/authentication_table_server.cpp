@@ -22,7 +22,7 @@
 namespace mongo {
 
     bool AuthenticationTable::_shouldSendInternalSecurityTable() const {
-        if (!ClientBasic::hasCurrent() || !ClientBasic::getCurrent()->getAuthenticationInfo()) {
+        if (!ClientBasic::getCurrent() || !ClientBasic::getCurrent()->getAuthenticationInfo()) {
             return false;
         }
         return ClientBasic::getCurrent()->getAuthenticationInfo()->isSpecialLocalhostAdmin();
