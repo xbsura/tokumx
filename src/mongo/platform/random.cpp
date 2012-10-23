@@ -15,6 +15,8 @@
  *    limitations under the License.
  */
 
+#include "mongo/platform/basic.h"
+
 #include "mongo/platform/random.h"
 
 #include <cstdlib>
@@ -24,8 +26,6 @@
 #ifndef _WIN32
 #include <errno.h>
 #endif
-
-#include "mongo/platform/basic.h"
 
 namespace mongo {
 
