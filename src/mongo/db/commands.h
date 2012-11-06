@@ -20,8 +20,11 @@
 
 #include <db.h>
 
-#include "jsobj.h"
-#include "../util/mongoutils/str.h"
+#include <vector>
+
+#include "mongo/db/auth/privilege.h"
+#include "mongo/db/jsobj.h"
+#include "mongo/util/mongoutils/str.h"
 #include "mongo/db/opsettings.h"
 
 namespace mongo {
@@ -129,6 +132,14 @@ namespace mongo {
            (e.g., getnonce, authenticate) can be done by anyone even unauthorized.
         */
         virtual bool requiresAuth() { return true; }
+
+        /**
+         * Appends to "*out" the privileges required to run this command on database "dbname" with
+         * the invocation described by "cmdObj".
+         */
+        virtual void addRequiredPrivileges(const std::string& dbname,
+                                           const BSONObj& cmdObj,
+                                           std::vector<Privilege>* out);
 
         /* Return true if command should be permitted when a replica set secondary is in "recovering"
            (unreadable) state.

@@ -22,10 +22,13 @@
 
 #include <db.h>
 
-#include "jsobj.h"
-#include "commands.h"
-#include "client.h"
-#include "replutil.h"
+#include "mongo/db/commands.h"
+
+#include "mongo/db/auth/action_type.h"
+#include "mongo/db/auth/privilege.h"
+#include "mongo/db/client.h"
+#include "mongo/db/jsobj.h"
+#include "mongo/db/replutil.h"
 
 namespace mongo {
 
@@ -157,12 +160,24 @@ namespace mongo {
         return i->second;
     }
 
-
     Command::LockType Command::locktype( const string& name ) {
         Command * c = findCommand( name );
         if ( ! c )
             return WRITE;
         return c->locktype();
+    }
+
+
+    void Command::addRequiredPrivileges(const std::string& dbname,
+                                        const BSONObj& cmdObj,
+                                        std::vector<Privilege>* out) {
+        if (!requiresAuth()) {
+            return;
+        }
+        ActionSet actions;
+        actions.addAction(locktype() == WRITE ? ActionType::oldWrite : ActionType::oldRead);
+        Privilege privilege(adminOnly() ? "admin" : dbname, actions);
+        out->push_back(privilege);
     }
 
     void Command::logIfSlow( const Timer& timer, const string& msg ) {
