@@ -60,6 +60,7 @@ env.StaticLibrary('md5', [
         ])
 
 env.StaticLibrary('bson', [
+        'bson/util/bson_extract.cpp',
         'util/safe_num.cpp',
         'bson/oid.cpp',
         'db/nonce.cpp',
@@ -78,6 +79,8 @@ env.CppUnitTest('string_map_test', ['util/string_map_test.cpp'],
 
 env.CppUnitTest('bson_validate_test', ['bson/bson_validate_test.cpp'],
                 LIBDEPS=['bson'])
+
+env.CppUnitTest('bson_extract_test', ['bson/util/bson_extract_test.cpp'], LIBDEPS=['bson'])
 
 commonFiles = [ "pch.cpp",
                 "buildinfo.cpp",
