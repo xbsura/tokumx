@@ -83,8 +83,4 @@ namespace mongo {
     ClientBasic* ClientBasic::getCurrent() {
         return 0;
     }
-
-    bool ClientBasic::hasCurrent() {
-        return false;
-    }
 }
