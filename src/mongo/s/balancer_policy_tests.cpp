@@ -15,6 +15,8 @@
  */
 
 #include "mongo/unittest/unittest.h"
+#include "mongo/platform/random.h"
+#include "mongo/s/balancer_policy.h"
 #include "mongo/s/config.h"
 #include "mongo/s/balancer_policy.h"
 
@@ -346,28 +348,6 @@ namespace mongo {
             MigrateInfo* m = BalancerPolicy::balance( "ns", d, 0 );
             ASSERT( !m );
         }
-
-        // Note: Only in 2.2, 2.4 has utility class
-        class PseudoRandom {
-        public:
-
-            PseudoRandom(unsigned int seed) {
-                _seed = seed;
-            }
-
-            int nextInt32( int max = -1 ){
-
-#if !defined(_WIN32)
-                int r = rand_r( &_seed ) ;
-#else
-                int r = ::rand(); // seed not used in this case
-#endif
-                return max > 0 ? r % max : r;
-            }
-
-        private:
-            unsigned int _seed;
-        };
 
         /**
          * Idea behind this test is that we set up several shards, the first two of which are
