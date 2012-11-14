@@ -58,20 +58,6 @@ namespace {
         ASSERT_EQUALS(principal, authManager.checkAuthorization("otherDb", ActionType::insert));
     }
 
-    TEST(AuthorizationManagerTest, GrantInternalAuthorization) {
-        AuthExternalStateMock* externalState = new AuthExternalStateMock();
-        AuthorizationManager authManager(externalState);
-        authManager.initialize(NULL);
-
-        ASSERT_NULL(authManager.checkAuthorization("test", ActionType::insert));
-        ASSERT_NULL(authManager.checkAuthorization("test", ActionType::replSetHeartbeat));
-
-        authManager.grantInternalAuthorization();
-
-        ASSERT_NON_NULL(authManager.checkAuthorization("test", ActionType::insert));
-        ASSERT_NON_NULL(authManager.checkAuthorization("test", ActionType::replSetHeartbeat));
-    }
-
     TEST(AuthorizationManagerTest, GetPrivilegesFromPrivilegeDocument) {
         Principal* principal = new Principal("Spencer");
         BSONObj invalid;
