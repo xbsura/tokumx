@@ -50,7 +50,7 @@ namespace mongo {
             _authenticationSession.swap(other);
         }
         AuthorizationManager* getAuthorizationManager() {
-            massert(16481,
+            massert(16814,
                     "No AuthorizationManager has been set up for this connection",
                     _authorizationManager != NULL);
             return _authorizationManager.get();
@@ -58,7 +58,7 @@ namespace mongo {
         // setAuthorizationManager must be called in the initialization of any ClientBasic that
         // corresponds to an incoming client connection.
         void setAuthorizationManager(AuthorizationManager* authorizationManager) {
-            massert(16477,
+            massert(16815,
                     "An AuthorizationManager has already been set up for this connection",
                     _authorizationManager == NULL);
             _authorizationManager.reset(authorizationManager);

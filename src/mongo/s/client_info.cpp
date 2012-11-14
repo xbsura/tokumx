@@ -18,6 +18,7 @@
  */
 
 #include "pch.h"
+
 #include "server.h"
 #include "../util/scopeguard.h"
 #include "../db/commands.h"
@@ -84,7 +85,7 @@ namespace mongo {
         ShardConnection conn(shard, adminNs);
         AuthorizationManager* authManager = new AuthorizationManager(new AuthExternalStateImpl());
         Status status = authManager->initialize(conn.get());
-        massert(16479,
+        massert(16813,
                 mongoutils::str::stream() << "Error initializing AuthorizationManager: "
                                           << status.reason(),
                 status == Status::OK());
@@ -101,9 +102,18 @@ namespace mongo {
         return info;
     }
 
-    ClientInfo * ClientInfo::get() {
+    ClientInfo * ClientInfo::get(AbstractMessagingPort* messagingPort) {
         ClientInfo * info = _tlInfo.get();
-        massert(16811, "No ClientInfo exists for this thread", info);
+        if (!info) {
+            info = create(messagingPort);
+        }
+        massert(16811,
+                mongoutils::str::stream() << "AbstractMessagingPort was provided to ClientInfo::get"
+                        << " but differs from the one stored in the current ClientInfo object. "
+                        << "Current ClientInfo messaging port "
+                        << (info->port() ? "is not" : "is")
+                        << " NULL",
+                messagingPort == NULL || messagingPort == info->port());
         return info;
     }
 

@@ -65,7 +65,7 @@ namespace mongo {
             // as part of its initialization without needing auth.
             GodScope gs;
             Status status = authManager->initialize(new DBDirectClient());
-            massert(16480,
+            massert(16812,
                     mongoutils::str::stream() << "Error initializing AuthorizationManager: "
                                               << status.reason(),
                     status == Status::OK());
