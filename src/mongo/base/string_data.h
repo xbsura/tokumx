@@ -115,7 +115,7 @@ namespace mongo {
 
         size_t size() const { fillSize(); return _size; }
         bool empty() const { return size() == 0; }
-        string toString() const { return string(_data, size()); }
+        string toString() const { return string(data(), size()); }
         char operator[] ( unsigned pos ) const { return _data[pos]; }
 
     private:
