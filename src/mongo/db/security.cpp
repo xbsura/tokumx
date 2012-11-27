@@ -17,16 +17,17 @@
  *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#include "pch.h"
+#include "mongo/pch.h"
+
+#include "mongo/db/security.h"
 
 #include "mongo/db/auth/authorization_manager.h"
-#include "security.h"
-#include "security_common.h"
-#include "instance.h"
-#include "client.h"
-#include "curop.h"
-#include "db.h"
-#include "dbhelpers.h"
+#include "mongo/db/client.h"
+#include "mongo/db/curop.h"
+#include "mongo/db/db.h"
+#include "mongo/db/dbhelpers.h"
+#include "mongo/db/instance.h"
+#include "mongo/db/security_common.h"
 
 // this is the _mongod only_ implementation of security.h
 
@@ -122,33 +123,6 @@ namespace mongo {
         if ( !_hadTempAuthFromStart ) {
             _ai->clearTemporaryAuthorization();
         }
-    }
-
-    bool CmdAuthenticate::getUserObj(const string& dbname, const string& user, BSONObj& userObj, string& pwd) {
-        if (user == internalSecurity.user) {
-            uassert(15889, "key file must be used to log in with internal user",
-                    !cmdLine.keyFile.empty());
-            pwd = internalSecurity.pwd;
-        }
-        else {
-            string systemUsers = dbname + ".system.users";
-            {
-                Client::ReadContext tc(systemUsers, dbpath, false);
-                Client::Transaction txn(DB_TXN_SNAPSHOT | DB_TXN_READ_ONLY);
-
-                BSONObjBuilder b;
-                b << "user" << user;
-                BSONObj query = b.done();
-                if( !Helpers::findOne(systemUsers.c_str(), query, userObj) ) {
-                    log() << "auth: couldn't find user " << user << ", " << systemUsers << endl;
-                    return false;
-                }
-                txn.commit();
-            }
-
-            pwd = userObj.getStringField("pwd");
-        }
-        return true;
     }
 
     bool CmdLogout::run(const string& dbname , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
