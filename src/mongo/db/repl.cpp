@@ -49,6 +49,7 @@
 #include "ops/update.h"
 #include "pcrecpp.h"
 #include "mongo/db/instance.h"
+#include "mongo/db/server_parameters.h"
 #include "mongo/db/queryutil.h"
 
 namespace mongo {
@@ -193,8 +194,6 @@ namespace mongo {
             return true;
         }
     } cmdismaster;
-
-    extern unsigned replApplyBatchSize;
 
     void startReplSets(ReplSetCmdline*);
     void startReplication() {
