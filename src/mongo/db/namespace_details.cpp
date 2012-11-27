@@ -1043,6 +1043,10 @@ namespace mongo {
                 !idx_info["dropDups"].trueValue());
         uassert(12588, "cannot add index with a background operation in progress", !_indexBuildInProgress);
         uassert(12523, "no index name specified", idx_info["name"].ok());
+        uassert(16548,
+                mongoutils::str::stream() << "not authorized to create index on " << _ns,
+                cc().getAuthorizationManager()->checkAuthorization(_ns,
+                                                                   ActionType::ensureIndex));
 
         const string &name = idx_info["name"].String();
         if (findIndexByName(name.c_str()) >= 0) {

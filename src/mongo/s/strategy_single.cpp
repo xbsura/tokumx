@@ -117,7 +117,15 @@ namespace mongo {
             BSONObjBuilder b;
             vector<Shard> shards;
 
+            AuthorizationManager* authManager =
+                    ClientBasic::getCurrent()->getAuthorizationManager();
+
             if ( strcmp( ns , "inprog" ) == 0 ) {
+                uassert(16545,
+                        "not authorized to run inprog",
+                        authManager->checkAuthorization(AuthorizationManager::SERVER_RESOURCE_NAME,
+                                                        ActionType::inprog));
+
                 Shard::getAllShards( shards );
 
                 BSONArrayBuilder arr( b.subarrayStart( "inprog" ) );
@@ -156,6 +164,10 @@ namespace mongo {
                 arr.done();
             }
             else if ( strcmp( ns , "killop" ) == 0 ) {
+                uassert(16546,
+                        "not authorized to run killop",
+                        authManager->checkAuthorization(AuthorizationManager::SERVER_RESOURCE_NAME,
+                                                        ActionType::killop));
                 r.checkAuth( Auth::WRITE , "admin" );
 
                 BSONElement e = q.query["op"];

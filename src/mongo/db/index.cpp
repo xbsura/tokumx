@@ -25,12 +25,15 @@
 #include "mongo/db/namespace.h"
 #include "mongo/db/index.h"
 #include "mongo/db/cursor.h"
+#include "mongo/db/auth/action_type.h"
+#include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/background.h"
 #include "mongo/db/repl/rs.h"
 #include "mongo/db/ops/delete.h"
 #include "mongo/db/storage/key.h"
 #include "mongo/util/mongoutils/str.h"
 #include "mongo/util/scopeguard.h"
+#include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
 
