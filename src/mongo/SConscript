@@ -361,7 +361,7 @@ serverOnlyFiles = [ "db/curop.cpp",
                     # Most storage/ files are in coredb, but this is server-only.
                     "db/storage/loader.cpp" ]
 
-env.Library( "dbcmdline", "db/cmdline.cpp", LIBDEPS=['bson'] )
+env.Library( "dbcmdline", "db/cmdline.cpp", LIBDEPS=['bson', 'server_parameters'] )
 env.CppUnitTest('cmdline_test', 'db/cmdline_test.cpp', LIBDEPS=['dbcmdline'])
 
 env.Library('stacktrace', 'util/stacktrace.cpp')
