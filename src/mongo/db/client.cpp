@@ -53,11 +53,6 @@ namespace mongo {
         // AuthorizationManager
         AuthExternalState* externalState = new AuthExternalStateMongod;
         AuthorizationManager* authManager = new AuthorizationManager(externalState);
-        Status status = authManager->initialize(new DBDirectClient());
-        massert(16818,
-                mongoutils::str::stream() << "Error initializing AuthorizationManager: "
-                << status.reason(),
-                status == Status::OK());
         setAuthorizationManager(authManager);
     }
 
