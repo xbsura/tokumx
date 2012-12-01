@@ -16,21 +16,27 @@
 */
 
 #include "pch.h"
-#include "../cmdline.h"
-#include "../../util/net/sock.h"
-#include "../client.h"
-#include "../dbhelpers.h"
-#include "../../s/d_logic.h"
-#include "rs.h"
-#include "connections.h"
-#include "../repl.h"
-#include "../instance.h"
+#include "mongo/platform/basic.h"
+
+#include "mongo/base/owned_pointer_vector.h"
+#include "mongo/base/status.h"
+#include "mongo/db/auth/authorization_manager.h"
+#include "mongo/db/auth/principal.h"
+#include "mongo/db/client.h"
+#include "mongo/db/cmdline.h"
+#include "mongo/db/dbhelpers.h"
+#include "mongo/db/instance.h"
+#include "mongo/db/repl.h"
 #include "mongo/db/repl/bgsync.h"
+#include "mongo/db/repl/connections.h"
+#include "mongo/db/repl/rs.h"
 #include "mongo/platform/bits.h"
 #include "mongo/db/gtid.h"
 #include "mongo/db/txn_context.h"
 #include "mongo/util/time_support.h"
 #include "mongo/db/oplog.h"
+#include "mongo/s/d_logic.h"
+#include "mongo/util/net/sock.h"
 
 using namespace std;
 
@@ -1008,6 +1014,7 @@ namespace mongo {
         if ( noauth )
             return;
         cc().getAuthenticationInfo()->authorize("local","_repl");
+        cc().getAuthorizationManager()->grantInternalAuthorization("_repl");
     }
 
     void ReplSetImpl::purgeOplogThread() {
