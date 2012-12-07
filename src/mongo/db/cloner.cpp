@@ -18,6 +18,7 @@
 */
 
 #include "mongo/pch.h"
+#include "mongo/base/init.h"
 #include "mongo/bson/util/builder.h"
 #include "mongo/client/dbclientinterface.h"
 #include "mongo/client/remote_transaction.h"
@@ -692,6 +693,13 @@ namespace mongo {
             help << "clone this database from an instance of the db on another host\n";
             help << "{ clone : \"host13\" }";
         }
+        virtual void addRequiredPrivileges(const std::string& dbname,
+                                           const BSONObj& cmdObj,
+                                           std::vector<Privilege>* out) {
+            ActionSet actions;
+            actions.addAction(ActionType::clone);
+            out->push_back(Privilege(dbname, actions));
+        }
         CmdClone() : Command("clone") { }
         
         virtual bool run(
@@ -769,7 +777,7 @@ namespace mongo {
             return rval;
 
         }
-    } cmdclone;
+    } cmdClone;
 
     class CmdCloneCollection : public Command {
     public:
@@ -1055,5 +1063,42 @@ namespace mongo {
             return res;
         }
     } cmdcopydb;
+
+    // This will be registered instead of the real implementations of any commands that don't work
+    // when auth is enabled.
+    class NotWithAuthCmd : public InformationCommand {
+    public:
+        NotWithAuthCmd(const char* cmdName) : InformationCommand(cmdName, false) { }
+        virtual bool requiresAuth() { return false; }
+        virtual void addRequiredPrivileges(const std::string& dbname,
+                                           const BSONObj& cmdObj,
+                                           std::vector<Privilege>* out) {}
+        virtual void help( stringstream &help ) const {
+            help << name << " is not supported when running with authentication enabled";
+        }
+        virtual bool run(const string&,
+                         BSONObj& cmdObj,
+                         int,
+                         string& errmsg,
+                         BSONObjBuilder& result,
+                         bool fromRepl) {
+            errmsg = name + " is not supported when running with authentication enabled";
+            return false;
+        }
+    };
+
+    MONGO_INITIALIZER(RegisterNotWithAuthCommands)(InitializerContext* context) {
+        if (noauth) {
+            // Leaked intentionally: a Command registers itself when constructed.
+            new CmdCloneCollection();
+            new CmdCopyDb();
+            new CmdCopyDbGetNonce();
+        } else {
+            new NotWithAuthCmd("cloneCollection");
+            new NotWithAuthCmd("copydb");
+            new NotWithAuthCmd("copydbgetnonce");
+        }
+        return Status::OK();
+    }
 
 } // namespace mongo
