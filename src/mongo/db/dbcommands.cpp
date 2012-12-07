@@ -89,6 +89,7 @@ namespace mongo {
     class CmdResetError : public InformationCommand {
     public:
         CmdResetError() : InformationCommand("resetError", false, "reseterror") {}
+        virtual bool requiresAuth() { return false; }
         virtual void addRequiredPrivileges(const std::string& dbname,
                                            const BSONObj& cmdObj,
                                            std::vector<Privilege>* out) {} // No auth required
@@ -114,6 +115,7 @@ namespace mongo {
     class CmdGetLastError : public InformationCommand {
     public:
         CmdGetLastError() : InformationCommand("getLastError", false, "getlasterror") { }
+        virtual bool requiresAuth()       { return false; }
         virtual void addRequiredPrivileges(const std::string& dbname,
                                            const BSONObj& cmdObj,
                                            std::vector<Privilege>* out) {} // No auth required
@@ -287,6 +289,7 @@ namespace mongo {
         virtual void help( stringstream& help ) const {
             help << "check for errors since last reseterror commandcal";
         }
+        virtual bool requiresAuth() { return false; }
         virtual void addRequiredPrivileges(const std::string& dbname,
                                            const BSONObj& cmdObj,
                                            std::vector<Privilege>* out) {} // No auth required
@@ -1448,6 +1451,7 @@ namespace mongo {
         virtual void help( stringstream &help ) const {
             help << "{whatsmyuri:1}";
         }
+        virtual bool requiresAuth() { return false; }
         virtual void addRequiredPrivileges(const std::string& dbname,
                                            const BSONObj& cmdObj,
                                            std::vector<Privilege>* out) {} // No auth required

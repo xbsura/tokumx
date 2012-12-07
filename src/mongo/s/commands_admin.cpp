@@ -1141,7 +1141,7 @@ namespace mongo {
                 errmsg.clear();
 
                 if ( !ClientBasic::getCurrent()->getAuthenticationInfo()->isAuthorized("admin") ) {
-                    errmsg = "unauthorized. Need admin authentication to add a shard ";
+                    errmsg = "unauthorized. Need admin authentication to add a shard";
                     log() << "addshard request " << cmdObj << " failed:" << errmsg << endl;
                     return false;
                 }
@@ -1381,6 +1381,7 @@ namespace mongo {
         class CmdWhatsMyUri : public InformationCommand {
         public:
             CmdWhatsMyUri() : InformationCommand("whatsmyuri", false) { }
+            virtual bool requiresAuth() { return false; }
             virtual void addRequiredPrivileges(const std::string& dbname,
                                                const BSONObj& cmdObj,
                                                std::vector<Privilege>* out) {} // No auth required
@@ -1416,6 +1417,7 @@ namespace mongo {
                 help << "check for an error on the last command executed";
             }
             CmdShardingGetLastError() : InformationCommand("getLastError" , false , "getlasterror") { }
+            virtual bool requiresAuth() { return false; }
             virtual void addRequiredPrivileges(const std::string& dbname,
                                                const BSONObj& cmdObj,
                                                std::vector<Privilege>* out) {} // No auth required
@@ -1442,6 +1444,7 @@ namespace mongo {
     public:
         CmdShardingResetError() : InformationCommand( "resetError" , false , "reseterror" ) {}
 
+        virtual bool requiresAuth() { return false; }
         virtual void addRequiredPrivileges(const std::string& dbname,
                                            const BSONObj& cmdObj,
                                            std::vector<Privilege>* out) {} // No auth required
