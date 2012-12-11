@@ -1663,9 +1663,10 @@ namespace mongo {
             public PublicGridCommand {
         public:
             PipelineCommand();
-            // TODO: implement addRequiredPrivileges
-
             // virtuals from Command
+            virtual void addRequiredPrivileges(const std::string& dbname,
+                                               const BSONObj& cmdObj,
+                                               std::vector<Privilege>* out);
             virtual bool run(const string &dbName , BSONObj &cmdObj,
                              int options, string &errmsg,
                              BSONObjBuilder &result, bool fromRepl);
@@ -1681,6 +1682,14 @@ namespace mongo {
 
         PipelineCommand::PipelineCommand():
             PublicGridCommand(Pipeline::commandName) {
+        }
+
+        void PipelineCommand::addRequiredPrivileges(const std::string& dbname,
+                                                    const BSONObj& cmdObj,
+                                                    std::vector<Privilege>* out) {
+            ActionSet actions;
+            actions.addAction(ActionType::find);
+            out->push_back(Privilege(parseNs(dbname, cmdObj), actions));
         }
 
         bool PipelineCommand::run(const string &dbName , BSONObj &cmdObj,
