@@ -112,8 +112,6 @@ namespace mongo {
                 return false;
             ns += 10;
 
-            r.checkAuth( Auth::WRITE );
-
             BSONObjBuilder b;
             vector<Shard> shards;
 
@@ -168,7 +166,6 @@ namespace mongo {
                         "not authorized to run killop",
                         authManager->checkAuthorization(AuthorizationManager::SERVER_RESOURCE_NAME,
                                                         ActionType::killop));
-                r.checkAuth( Auth::WRITE , "admin" );
 
                 BSONElement e = q.query["op"];
                 if ( e.type() != String ) {
