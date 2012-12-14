@@ -357,6 +357,7 @@ namespace mongo {
         Client& c = cc();
         if ( c.getAuthenticationInfo() ) {
             c.getAuthenticationInfo()->startRequest();
+            c.getAuthorizationManager()->startRequest();
         }
 
         // initialize the default OpSettings, 
