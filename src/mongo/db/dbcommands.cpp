@@ -1668,27 +1668,6 @@ namespace mongo {
         string dbname = nsToDatabase( cmdns );
 
         AuthenticationInfo *ai = client.getAuthenticationInfo();
-        // Won't clear the temporary auth if it's already set at this point
-        AuthenticationInfo::TemporaryAuthReleaser authRelease( ai );
-
-        // Some commands run other commands using the DBDirectClient. When this happens,the inner
-        // command doesn't get $auth added to the command object, but the temporary authorization
-        // for that thread is already set.  Therefore, we shouldn't error if no $auth is provided
-        // but we already have temporary auth credentials set.
-        if ( ai->usingInternalUser() && !ai->hasTemporaryAuthorization() ) {
-            // The temporary authentication will be cleared when authRelease goes out of scope
-            if ( cmdObj.hasField(AuthenticationTable::fieldName.c_str()) ) {
-                BSONObj authObj = cmdObj[AuthenticationTable::fieldName].Obj();
-                ai->setTemporaryAuthorization( authObj );
-            } else {
-                SOMETIMES ( noAuthTableCounter, 1000 ) {
-                    warning() << "Received command without $auth table.  This is probably because "
-                        "you are running with 1 or more mongod or mongos nodes that are running a "
-                        "version prior to 2.2.  Command object: " << cmdObj.toString() << endl;
-                }
-            }
-        }
-
         if( c->adminOnly() && c->localHostOnlyIfNoAuth( cmdObj ) && noauth && !ai->isLocalHost() ) {
             result.append( "errmsg" ,
                            "unauthorized: this command must run from localhost when running db without auth" );
