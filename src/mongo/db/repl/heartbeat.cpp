@@ -147,11 +147,7 @@ namespace mongo {
                             "from" << from );
 
         ScopedConn conn(memberFullName);
-        return conn.runCommand("admin",
-                               cmd,
-                               result,
-                               0,
-                               &AuthenticationTable::getInternalSecurityAuthenticationTable());
+        return conn.runCommand("admin", cmd, result, 0);
     }
 
     /**
