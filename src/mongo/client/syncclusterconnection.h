@@ -134,9 +134,6 @@ namespace mongo {
         double getSoTimeout() const { return _socketTimeout; }
 
 
-        virtual void setAuthenticationTable( const AuthenticationTable& auth );
-        virtual void clearAuthenticationTable();
-
         virtual bool lazySupported() const { return false; }
 
     protected:
