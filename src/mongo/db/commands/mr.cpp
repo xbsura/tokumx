@@ -1056,10 +1056,6 @@ namespace mongo {
                             }
                         }
                         
-                        if (state.isOnDisk() && !client.getAuthenticationInfo()->isAuthorized(dbname)) {
-                            errmsg = "read-only user cannot output mapReduce to collection, use inline instead";
-                            return false;
-                        }
                         state.init();
                         state.prepTempCollection();
                         ProgressMeterHolder pm( op->setMessage( "m/r: (1/3) emit phase" , state.incomingDocuments() ) );

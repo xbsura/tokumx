@@ -1462,7 +1462,6 @@ namespace mongo {
         }
     } cmdWhatsMyUri;
 
-    
     class DBHashCmd : public QueryCommand {
     public:
         DBHashCmd() : QueryCommand( "dbHash", false, "dbhash" ) {}

@@ -120,19 +120,13 @@ namespace mongo {
         virtual int txnFlags() const { return noTxnFlags(); }
         virtual bool canRunInMultiStmtTxn() const { return true; }
         bool run(const string& dbname , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
-
-            AuthenticationInfo *ai = cc().getAuthenticationInfo();
-            uassert( 12598 , "$eval reads unauthorized", ai->isAuthorizedReads(dbname.c_str()) );
-
             if ( cmdObj["nolock"].trueValue() ) {
                 return dbEval(dbname, cmdObj, result, errmsg);
             }
 
             // write security will be enforced in DBDirectClient
             // TODO: should this be a db lock?
-            scoped_ptr<Lock::ScopedLock> lk( ai->isAuthorized( dbname.c_str() ) ? 
-                                             static_cast<Lock::ScopedLock*>( new Lock::GlobalWrite() ) : 
-                                             static_cast<Lock::ScopedLock*>( new Lock::GlobalRead() ) );
+            Lock::GlobalWrite lk;
             // If we create a context here, and the js we're running does fileops, we'll create too many txns.
             //Client::Context ctx( dbname );
 
