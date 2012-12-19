@@ -562,8 +562,7 @@ namespace mongo {
 
         DBClientWithCommands() : _logLevel(0),
                 _cachedAvailableOptions( (enum QueryOptions)0 ),
-                _haveCachedAvailableOptions(false),
-                _hasAuthentication(false) { }
+                _haveCachedAvailableOptions(false) { }
 
         /** helper function.  run a simple command where the command expression is simply
               { command : 1 }
@@ -908,9 +907,6 @@ namespace mongo {
 
         bool exists( const string& ns );
 
-        virtual void setAuthenticationTable( const AuthenticationTable& auth );
-        virtual void clearAuthenticationTable();
-
         /** Create an index if it does not already exist.
             ensureIndex calls are remembered so it is safe/fast to call this function many
             times in your code.
@@ -989,8 +985,6 @@ namespace mongo {
     private:
         enum QueryOptions _cachedAvailableOptions;
         bool _haveCachedAvailableOptions;
-        AuthenticationTable _authTable;
-        bool _hasAuthentication;
     };
 
     /**

@@ -109,10 +109,6 @@ namespace mongo {
         // createPWDigest should really not be a member func
         DBClientConnection conn;
         internalSecurity.pwd = conn.createPasswordDigest(internalSecurity.user, str);
-        AuthenticationTable::getMutableInternalSecurityAuthenticationTable().addAuth(
-                "local",
-                internalSecurity.user,
-                Auth::WRITE );
 
         return true;
     }
@@ -153,11 +149,6 @@ namespace mongo {
     bool AuthenticationInfo::_isAuthorizedSingle_inlock(const string& dbname, Auth::Level level) const {
         const AuthenticationTable& authTable = _usingTempAuth ? _tempAuthTable : _authTable;
         return authTable.getAuthForDb( dbname ).level >= level;
-    }
-
-    const AuthenticationTable AuthenticationInfo::getAuthTable() const {
-        scoped_spinlock lk( _lock );
-        return _authTable;
     }
 
 } // namespace mongo
