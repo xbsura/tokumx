@@ -137,6 +137,39 @@ DB.prototype.__pwHash = function( nonce, username, pass ) {
     return hex_md5( nonce + username + hex_md5( username + ":mongo:" + pass ) );
 }
 
+DB.prototype._defaultAuthenticationMechanism = "MONGO-CR";
+
+DB.prototype._authOrThrow = function () {
+    var params;
+    if (arguments.length == 2) {
+        params = { user: arguments[0], pwd: arguments[1] };
+    }
+    else if (arguments.length == 1) {
+        if (typeof(arguments[0]) != "object")
+            throw Error("Single-argument form of auth expects a parameter object");
+        params = arguments[0];
+    }
+    else {
+        throw Error(
+            "auth expects either (username, password) or ({ user: username, pwd: password })");
+    }
+
+    if (params.mechanism === undefined)
+        params.mechanism = this._defaultAuthenticationMechanism;
+
+    if (params.mechanism == "MONGO-CR") {
+        this.getMongo().auth(this.getName(), params.user, params.pwd);
+    }
+    else if (typeof(this.getMongo().saslAuthenticate == "function")) {
+        params.userSource = this.getName();
+        this.getMongo().saslAuthenticate(params);
+    }
+    else {
+        throw Error("This shell does not support sasl authentication");
+    }
+}
+
+
 DB.prototype.auth = function( username , pass ){
     var result = 0;
     try {

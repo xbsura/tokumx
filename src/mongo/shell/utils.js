@@ -1088,15 +1088,22 @@ jsTestPath = function(){
 }
 
 jsTestOptions = function(){
-    if( TestData ) return { noJournal : TestData.noJournal,
-                            noJournalPrealloc : TestData.noJournalPrealloc,
-                            auth : TestData.auth,
-                            keyFile : TestData.keyFile,
-                            authUser : "__system",
-                            authPassword : TestData.keyFileData,
-                            adminUser : "admin",
-                            adminPassword : "password" }
-    return {}
+    if( TestData ) {
+        return Object.merge(_jsTestOptions,
+                            { noJournal : TestData.noJournal,
+                              noJournalPrealloc : TestData.noJournalPrealloc,
+                              auth : TestData.auth,
+                              keyFile : TestData.keyFile,
+                              authUser : "__system",
+                              authPassword : TestData.keyFileData,
+                              adminUser : TestData.adminUser || "admin",
+                              adminPassword : TestData.adminPassword || "password" });
+    }
+    return _jsTestOptions;
+}
+
+setJsTestOption = function(name, value) {
+    _jsTestOptions[name] = value;
 }
 
 jsTestLog = function(msg){
@@ -1153,9 +1160,14 @@ jsTest.authenticate = function(conn) {
                            // Set authenticated to stop an infinite recursion from getDB calling
                            // back into authenticate.
                            conn.authenticated = true;
-                           print ("Authenticating to admin user on connection: " + conn);
-                           conn.authenticated = conn.getDB('admin').auth(
-                               jsTestOptions().adminUser, jsTestOptions().adminPassword);
+                           print ("Authenticating to admin database as " +
+                                  jsTestOptions().adminUser + " with mechanism " +
+                                  DB.prototype._defaultAuthenticationMechanism +
+                                  " on connection: " + conn);
+                           conn.authenticated = conn.getDB('admin').auth({
+                               user: jsTestOptions().adminUser,
+                               pwd: jsTestOptions().adminPassword
+                           });
                            return conn.authenticated;
                        });
     } catch (e) {
