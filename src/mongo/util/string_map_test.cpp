@@ -187,6 +187,7 @@ namespace {
         return t.micros();
     }
 
+#if !defined(_DEBUG)
     TEST( StringMapTest, perf1 ) {
         unsigned long long standard = 0;
         unsigned long long unordered = 0;
@@ -211,4 +212,5 @@ namespace {
         log() << "StringMap:\t" << custom << std::endl;
         ASSERT_LESS_THAN( custom, standard );
     }
+#endif
 }
