@@ -26,6 +26,7 @@ clientSourceBasic = [
     'mongo/base/parse_number.cpp',
     'mongo/base/status.cpp',
     'mongo/bson/oid.cpp',
+    'mongo/bson/util/bson_extract.cpp',
     'mongo/buildinfo.cpp',
     "mongo/client/authentication_table_common.cpp",
     "mongo/client/authentication_table_client.cpp",
