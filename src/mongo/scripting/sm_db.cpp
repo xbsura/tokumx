@@ -315,22 +315,26 @@ namespace mongo {
 
     JSBool mongo_auth(JSContext *cx, JSObject *obj, uintN argc, jsval *argv, jsval *rval) {
         try {
-            smuassert( cx , "mongo_auth needs 3 args" , argc == 3 );
-            shared_ptr< DBClientWithCommands > * connHolder = (shared_ptr< DBClientWithCommands >*)JS_GetPrivate( cx , obj );
-            smuassert( cx ,  "no connection!" , connHolder && connHolder->get() );
-            DBClientWithCommands *conn = connHolder->get();
+            DBClientWithCommands *conn = getConnection(cx, obj);
+            smuassert(cx , "no connection!", conn);
 
-            Convertor c( cx );
-
-            string db = c.toString( argv[0] );
-            string username = c.toString( argv[1] );
-            string password = c.toString( argv[2] );
-            string errmsg = "";
-
-            if ( ! conn->auth( db, username, password, errmsg ) ) {
-                JS_ReportError( cx, errmsg.c_str() );
+            Convertor c(cx);
+            BSONObj params;
+            switch (argc) {
+            case 1:
+                params = c.toObject(argv[0]);
+                break;
+            case 3:
+                params = BSON(saslCommandMechanismFieldName << "MONGO-CR" <<
+                              saslCommandPrincipalSourceFieldName << c.toString(argv[0]) <<
+                              saslCommandPrincipalFieldName << c.toString(argv[1]) <<
+                              saslCommandPasswordFieldName << c.toString(argv[2]));
+                break;
+            default:
+                JS_ReportError(cx, "mongo_auth takes 1 object or 3 string arguments");
                 return JS_FALSE;
             }
+            conn->auth(params);
         }
         catch ( const AssertionException& e ) {
             if ( ! JS_IsExceptionPending( cx ) ) {

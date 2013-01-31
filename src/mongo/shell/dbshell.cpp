@@ -26,6 +26,7 @@
 
 #include "mongo/base/initializer.h"
 #include "mongo/client/dbclientinterface.h"
+#include "mongo/client/sasl_client_authenticate.h"
 #include "mongo/db/cmdline.h"
 #include "mongo/db/repl/rs_member.h"
 #include "mongo/scripting/engine.h"
@@ -615,6 +616,7 @@ int _main( int argc, char* argv[], char **envp ) {
     string username;
     string password;
     string authenticationMechanism;
+    string authenticationDatabase;
 
     bool runShell = false;
     bool nodb = false;
@@ -637,6 +639,9 @@ int _main( int argc, char* argv[], char **envp ) {
     ( "eval", po::value<string>( &script ), "evaluate javascript" )
     ( "username,u", po::value<string>(&username), "username for authentication" )
     ( "password,p", new mongo::PasswordValue( &password ), "password for authentication" )
+    ("authenticationDatabase",
+     po::value<string>(&authenticationDatabase)->default_value(""),
+     "user source (defaults to dbname)" )
     ("authenticationMechanism",
      po::value<string>(&authenticationMechanism)->default_value("MONGO-CR"),
      "authentication mechanism")

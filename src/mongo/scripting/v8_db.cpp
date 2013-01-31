@@ -16,15 +16,21 @@
  */
 
 #include "v8_wrapper.h"
-#include "v8_utils.h"
-#include "engine_v8.h"
 #include "v8_db.h"
-#include "util/base64.h"
-#include "util/text.h"
-#include "../client/syncclusterconnection.h"
-#include "../s/d_logic.h"
-#include "../db/namespacestring.h"
+
 #include <iostream>
+#include <boost/scoped_array.hpp>
+
+#include "mongo/base/init.h"
+#include "mongo/client/sasl_client_authenticate.h"
+#include "mongo/client/syncclusterconnection.h"
+#include "mongo/db/namespacestring.h"
+#include "mongo/s/d_logic.h"
+#include "mongo/scripting/engine_v8.h"
+#include "mongo/scripting/v8_utils.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/base64.h"
+#include "mongo/util/text.h"
 
 using namespace std;
 using namespace v8;
@@ -457,20 +463,31 @@ namespace mongo {
     }
 
     v8::Handle<v8::Value> mongoAuth(V8Scope* scope, const v8::Arguments& args) {
-        jsassert( args.Length() >= 3 , "update needs at least 3 args" );
-        DBClientBase * conn = getConnection( args );
-        string db = toSTLString(args[0]);
-        string username = toSTLString(args[1]);
-        string password = toSTLString(args[2]);
-        string errmsg = "";
+        DBClientWithCommands* conn = getConnection(args);
+        if (NULL == conn)
+            return v8AssertionException("no connection");
 
-        try {
-            if (conn->auth(db, username, password, errmsg)) {
-                return v8::Boolean::New(true);
-            }
-        } catch ( ... ) {
+        BSONObj params;
+        switch (args.Length()) {
+        case 1:
+            params = scope->v8ToMongo(args[0]->ToObject());
+            break;
+        case 3:
+            params = BSON(saslCommandMechanismFieldName << "MONGO-CR" <<
+                          saslCommandPrincipalSourceFieldName << toSTLString(args[0]) <<
+                          saslCommandPrincipalFieldName << toSTLString(args[1]) <<
+                          saslCommandPasswordFieldName << toSTLString(args[2]));
+            break;
+        default:
+            return v8AssertionException("mongoAuth takes 1 object or 3 string arguments");
         }
-        return v8::ThrowException( v8::String::New( errmsg.c_str() ) );
+        try {
+            conn->auth(params);
+        }
+        catch (const DBException& ex) {
+            return v8AssertionException(ex.toString());
+        }
+        return v8::Boolean::New(true);
     }
 
     v8::Handle<v8::Value> mongoLogout(V8Scope* scope, const v8::Arguments& args) {

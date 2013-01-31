@@ -20,14 +20,15 @@
 #include "mongo/base/string_data.h"
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/util/base64.h"
-#include "mongo/util/gsasl_session.h"
-#include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
-#include "mongo/util/net/hostandport.h"
 
 namespace mongo {
 
     using namespace mongoutils;
+
+    Status (*saslClientAuthenticate)(DBClientWithCommands* client,
+                                     const BSONObj& saslParameters,
+                                     void* sessionHook) = NULL;
 
     const char* const saslStartCommandName = "saslStart";
     const char* const saslContinueCommandName = "saslContinue";
@@ -44,15 +45,9 @@ namespace mongo {
     const char* const saslCommandPrincipalSourceFieldName = "principalSource";
     const char* const saslCommandServiceHostnameFieldName = "serviceHostname";
     const char* const saslCommandServiceNameFieldName = "serviceName";
+    const char* const saslCommandDigestPasswordFieldName = "digestPassword";
     const char* const saslDefaultDBName = "$sasl";
     const char* const saslDefaultServiceName = "mongodb";
-
-    const char* const saslClientLogFieldName = "clientLogLevel";
-
-namespace {
-    // Default log level on the client for SASL log messages.
-    const int defaultSaslClientLogLevel = 4;
-}  // namespace
 
     Status saslExtractPayload(const BSONObj& cmdObj, std::string* payload, BSONType* type) {
         BSONElement payloadElement;
@@ -84,155 +79,4 @@ namespace {
 
         return Status::OK();
     }
-
-namespace {
-
-    /**
-     * Configure "*session" as a client gsasl session for authenticating on the connection
-     * "*client", with the given "saslParameters".  "gsasl" and "sessionHook" are passed through
-     * to GsaslSession::initializeClientSession, where they are documented.
-     */
-    Status configureSession(Gsasl* gsasl,
-                            DBClientWithCommands* client,
-                            const BSONObj& saslParameters,
-                            void* sessionHook,
-                            GsaslSession* session) {
-
-        std::string mechanism;
-        Status status = bsonExtractStringField(saslParameters,
-                                               saslCommandMechanismFieldName,
-                                               &mechanism);
-        if (!status.isOK())
-            return status;
-
-        status = session->initializeClientSession(gsasl, mechanism, sessionHook);
-        if (!status.isOK())
-            return status;
-
-        std::string service;
-        status = bsonExtractStringFieldWithDefault(saslParameters,
-                                                   saslCommandServiceNameFieldName,
-                                                   saslDefaultServiceName,
-                                                   &service);
-        if (!status.isOK())
-            return status;
-        session->setProperty(GSASL_SERVICE, service);
-
-        std::string hostname;
-        status = bsonExtractStringFieldWithDefault(saslParameters,
-                                                   saslCommandServiceHostnameFieldName,
-                                                   HostAndPort(client->getServerAddress()).host(),
-                                                   &hostname);
-        if (!status.isOK())
-            return status;
-        session->setProperty(GSASL_HOSTNAME, hostname);
-
-        BSONElement element = saslParameters[saslCommandPrincipalFieldName];
-        if (element.type() == String) {
-            session->setProperty(GSASL_AUTHID, element.str());
-        }
-        else if (!element.eoo()) {
-            return Status(ErrorCodes::TypeMismatch,
-                          str::stream() << "Expected string for " << element);
-        }
-
-        element = saslParameters[saslCommandPasswordFieldName];
-        if (element.type() == String) {
-            session->setProperty(GSASL_PASSWORD, element.str());
-        }
-        else if (!element.eoo()) {
-            return Status(ErrorCodes::TypeMismatch,
-                          str::stream() << "Expected string for " << element);
-        }
-
-        return Status::OK();
-    }
-
-    int getSaslClientLogLevel(const BSONObj& saslParameters) {
-        int saslLogLevel = defaultSaslClientLogLevel;
-        BSONElement saslLogElement = saslParameters[saslClientLogFieldName];
-        if (saslLogElement.trueValue())
-            saslLogLevel = 1;
-        if (saslLogElement.isNumber())
-            saslLogLevel = saslLogElement.numberInt();
-        return saslLogLevel;
-    }
-
-}  // namespace
-
-    Status saslClientAuthenticate(Gsasl *gsasl,
-                                  DBClientWithCommands* client,
-                                  const BSONObj& saslParameters,
-                                  void* sessionHook) {
-
-        GsaslSession session;
-
-        int saslLogLevel = getSaslClientLogLevel(saslParameters);
-
-        Status status = configureSession(gsasl, client, saslParameters, sessionHook, &session);
-        if (!status.isOK())
-            return status;
-
-        std::string targetDatabase;
-        status = bsonExtractStringFieldWithDefault(saslParameters,
-                                                   saslCommandPrincipalSourceFieldName,
-                                                   saslDefaultDBName,
-                                                   &targetDatabase);
-        if (!status.isOK())
-            return status;
-
-        BSONObj saslFirstCommandPrefix = BSON(
-                saslStartCommandName << 1 <<
-                saslCommandMechanismFieldName << session.getMechanism());
-
-        BSONObj saslFollowupCommandPrefix = BSON(saslContinueCommandName << 1);
-        BSONObj saslCommandPrefix = saslFirstCommandPrefix;
-        BSONObj inputObj = BSON(saslCommandPayloadFieldName << "");
-        bool isServerDone = false;
-        while (!session.isDone()) {
-            std::string payload;
-            BSONType type;
-
-            status = saslExtractPayload(inputObj, &payload, &type);
-            if (!status.isOK())
-                return status;
-
-            LOG(saslLogLevel) << "sasl client input: " << base64::encode(payload) << endl;
-
-            std::string responsePayload;
-            status = session.step(payload, &responsePayload);
-            if (!status.isOK())
-                return status;
-
-            LOG(saslLogLevel) << "sasl client output: " << base64::encode(responsePayload) << endl;
-
-            BSONObjBuilder commandBuilder;
-            commandBuilder.appendElements(saslCommandPrefix);
-            commandBuilder.appendBinData(saslCommandPayloadFieldName,
-                                         int(responsePayload.size()),
-                                         BinDataGeneral,
-                                         responsePayload.c_str());
-            BSONElement conversationId = inputObj[saslCommandConversationIdFieldName];
-            if (!conversationId.eoo())
-                commandBuilder.append(conversationId);
-
-            if (!client->runCommand(targetDatabase, commandBuilder.obj(), inputObj)) {
-                return Status(ErrorCodes::UnknownError,
-                              inputObj[saslCommandErrmsgFieldName].str());
-            }
-
-            int statusCodeInt = inputObj[saslCommandCodeFieldName].Int();
-            if (0 != statusCodeInt)
-                return Status(ErrorCodes::fromInt(statusCodeInt),
-                              inputObj[saslCommandErrmsgFieldName].str());
-
-            isServerDone = inputObj[saslCommandDoneFieldName].trueValue();
-            saslCommandPrefix = saslFollowupCommandPrefix;
-        }
-
-        if (!isServerDone)
-            return Status(ErrorCodes::ProtocolError, "Client finished before server.");
-        return Status::OK();
-    }
-
 }  // namespace mongo

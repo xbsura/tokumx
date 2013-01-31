@@ -40,6 +40,7 @@ clientSourceBasic = [
     'mongo/client/gridfs.cpp',
     'mongo/client/model.cpp',
     'mongo/client/remote_transaction.cpp',
+    'mongo/client/sasl_client_authenticate.cpp',
     'mongo/client/syncclusterconnection.cpp',
     'mongo/db/jsobj.cpp',
     'mongo/db/json.cpp',
@@ -80,7 +81,7 @@ clientSourceBasic = [
     'mongo/util/util.cpp',
     ]
 
-clientSourceSasl = ['mongo/client/sasl_client_authenticate.cpp',
+clientSourceSasl = ['mongo/client/sasl_client_authenticate_impl.cpp',
                     'mongo/util/gsasl_session.cpp']
 
 clientSourceAll = clientSourceBasic + clientSourceSasl
