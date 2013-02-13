@@ -18,6 +18,7 @@
 // hacked in right now from engine_spidermonkey.cpp
 
 #include "mongo/client/dbclientcursor.h"
+#include "mongo/client/sasl_client_authenticate.h"
 #include "mongo/db/namespacestring.h"
 #include "mongo/util/base64.h"
 #include "mongo/util/text.h"
