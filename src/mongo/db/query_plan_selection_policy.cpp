@@ -14,8 +14,8 @@
  *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+#include "mongo/db/namespace_details.h"
 #include "mongo/db/query_plan_selection_policy.h"
-
 #include "mongo/db/queryoptimizer.h"
 
 namespace mongo {
@@ -34,7 +34,7 @@ namespace mongo {
     }
     BSONObj QueryPlanSelectionPolicy::IdElseNatural::planHint( const StringData& ns ) const {
         NamespaceDetails* nsd = nsdetails( ns );
-        if ( !nsd || !nsd->haveIdIndex() ) {
+        if ( !nsd || !nsd->hasIdIndex() ) {
             return BSON( "$hint" << BSON( "$natural" << 1 ) );
         }
         return BSON( "$hint" << nsd->idx( nsd->findIdIndex() ).indexName() );

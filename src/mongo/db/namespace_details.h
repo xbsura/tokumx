@@ -358,7 +358,7 @@ namespace mongo {
     }; // NamespaceDetails
 
     class ParsedQuery;
-    class QueryPlanSummary;
+    struct QueryPlanSummary;
     
     /* NamespaceDetailsTransient
 
