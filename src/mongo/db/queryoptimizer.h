@@ -25,7 +25,6 @@
 #include "mongo/db/queryutil.h"
 #include "mongo/db/explain.h"
 #include "mongo/db/matcher.h"
-#include "mongo/db/queryoptimizercursor.h"
 #include "mongo/db/querypattern.h"
 #include "mongo/db/queryutil.h"
 #include "mongo/util/net/listen.h"
@@ -36,6 +35,7 @@ namespace mongo {
 
     class IndexDetails;
     class IndexType;
+    class QueryPlanSelectionPolicy;
     class QueryPlanSummary;
     
     /**
