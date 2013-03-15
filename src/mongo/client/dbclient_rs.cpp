@@ -254,7 +254,7 @@ namespace mongo {
             while ( ! inShutdown() ) {
                 sleepsecs( 10 );
                 try {
-                    ReplicaSetMonitor::checkAll( true );
+                    ReplicaSetMonitor::checkAll();
                 }
                 catch ( std::exception& e ) {
                     error() << "check failed: " << e.what() << endl;
@@ -362,7 +362,7 @@ namespace mongo {
         }
     }
 
-    void ReplicaSetMonitor::checkAll( bool checkAllSecondaries ) {
+    void ReplicaSetMonitor::checkAll() {
         set<string> seen;
 
         while ( true ) {
@@ -383,7 +383,7 @@ namespace mongo {
             if ( ! m )
                 break;
 
-            m->check( checkAllSecondaries );
+            m->check();
             {
                 scoped_lock lk( _setsLock );
                 if ( m->_failedChecks >= _maxFailedChecks ) {
@@ -470,7 +470,7 @@ namespace mongo {
                 return _nodes[_master].addr;
         }
         
-        _check( false );
+        _check();
 
         scoped_lock lk( _lock );
         uassert( 10009 , str::stream() << "ReplicaSetMonitor no master found for set: " << _name , _master >= 0 );
@@ -564,60 +564,6 @@ namespace mongo {
         int x = _find_inlock( server );
         if ( x >= 0 ) {
             _nodes[x].ok = false;
-        }
-    }
-
-    void ReplicaSetMonitor::_checkStatus( const string& hostAddr ) {
-        BSONObj status;
-
-        /* replSetGetStatus requires admin auth so use a connection from the pool,
-         * and tell it to use the internal credentials.
-         */
-        scoped_ptr<ScopedDbConnection> authenticatedConn(
-                ScopedDbConnection::getInternalScopedDbConnection( hostAddr, 5.0 ) );
-
-        if ( !authenticatedConn->get()->runCommand( "admin",
-                                                    BSON( "replSetGetStatus" << 1 ),
-                                                    status )) {
-            LOG(1) << "dbclient_rs replSetGetStatus failed" << endl;
-            authenticatedConn->done(); // connection worked properly, but we got an error from server
-            return;
-        }
-
-        // Make sure we return when finished
-        authenticatedConn->done();
-
-        if( !status.hasField("members") ) { 
-            log() << "dbclient_rs error expected members field in replSetGetStatus result" << endl;
-            return;
-        }
-        if( status["members"].type() != Array) {
-            log() << "dbclient_rs error expected members field in replSetGetStatus result to be an array" << endl;
-            return;
-        }
-
-        BSONObjIterator hi(status["members"].Obj());
-        while (hi.more()) {
-            BSONObj member = hi.next().Obj();
-            string host = member["name"].String();
-
-            int m = -1;
-            if ((m = _find(host)) < 0) {
-                LOG(1) << "dbclient_rs _checkStatus couldn't _find(" << host << ')' << endl;
-                continue;
-            }
-
-            double state = member["state"].Number();
-            if (member["health"].Number() == 1 && (state == 1 || state == 2)) {
-                LOG(1) << "dbclient_rs nodes["<<m<<"].ok = true " << host << endl;
-                scoped_lock lk( _lock );
-                _nodes[m].ok = true;
-            }
-            else {
-                LOG(1) << "dbclient_rs nodes["<<m<<"].ok = false " << host << endl;
-                scoped_lock lk( _lock );
-                _nodes[m].ok = false;
-            }
         }
     }
 
@@ -799,6 +745,7 @@ namespace mongo {
                 node.hidden = o["hidden"].trueValue();
                 node.secondary = o["secondary"].trueValue();
                 node.ismaster = o["ismaster"].trueValue();
+                node.ok = node.secondary || node.ismaster;
 
                 node.lastIsMaster = o.copy();
             }
@@ -822,7 +769,6 @@ namespace mongo {
             }
             
             _checkHosts( b.arr(), changed);
-            _checkStatus( conn->getServerAddress() );
 
         }
         catch ( std::exception& e ) {
@@ -847,26 +793,13 @@ namespace mongo {
         return isMaster;
     }
 
-    void ReplicaSetMonitor::_check( bool checkAllSecondaries ) {
+    void ReplicaSetMonitor::_check() {
         LOG(1) <<  "_check : " << getServerAddress() << endl;
 
         int newMaster = -1;
         shared_ptr<DBClientConnection> nodeConn;
 
         for ( int retry = 0; retry < 2; retry++ ) {
-            bool triedQuickCheck = false;
-
-            if ( !checkAllSecondaries ) {
-                scoped_lock lk( _lock );
-                verify(_master < static_cast<int>(_nodes.size()));
-                if ( _master >= 0 && _nodes[_master].ok ) {
-                  /* Nothing else to do since another thread already
-                   * found a usable _master
-                   */
-                  return;
-                }
-            }
-
             for ( unsigned i = 0; /* should not check while outside of lock! */ ; i++ ) {
                 {
                     scoped_lock lk( _lock );
@@ -884,9 +817,6 @@ namespace mongo {
                                   << " changed to " << _nodes[newMaster].addr << endl;
                         }
                         _master = i;
-
-                        if ( !checkAllSecondaries )
-                            return;
                     }
                     else {
                         /*
@@ -894,53 +824,6 @@ namespace mongo {
                          * _master, so try again.
                          */
                         break;
-                    }
-                }
-
-
-                if ( ! triedQuickCheck && ! maybePrimary.empty() ) {
-                    int probablePrimaryIdx = -1;
-                    shared_ptr<DBClientConnection> probablePrimaryConn;
-
-                    {
-                        scoped_lock lk( _lock );
-                        probablePrimaryIdx = _find_inlock( maybePrimary );
-
-                        if (probablePrimaryIdx >= 0) {
-                            probablePrimaryConn = _nodes[probablePrimaryIdx].conn;
-                        }
-                    }
-
-                    if ( probablePrimaryIdx >= 0 ) {
-                        triedQuickCheck = true;
-
-                        string dummy;
-                        if ( _checkConnection( probablePrimaryConn.get(), dummy,
-                                false, probablePrimaryIdx ) ) {
-
-                            scoped_lock lk( _lock );
-
-                            if ( _checkConnMatch_inlock( probablePrimaryConn.get(),
-                                                         probablePrimaryIdx )) {
-                              
-
-                                newMaster = probablePrimaryIdx;
-                                if ( newMaster != _master ) {
-                                    log() << "Primary for replica set " << _name << " changed to " << _nodes[newMaster].addr << endl;
-                                }
-                                _master = probablePrimaryIdx;
-
-                                if ( ! checkAllSecondaries )
-                                    return;
-                            }
-                            else {
-                                /*
-                                 * Somebody modified _nodes and most likely set the
-                                 * new _master, so try again.
-                                 */
-                                break;
-                            }
-                        }
                     }
                 }
             }
@@ -955,26 +838,27 @@ namespace mongo {
             warning() << "No primary detected for set " << _name << endl;
             scoped_lock lk( _lock );
             _master = -1;
+            bool hasOKNode = false;
 
-            for (vector<Node>::iterator iter = _nodes.begin(); iter < _nodes.end(); ++iter) {
-                iter->ismaster = false;
-            }
-
-            if (checkAllSecondaries) {
-                for ( unsigned i = 0; i < _nodes.size(); i++ ) {
-                    if ( _nodes[i].ok ) {
-                        _failedChecks = 0;
-                        return;
-                    }
+            for ( unsigned i = 0; i < _nodes.size(); i++ ) {
+                _nodes[i].ismaster = false;
+                if ( _nodes[i].ok ) {
+                    hasOKNode = true;
                 }
-                // None of the nodes are ok.
-                _failedChecks++;
-                log() << "All nodes for set " << _name << " are down. This has happened for " << _failedChecks << " checks in a row. Polling will stop after " << _maxFailedChecks - _failedChecks << " more failed checks" << endl;
             }
+            if (hasOKNode) {
+                _failedChecks = 0;
+                return;
+            }
+            // None of the nodes are ok.
+            _failedChecks++;
+            log() << "All nodes for set " << _name << " are down. This has happened for " <<
+                    _failedChecks << " checks in a row. Polling will stop after " <<
+                    _maxFailedChecks - _failedChecks << " more failed checks" << endl;
         }
     }
 
-    void ReplicaSetMonitor::check( bool checkAllSecondaries ) {
+    void ReplicaSetMonitor::check() {
         bool isNodeEmpty = false;
 
         {
@@ -992,31 +876,8 @@ namespace mongo {
             return;
         }
 
-        shared_ptr<DBClientConnection> masterConn;
-
-        {
-            scoped_lock lk( _lock );
-
-            // first see if the current master is fine
-            if ( _master >= 0 ) {
-                verify(_master < static_cast<int>(_nodes.size()));
-                masterConn = _nodes[_master].conn;
-            }
-        }
-
-        if ( masterConn.get() != NULL ) {
-            string temp;
-
-            if ( _checkConnection( masterConn.get(), temp, false, _master )) {
-                if ( ! checkAllSecondaries ) {
-                    // current master is fine, so we're done
-                    return;
-                }
-            }
-        }
-
         // we either have no master, or the current is dead
-        _check( checkAllSecondaries );
+        _check();
     }
 
     int ReplicaSetMonitor::_find( const string& server ) const {
@@ -1088,7 +949,7 @@ namespace mongo {
 
         if (candidate.empty()) {
             // mimic checkMaster behavior, which refreshes the local view of the replica set
-            _check(false);
+            _check();
 
             scoped_lock lk(_lock);
             return ReplicaSetMonitor::selectNode(_nodes, preference, tags, _localThresholdMillis,
@@ -1234,7 +1095,7 @@ namespace mongo {
         }
 
         // Check everything to get the first data
-        _check(true);
+        _check();
     }
 
     bool ReplicaSetMonitor::isAnyNodeOk() const {
