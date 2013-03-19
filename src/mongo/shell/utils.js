@@ -1096,6 +1096,7 @@ jsTestOptions = function(){
                               keyFile : TestData.keyFile,
                               authUser : "__system",
                               authPassword : TestData.keyFileData,
+                              authMechanism : TestData.authMechanism,
                               adminUser : TestData.adminUser || "admin",
                               adminPassword : TestData.adminPassword || "password" });
     }
