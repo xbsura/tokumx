@@ -260,6 +260,8 @@ namespace mongo {
                 std::string str = e.String();
                 if (str == "lzma") {
                     compression = TOKU_LZMA_METHOD;
+                } else if (str == "lz4") {
+                    compression = TOKU_LZ4_METHOD;
                 } else if (str == "quicklz") {
                     compression = TOKU_QUICKLZ_METHOD;
                 } else if (str == "zlib") {
@@ -267,7 +269,7 @@ namespace mongo {
                 } else if (str == "none") {
                     compression = TOKU_NO_COMPRESSION;
                 } else {
-                    uassert(16442, "compression must be one of: lzma, quicklz, zlib, none.", false);
+                    uassert(16442, "compression must be one of: lzma, lz4, quicklz, zlib, none.", false);
                 }
                 TOKULOG(1) << "db " << name << ", using compression method \"" << str << "\"" << endl;
             }
