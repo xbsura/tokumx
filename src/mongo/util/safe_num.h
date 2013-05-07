@@ -51,7 +51,7 @@ namespace mongo {
     class SafeNum {
     public:
         SafeNum();
-        ~SafeNum() { }
+        ~SafeNum();
 
         //
         // construction support
@@ -124,8 +124,8 @@ namespace mongo {
         //
         // accessors
         //
-        bool isValid() const { return _type != EOO; }
-        BSONType type() const { return _type; }
+        bool isValid() const;
+        BSONType type() const;
         std::string debugString() const;
 
         //
@@ -182,3 +182,6 @@ namespace mongo {
     ostream& operator<<(ostream& os, const SafeNum& snum);
 
 } // namespace mongo
+
+#include "mongo/util/safe_num-inl.h"
+
