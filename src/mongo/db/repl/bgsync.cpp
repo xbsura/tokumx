@@ -163,42 +163,42 @@ namespace mongo {
         uint32_t timeToSleep = 0;
 
         while (!_opSyncShouldExit) {
-            if (timeToSleep) {
+            try {
+                if (timeToSleep) {
+                    {
+                        boost::unique_lock<boost::mutex> lck(_mutex);
+                        _opSyncRunning = false;
+                        // notify other threads that we are not running
+                        _opSyncRunningCondVar.notify_all();
+                    }
+                    for (uint32_t i = 0; i < timeToSleep; i++) {
+                        sleepsecs(1);
+                        // get out if we need to
+                        if (_opSyncShouldExit) { break; }
+                    }
+                    timeToSleep = 0;
+                }
+                // get out if we need to
+                if (_opSyncShouldExit) { break; }
+
                 {
                     boost::unique_lock<boost::mutex> lck(_mutex);
                     _opSyncRunning = false;
-                    // notify other threads that we are not running
+
+                    while (!_opSyncShouldRun && !_opSyncShouldExit) {
+                        // notify other threads that we are not running
+                        _opSyncRunningCondVar.notify_all();
+                        // wait for permission that we can run
+                        _opSyncCanRunCondVar.wait(lck);
+                    }
+
+                    // notify other threads that we are running
                     _opSyncRunningCondVar.notify_all();
+                    _opSyncRunning = true;
                 }
-                for (uint32_t i = 0; i < timeToSleep; i++) {
-                    sleepsecs(1);
-                    // get out if we need to
-                    if (_opSyncShouldExit) { break; }
-                }
-                timeToSleep = 0;
-            }
-            // get out if we need to
-            if (_opSyncShouldExit) { break; }
+                // get out if we need to
+                if (_opSyncShouldExit) { break; }
 
-            {
-                boost::unique_lock<boost::mutex> lck(_mutex);
-                _opSyncRunning = false;
-
-                while (!_opSyncShouldRun && !_opSyncShouldExit) {
-                    // notify other threads that we are not running
-                    _opSyncRunningCondVar.notify_all();
-                    // wait for permission that we can run
-                    _opSyncCanRunCondVar.wait(lck);
-                }
-
-                // notify other threads that we are running
-                _opSyncRunningCondVar.notify_all();
-                _opSyncRunning = true;
-            }
-            // get out if we need to
-            if (_opSyncShouldExit) { break; }
-
-            try {
                 MemberState state = theReplSet->state();
                 if (state.fatal() || state.startup()) {
                     timeToSleep = 5;
@@ -481,10 +481,15 @@ namespace mongo {
         GTID gtid = getGTIDFromBSON("_id", o);
         
         if( theReplSet->gtidManager->rollbackNeeded(gtid, ts, lastHash)) {
-            log() << "rollback needed! Our GTID" << 
+            log() << "Rollback needed! Our GTID" << 
                 theReplSet->gtidManager->getLiveState().toString() << 
-                " remote GTID: " << gtid.toString() << ". Going fatal." << rsLog;
-            theReplSet->goFatal();
+                " remote GTID: " << gtid.toString() << ". Attempting rollback." << rsLog;
+            
+            // starting from ourLast, we need to read the remote oplog
+            // backwards until we find an entry in the remote oplog
+            //GTID ourLast = theReplSet->gtidManager->getLiveState();
+            //shared_ptr<DBClientCursor> rollbackCursor = r.getRollbackCursor(ourLast);
+
             return true;
         }
 
