@@ -444,7 +444,7 @@ namespace OpLogHelpers{
             runCappedInsertFromOplog(ns, op);
         }
         else {
-            throw MsgAssertionException( 14825 , ErrorMsg("error in applyOperation : unknown opType ", *opType) );
+            throw MsgAssertionException( 16795 , ErrorMsg("error in applyOperation : unknown opType ", *opType) );
         }
     }
 } // namespace OpLogHelpers
