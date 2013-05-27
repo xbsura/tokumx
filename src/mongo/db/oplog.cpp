@@ -174,7 +174,6 @@ namespace mongo {
         uint64_t flags = (ND_UNIQUE_CHECKS_OFF | ND_LOCK_TREE_OFF);
         rsOplogDetails->insertObject(entry, flags);
     }
-
     // assumes oplog is read locked on entry
     void replicateTransactionToOplog(BSONObj& op) {
         // set the applied bool to false, to let the oplog know that
@@ -222,6 +221,25 @@ namespace mongo {
             // we are operating as a secondary. We don't have to fsync
             transaction.commit(DB_TXN_NOSYNC);
         }
+    }
+
+    void rollbackTransactionFromOplog(BSONObj entry) {
+        bool transactionAlreadyApplied = entry["a"].Bool();
+        Client::Transaction transaction(DB_SERIALIZABLE);
+        if (transactionAlreadyApplied) {
+            std::vector<BSONElement> ops = entry["ops"].Array();
+            const size_t numOps = ops.size();
+
+            for(size_t i = 0; i < numOps; ++i) {
+                BSONElement* curr = &ops[i];
+                OpLogHelpers::rollbackOperationFromOplog(curr->Obj());
+            }
+        }
+        {
+            Lock::DBRead lk1("local");
+            purgeEntryFromOplog(entry);
+        }
+        transaction.commit(DB_TXN_NOSYNC);
     }
     
     void purgeEntryFromOplog(BSONObj entry) {
