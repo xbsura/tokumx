@@ -479,21 +479,68 @@ namespace mongo {
         uint64_t ts = o["ts"]._numberLong();
         uint64_t lastHash = o["h"].numberLong();
         GTID gtid = getGTIDFromBSON("_id", o);
-        
-        if( theReplSet->gtidManager->rollbackNeeded(gtid, ts, lastHash)) {
-            log() << "Rollback needed! Our GTID" << 
-                theReplSet->gtidManager->getLiveState().toString() << 
-                " remote GTID: " << gtid.toString() << ". Attempting rollback." << rsLog;
-            
-            // starting from ourLast, we need to read the remote oplog
-            // backwards until we find an entry in the remote oplog
-            //GTID ourLast = theReplSet->gtidManager->getLiveState();
-            //shared_ptr<DBClientCursor> rollbackCursor = r.getRollbackCursor(ourLast);
 
-            return true;
+        if( !theReplSet->gtidManager->rollbackNeeded(gtid, ts, lastHash)) {
+            return false;
         }
 
-        return false;
+        log() << "Rollback needed! Our GTID" <<
+            theReplSet->gtidManager->getLiveState().toString() <<
+            " remote GTID: " << gtid.toString() << ". Attempting rollback." << rsLog;
+
+        // starting from ourLast, we need to read the remote oplog
+        // backwards until we find an entry in the remote oplog
+        // that has the same GTID, timestamp, and hash as
+        // what we have in our oplog. If we don't find one that is within
+        // some reasonable timeframe, then we go fatal
+        GTID ourLast = theReplSet->gtidManager->getLiveState();
+        shared_ptr<DBClientCursor> rollbackCursor = r.getRollbackCursor(ourLast);
+        GTID idToRollbackTo;
+        uint64_t rollbackPointTS;
+        uint64_t rollbackPointHash;
+        while (rollbackCursor->more()) {
+            BSONObj remoteObj = rollbackCursor->next();
+            GTID remoteGTID = getGTIDFromBSON("_id", remoteObj);
+            uint64_t remoteTS = remoteObj["ts"]._numberLong();
+            uint64_t remoteLastHash = remoteObj["h"].numberLong();
+            if (remoteTS + 1800*1000 < ts) {
+                log() << "replSet rollback too long a time period for a rollback (at least 30 minutes)." << rsLog;
+                break;
+            }
+            //now try to find an entry in our oplog with that GTID
+            BSONObjBuilder localQuery;
+            BSONObj localObj;
+            addGTIDToBSON("_id", remoteGTID, localQuery);
+            bool foundLocally = false;
+            {
+                Client::ReadContext ctx(rsoplog);
+                Client::Transaction transaction(DB_SERIALIZABLE);
+                foundLocally = Helpers::findOne( rsoplog, localQuery.done(), localObj);
+            }
+            if (foundLocally) {
+                GTID localGTID = getGTIDFromBSON("_id", localObj);
+                uint64_t localTS = localObj["ts"]._numberLong();
+                uint64_t localLastHash = localObj["h"].numberLong();
+                if (localLastHash == remoteLastHash &&
+                    localTS == remoteTS &&
+                    GTID::cmp(localGTID, remoteGTID) == 0
+                    )
+                {
+                    idToRollbackTo = localGTID;
+                    rollbackPointTS = localTS;
+                    rollbackPointHash = localLastHash;
+                    break;
+                }
+            }
+        }
+        // At this point, either we have found the point to try to rollback to,
+        // or we have determined that we cannot rollback
+        if (idToRollbackTo.isInitial()) {
+            // we cannot rollback
+        }
+        // proceed with the rollback to point idToRollbackTo
+
+        return true;
     }
 
     Member* BackgroundSync::getSyncTarget() {
