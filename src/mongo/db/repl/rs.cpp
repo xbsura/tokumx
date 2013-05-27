@@ -1069,6 +1069,18 @@ namespace mongo {
         _replOplogPurgeRunning = false;
     }
 
+    void ReplSetImpl::forceUpdateReplInfo() {
+        boost::unique_lock<boost::mutex> lock(_replInfoMutex);
+        GTID minUnappliedGTID;
+        GTID minLiveGTID;
+        verify(gtidManager != NULL);
+        gtidManager->getMins(&minLiveGTID, &minUnappliedGTID);
+        Lock::DBRead lk("local");
+        Client::Transaction transaction(DB_SERIALIZABLE);
+        logToReplInfo(minLiveGTID, minUnappliedGTID);
+        transaction.commit();
+    }
+
     void ReplSetImpl::updateReplInfoThread() {
         _replInfoUpdateRunning = true;
         GTID lastMinUnappliedGTID;
@@ -1080,6 +1092,7 @@ namespace mongo {
         while (_replBackgroundShouldRun) {
             if (theReplSet) {
                 try {
+                    boost::unique_lock<boost::mutex> lock(_replInfoMutex);
                     GTID minUnappliedGTID;
                     GTID minLiveGTID;
                     verify(gtidManager != NULL);

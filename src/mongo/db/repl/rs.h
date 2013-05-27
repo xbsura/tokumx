@@ -350,6 +350,7 @@ namespace mongo {
         void goFatal();
     private:
         // for replInfoUpdate
+        boost::mutex _replInfoMutex;
         bool _replInfoUpdateRunning;
         // for oplog purge
         bool _replOplogPurgeRunning;
@@ -535,6 +536,7 @@ namespace mongo {
 
         void stopReplication();
         void startReplication();
+        void forceUpdateReplInfo();
         
         int oplogVersion;
     };

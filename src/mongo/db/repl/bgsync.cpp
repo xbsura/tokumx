@@ -519,7 +519,7 @@ namespace mongo {
                 // we cannot rollback
                 throw RollbackOplogException("could not find ID to rollback to");
             }
-        }        
+        }
         catch (DBException& e) {
             throw RollbackOplogException("DBException while trying to find ID to rollback to: " + e.toString());
         }
@@ -543,41 +543,51 @@ namespace mongo {
             }
             verifySettled();
         }
-        // now that we are settled, we have to take care of the GTIDManager
-        // and the repl info thread.
-        // We need to reset the state of the GTIDManager to the point
-        // we intend to rollback to, and we need to make sure that the repl info thread
-        // has captured this information.
-        theReplSet->gtidManager->resetAfterInitialSync(
-            idToRollbackTo,
-            rollbackPointTS,
-            rollbackPointHash
-            );
-        // now force an update of the repl info thread
 
-        
-        // at this point, everything should be settled, the applier should
-        // have nothing left (and remain that way, because this is the only
-        // thread that can put work on the applier). Now we can rollback
-        // the data.
-        while (true) {
-            BSONObj o;
-            {
-                Lock::DBRead lk(rsoplog);
-                Client::Transaction txn(DB_SERIALIZABLE);
-                // if there is nothing in the oplog, break
-                if( !Helpers::getLast(rsoplog, o) ) {
+        try {
+            // now that we are settled, we have to take care of the GTIDManager
+            // and the repl info thread.
+            // We need to reset the state of the GTIDManager to the point
+            // we intend to rollback to, and we need to make sure that the repl info thread
+            // has captured this information.
+            theReplSet->gtidManager->resetAfterInitialSync(
+                idToRollbackTo,
+                rollbackPointTS,
+                rollbackPointHash
+                );
+            // now force an update of the repl info thread
+            theReplSet->forceUpdateReplInfo();
+
+            // at this point, everything should be settled, the applier should
+            // have nothing left (and remain that way, because this is the only
+            // thread that can put work on the applier). Now we can rollback
+            // the data.
+            while (true) {
+                BSONObj o;
+                {
+                    Lock::DBRead lk(rsoplog);
+                    Client::Transaction txn(DB_SERIALIZABLE);
+                    // if there is nothing in the oplog, break
+                    if( !Helpers::getLast(rsoplog, o) ) {
+                        break;
+                    }
+                }
+                GTID lastGTID = getGTIDFromBSON("_id", o);
+                // if we have rolled back enough, break from while loop
+                if (GTID::cmp(lastGTID, idToRollbackTo) <= 0) {
+                    dassert(GTID::cmp(lastGTID, idToRollbackTo) == 0);
                     break;
                 }
+                rollbackTransactionFromOplog(o);
             }
-            GTID lastGTID = getGTIDFromBSON("_id", o);
-            // if we have rolled back enough, break from while loop
-            if (GTID::cmp(lastGTID, idToRollbackTo) <= 0) {
-                dassert(GTID::cmp(lastGTID, idToRollbackTo) == 0);
-                break;
-            }
-            rollbackTransactionFromOplog(o);
         }
+        catch (DBException& e) {
+            throw RollbackOplogException("DBException while trying to run rollback: " + e.toString());
+        }
+        catch (std::exception& e2) {
+            throw RollbackOplogException(str::stream() << "Exception while trying to run rollback: " << e2.what());
+        }
+        
     }
 
     bool BackgroundSync::isRollbackRequired(OplogReader& r) {
