@@ -264,8 +264,6 @@ namespace mongo {
             }
         }
 
-        // this oplog reader does not do a handshake because we don't want the server it's syncing
-        // from to track how far it has synced
         OplogReader r(true /* doHandshake */);
 
         // find a target to sync from the last op time written
@@ -290,6 +288,7 @@ namespace mongo {
         }
 
         try {
+            // this method may actually run rollback, yes, the name is bad
             if (isRollbackRequired(r)) {
                 // sleep 1 second and try again. (The 1 is arbitrary).
                 // If we are not fatal, then we will keep trying to sync
@@ -544,6 +543,19 @@ namespace mongo {
             }
             verifySettled();
         }
+        // now that we are settled, we have to take care of the GTIDManager
+        // and the repl info thread.
+        // We need to reset the state of the GTIDManager to the point
+        // we intend to rollback to, and we need to make sure that the repl info thread
+        // has captured this information.
+        theReplSet->gtidManager->resetAfterInitialSync(
+            idToRollbackTo,
+            rollbackPointTS,
+            rollbackPointHash
+            );
+        // now force an update of the repl info thread
+
+        
         // at this point, everything should be settled, the applier should
         // have nothing left (and remain that way, because this is the only
         // thread that can put work on the applier). Now we can rollback

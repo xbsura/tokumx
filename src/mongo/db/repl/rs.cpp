@@ -1084,6 +1084,9 @@ namespace mongo {
                     GTID minLiveGTID;
                     verify(gtidManager != NULL);
                     gtidManager->getMins(&minLiveGTID, &minUnappliedGTID);
+                    // Note that these CANNOT be >, they must be !=. In the
+                    // case of rollback, these values may go backwards, and this
+                    // thread must capture that information.
                     if (GTID::cmp(lastMinLiveGTID, minLiveGTID) != 0 ||
                         GTID::cmp(lastMinUnappliedGTID, minUnappliedGTID) != 0
                         )
