@@ -539,7 +539,27 @@ namespace mongo {
             // we cannot rollback
         }
         // proceed with the rollback to point idToRollbackTo
-
+        // probably ought to grab a global write lock while doing this
+        // I don't think we want oplog cursors reading from this machine
+        // while we are rolling back. Or at least do something to protect against this
+        while (true) {
+            BSONObj o;
+            {
+                Lock::DBRead lk(rsoplog);
+                Client::Transaction txn(DB_SERIALIZABLE);
+                // if there is nothing in the oplog, break
+                if( !Helpers::getLast(rsoplog, o) ) {
+                    break;
+                }
+            }
+            GTID lastGTID = getGTIDFromBSON("_id", o);
+            // if we have rolled back enough, break from while loop
+            if (GTID::cmp(lastGTID, idToRollbackTo) <= 0) {
+                dassert(GTID::cmp(lastGTID, idToRollbackTo) == 0);
+                break;
+            }
+            rollbackTransactionFromOplog(o);
+        }
         return true;
     }
 

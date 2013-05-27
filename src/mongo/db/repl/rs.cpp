@@ -460,8 +460,7 @@ namespace mongo {
             uint64_t lastTime = o["ts"]._numberLong();
             uint64_t lastHash = o["h"].numberLong();
             gtidManager.reset(new GTIDManager(lastGTID, lastTime, lastHash, _id));
-            setTxnGTIDManager(gtidManager.get());
-            
+            setTxnGTIDManager(gtidManager.get());            
         }
         else {
             // make a GTIDManager that starts from scratch
