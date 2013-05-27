@@ -60,7 +60,7 @@ namespace mongo {
 
     void BackgroundSync::shutdown() {
         // first get producer thread to exit
-        log() << "trying to shutdown bgsync" << endl;
+        log() << "trying to shutdown bgsync" << rsLog;
         {
             boost::unique_lock<boost::mutex> lock(_mutex);
             _opSyncShouldExit = true;
@@ -71,10 +71,10 @@ namespace mongo {
         // just sleep for periods of one second
         // until we see that we are no longer running 
         // the opSync thread
-        log() << "waiting for opSync thread to end" << endl;
+        log() << "waiting for opSync thread to end" << rsLog;
         while (_opSyncInProgress) {
             sleepsecs(1);
-            log() << "still waiting for opSync thread to end... " << endl;
+            log() << "still waiting for opSync thread to end... " << rsLog;
         }
 
         // at this point, the opSync thread should be done
@@ -87,12 +87,12 @@ namespace mongo {
             _queueCond.notify_all();
         }
         // same reasoning as with _opSyncInProgress above
-        log() << "waiting for applier thread to end" << endl;
+        log() << "waiting for applier thread to end" << rsLog;
         while (_applierInProgress) {
             sleepsecs(1);
-            log() << "still waiting for applier thread to end..." << endl;
+            log() << "still waiting for applier thread to end..." << rsLog;
         }
-        log() << "shutdown of bgsync complete" << endl;
+        log() << "shutdown of bgsync complete" << rsLog;
     }
 
     void BackgroundSync::applierThread() {
@@ -526,6 +526,7 @@ namespace mongo {
                     GTID::cmp(localGTID, remoteGTID) == 0
                     )
                 {
+                    log() << "found id to rollback to " << idToRollbackto << rsLog;
                     idToRollbackTo = localGTID;
                     rollbackPointTS = localTS;
                     rollbackPointHash = localLastHash;
@@ -538,10 +539,26 @@ namespace mongo {
         if (idToRollbackTo.isInitial()) {
             // we cannot rollback
         }
+
         // proceed with the rollback to point idToRollbackTo
         // probably ought to grab a global write lock while doing this
         // I don't think we want oplog cursors reading from this machine
         // while we are rolling back. Or at least do something to protect against this
+
+        // first, let's get all the operations that are being applied out of the way,
+        // we don't want to rollback an item in the oplog while simultaneously,
+        // the applier thread is applying it to the oplog
+        {
+            boost::unique_lock<boost::mutex> lock(_mutex);
+            while (_deque.size() > 0) {
+                log() << "waiting for applier to finish work before doing rollback " << rsLog;
+                _queueDone.wait(lock);
+            }
+        }
+        // at this point, everything should be settled, the applier should
+        // have nothing left (and remain that way, because this is the only
+        // thread that can put work on the applier). Now we can rollback
+        // the data.
         while (true) {
             BSONObj o;
             {
@@ -594,7 +611,7 @@ namespace mongo {
             lastLiveGTID.toString() << " " << 
             lastUnappliedGTID.toString() << " " << 
             minLiveGTID.toString() << " " <<
-            minUnappliedGTID.toString() << endl;
+            minUnappliedGTID.toString() << rsLog;
     }
 
     void BackgroundSync::stopOpSyncThread() {

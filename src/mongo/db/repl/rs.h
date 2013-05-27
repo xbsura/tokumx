@@ -330,6 +330,13 @@ namespace mongo {
         StateBox box;
 
         shared_ptr<GTIDManager> gtidManager;
+        // this lock protects the _blockSync variable and the _maintenanceMode
+        // variable. It must be taken before the rslock. It protects state changes
+        // that depend on those variables, meaning RS_SECONDARY, RS_PRIMARY,
+        // and RS_RECOVERING. Because one stops the opsync thread with this
+        // lock held, and stopping the opsync thread may take seconds, this
+        // lock may be held for a long time and should be taken before the
+        // rslock.
         boost::mutex stateChangeMutex;
         bool forceSyncFrom(const string& host, string& errmsg, BSONObjBuilder& result);
 
@@ -352,13 +359,6 @@ namespace mongo {
         boost::mutex _purgeMutex;
         boost::condition _purgeCond;
 
-        // this lock protects the _blockSync variable and the _maintenanceMode
-        // variable. It must be taken before the rslock. It protects state changes
-        // that depend on those variables, meaning RS_SECONDARY, RS_PRIMARY,
-        // and RS_RECOVERING. Because one stops the opsync thread with this
-        // lock held, and stopping the opsync thread may take seconds, this
-        // lock may be held for a long time and should be taken before the
-        // rslock.
         set<ReplSetHealthPollTask*> healthTasks;
         void endOldHealthTasks();
         void startHealthTaskFor(Member *m);

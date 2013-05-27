@@ -14,4 +14,8 @@ namespace mongo {
         const char * what() const throw () { return "RetryAfterSleepException"; }
     };
 
+    class RollbackOplogException : public std::exception {
+    public:
+        const char * what() const throw () { return "RollbackOplogException"; }
+    };
 }
