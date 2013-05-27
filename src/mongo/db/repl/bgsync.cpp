@@ -466,33 +466,7 @@ namespace mongo {
         }
     }
 
-    bool BackgroundSync::isRollbackRequired(OplogReader& r) {
-        string hn = r.conn()->getServerAddress();
-        if (!r.more()) {
-            // In vanilla Mongo, this happened for one of the
-            // following reasons:
-            //  - we were ahead of what we are syncing from (don't
-            //    think that is possible anymore)
-            //  - remote oplog is empty for some weird reason
-            // in either case, if it (strangely) happens, we'll just return
-            // and our caller will simply try again after a short sleep.
-            log() << "replSet error empty query result from " << hn << " oplog" << rsLog;
-            return true;
-        }
-
-        BSONObj o = r.nextSafe();
-        uint64_t ts = o["ts"]._numberLong();
-        uint64_t lastHash = o["h"].numberLong();
-        GTID gtid = getGTIDFromBSON("_id", o);
-
-        if( !theReplSet->gtidManager->rollbackNeeded(gtid, ts, lastHash)) {
-            return false;
-        }
-
-        log() << "Rollback needed! Our GTID" <<
-            theReplSet->gtidManager->getLiveState().toString() <<
-            " remote GTID: " << gtid.toString() << ". Attempting rollback." << rsLog;
-
+    void BackgroundSync::runRollback(OplogReader& r, uint64_t oplogTS) {
         // starting from ourLast, we need to read the remote oplog
         // backwards until we find an entry in the remote oplog
         // that has the same GTID, timestamp, and hash as
@@ -509,8 +483,8 @@ namespace mongo {
                 GTID remoteGTID = getGTIDFromBSON("_id", remoteObj);
                 uint64_t remoteTS = remoteObj["ts"]._numberLong();
                 uint64_t remoteLastHash = remoteObj["h"].numberLong();
-                if (remoteTS + 1800*1000 < ts) {
-                    log() << "replSet rollback too long a time period for a rollback (at least 30 minutes)." << rsLog;
+                if (remoteTS + 1800*1000 < oplogTS) {
+                    throw RollbackOplogException("replSet rollback too long a time period for a rollback (at least 30 minutes).");
                     break;
                 }
                 //now try to find an entry in our oplog with that GTID
@@ -592,6 +566,36 @@ namespace mongo {
             }
             rollbackTransactionFromOplog(o);
         }
+    }
+
+    bool BackgroundSync::isRollbackRequired(OplogReader& r) {
+        string hn = r.conn()->getServerAddress();
+        if (!r.more()) {
+            // In vanilla Mongo, this happened for one of the
+            // following reasons:
+            //  - we were ahead of what we are syncing from (don't
+            //    think that is possible anymore)
+            //  - remote oplog is empty for some weird reason
+            // in either case, if it (strangely) happens, we'll just return
+            // and our caller will simply try again after a short sleep.
+            log() << "replSet error empty query result from " << hn << " oplog" << rsLog;
+            return true;
+        }
+
+        BSONObj o = r.nextSafe();
+        uint64_t ts = o["ts"]._numberLong();
+        uint64_t lastHash = o["h"].numberLong();
+        GTID gtid = getGTIDFromBSON("_id", o);
+
+        if( !theReplSet->gtidManager->rollbackNeeded(gtid, ts, lastHash)) {
+            return false;
+        }
+
+        log() << "Rollback needed! Our GTID" <<
+            theReplSet->gtidManager->getLiveState().toString() <<
+            " remote GTID: " << gtid.toString() << ". Attempting rollback." << rsLog;
+
+        runRollback(r, ts);
         return true;
     }
 
