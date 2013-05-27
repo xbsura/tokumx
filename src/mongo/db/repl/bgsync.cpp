@@ -289,11 +289,16 @@ namespace mongo {
             return 0;
         }
 
-        if (isRollbackRequired(r)) {
-            // for now, sleep 5 seconds and try again.
-            // If we are not fatal, then we will keep trying to sync
-            // from another machine
-            return 5;
+        try {
+            if (isRollbackRequired(r)) {
+                // sleep 1 second and try again. (The 1 is arbitrary).
+                // If we are not fatal, then we will keep trying to sync
+                // from another machine
+                return 2;
+            }
+        }
+        catch (RollbackOplogException& re){
+            // we attempted a rollback and failed, we must go fatal.
         }
 
         while (!_opSyncShouldExit) {
@@ -563,6 +568,7 @@ namespace mongo {
                 log() << "waiting for applier to finish work before doing rollback " << rsLog;
                 _queueDone.wait(lock);
             }
+            verifySettled();
         }
         // at this point, everything should be settled, the applier should
         // have nothing left (and remain that way, because this is the only

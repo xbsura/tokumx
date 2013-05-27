@@ -365,6 +365,11 @@ namespace OpLogHelpers{
         _runCommands(ns, command, bb, ob, true, 0);
     }
 
+    static void rollbackCommandFromOplog(const char* ns, BSONObj op) {
+        BSONObj command = op[KEY_STR_ROW].embeddedObject();
+        throw RollbackOplogException(str::stream() << "Could not rollback command " << command << " on ns " << ns);
+    }
+    
     void applyOperationFromOplog(const BSONObj& op) {
         LOG(6) << "applying op: " << op << endl;
         OpCounters* opCounters = &replOpCounters;
@@ -430,9 +435,7 @@ namespace OpLogHelpers{
             runInsertFromOplog(ns, op);
         }
         else if (strcmp(opType, OP_STR_COMMAND) == 0) {
-            verify(false);
-            // TODO: Handle commands
-            //runCommandFromOplog(ns, op);
+            rollbackCommandFromOplog(ns, op);
         }
         else if (strcmp(opType, OP_STR_COMMENT) == 0) {
             // no-op
