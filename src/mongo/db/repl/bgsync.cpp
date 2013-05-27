@@ -494,50 +494,59 @@ namespace mongo {
         // what we have in our oplog. If we don't find one that is within
         // some reasonable timeframe, then we go fatal
         GTID ourLast = theReplSet->gtidManager->getLiveState();
-        shared_ptr<DBClientCursor> rollbackCursor = r.getRollbackCursor(ourLast);
         GTID idToRollbackTo;
         uint64_t rollbackPointTS;
         uint64_t rollbackPointHash;
-        while (rollbackCursor->more()) {
-            BSONObj remoteObj = rollbackCursor->next();
-            GTID remoteGTID = getGTIDFromBSON("_id", remoteObj);
-            uint64_t remoteTS = remoteObj["ts"]._numberLong();
-            uint64_t remoteLastHash = remoteObj["h"].numberLong();
-            if (remoteTS + 1800*1000 < ts) {
-                log() << "replSet rollback too long a time period for a rollback (at least 30 minutes)." << rsLog;
-                break;
-            }
-            //now try to find an entry in our oplog with that GTID
-            BSONObjBuilder localQuery;
-            BSONObj localObj;
-            addGTIDToBSON("_id", remoteGTID, localQuery);
-            bool foundLocally = false;
-            {
-                Client::ReadContext ctx(rsoplog);
-                Client::Transaction transaction(DB_SERIALIZABLE);
-                foundLocally = Helpers::findOne( rsoplog, localQuery.done(), localObj);
-            }
-            if (foundLocally) {
-                GTID localGTID = getGTIDFromBSON("_id", localObj);
-                uint64_t localTS = localObj["ts"]._numberLong();
-                uint64_t localLastHash = localObj["h"].numberLong();
-                if (localLastHash == remoteLastHash &&
-                    localTS == remoteTS &&
-                    GTID::cmp(localGTID, remoteGTID) == 0
-                    )
-                {
-                    log() << "found id to rollback to " << idToRollbackTo << rsLog;
-                    idToRollbackTo = localGTID;
-                    rollbackPointTS = localTS;
-                    rollbackPointHash = localLastHash;
+        try {
+            shared_ptr<DBClientCursor> rollbackCursor = r.getRollbackCursor(ourLast);
+            while (rollbackCursor->more()) {
+                BSONObj remoteObj = rollbackCursor->next();
+                GTID remoteGTID = getGTIDFromBSON("_id", remoteObj);
+                uint64_t remoteTS = remoteObj["ts"]._numberLong();
+                uint64_t remoteLastHash = remoteObj["h"].numberLong();
+                if (remoteTS + 1800*1000 < ts) {
+                    log() << "replSet rollback too long a time period for a rollback (at least 30 minutes)." << rsLog;
                     break;
                 }
+                //now try to find an entry in our oplog with that GTID
+                BSONObjBuilder localQuery;
+                BSONObj localObj;
+                addGTIDToBSON("_id", remoteGTID, localQuery);
+                bool foundLocally = false;
+                {
+                    Client::ReadContext ctx(rsoplog);
+                    Client::Transaction transaction(DB_SERIALIZABLE);
+                    foundLocally = Helpers::findOne( rsoplog, localQuery.done(), localObj);
+                }
+                if (foundLocally) {
+                    GTID localGTID = getGTIDFromBSON("_id", localObj);
+                    uint64_t localTS = localObj["ts"]._numberLong();
+                    uint64_t localLastHash = localObj["h"].numberLong();
+                    if (localLastHash == remoteLastHash &&
+                        localTS == remoteTS &&
+                        GTID::cmp(localGTID, remoteGTID) == 0
+                        )
+                    {
+                        log() << "found id to rollback to " << idToRollbackTo << rsLog;
+                        idToRollbackTo = localGTID;
+                        rollbackPointTS = localTS;
+                        rollbackPointHash = localLastHash;
+                        break;
+                    }
+                }
             }
+            // At this point, either we have found the point to try to rollback to,
+            // or we have determined that we cannot rollback
+            if (idToRollbackTo.isInitial()) {
+                // we cannot rollback
+                throw RollbackOplogException("could not find ID to rollback to");
+            }
+        }        
+        catch (DBException& e) {
+            throw RollbackOplogException("DBException while trying to find ID to rollback to: " + e.toString());
         }
-        // At this point, either we have found the point to try to rollback to,
-        // or we have determined that we cannot rollback
-        if (idToRollbackTo.isInitial()) {
-            // we cannot rollback
+        catch (std::exception& e2) {
+            throw RollbackOplogException(str::stream() << "Exception while trying to find ID to rollback to: " << e2.what());
         }
 
         // proceed with the rollback to point idToRollbackTo
