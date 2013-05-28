@@ -135,17 +135,26 @@ function verify(db) {
 
 doTest = function (signal) {
 
-    var replTest = new ReplSetTest({ name: 'unicomplex', nodes: 3 });
-    var nodes = replTest.nodeList();
-    //print(tojson(nodes));
+	var num = 3;
+	var host = getHostName();
+	var name = "tags";
+	var timeout = 60000;
 
-    var conns = replTest.startSet();
-    var r = replTest.initiate({ "_id": "unicomplex",
-        "members": [
-                             { "_id": 0, "host": nodes[0] },
-                             { "_id": 1, "host": nodes[1] },
-                             { "_id": 2, "host": nodes[2], arbiterOnly: true}]
-    });
+	var replTest = new ReplSetTest( {name: name, nodes: num, startPort:31000} );
+	var conns = replTest.startSet();
+	var port = replTest.ports;
+	var config = {_id : name, members :
+	        [
+	         {_id:0, host : host+":"+port[0]},
+	         {_id:1, host : host+":"+port[1]},
+	         {_id:2, host : host+":"+port[2], arbiterOnly : true},
+	        ],
+             };
+
+	replTest.initiate(config);
+
+	replTest.awaitReplication();
+	replTest.bridge();
 
     // Make sure we have a master
     var master = replTest.getMaster();
@@ -183,24 +192,28 @@ doTest = function (signal) {
         return status.members[1].state == 2;
       });
 
-    replTest.bridge();
     master = replTest.getMaster();
 	print("disconnect primary from everywhere");
 	replTest.partition(0,1);
 	replTest.partition(0,2);
 	// do some writes to a before it realizes it can no longer be primary
+	print("do Items to Rollback");
     doItemsToRollBack(a);
 	// wait for b to become master
+	print("wait for B to become master");
     wait(function () { return B.isMaster().ismaster; });
+	// if I don't add this line, we have interesting problems with multiple primaries, because
+	// A comes back before it has stepped down.
+    //wait(function () { return !A.isMaster().ismaster; });
 	// do some writes to b, as it is the new master
+	print("new writes on b");
     doWritesToKeep2(b);
 	// now bring a back
+	print("connect A back");
 	replTest.unPartition(0,1);
 	replTest.unPartition(0,2);
+    sleep(5000);
 
-    wait(function () { try { return !B.isMaster().ismaster; } catch(e) { return false; } });
-    wait(function () { try { return A.isMaster().ismaster; } catch(e) { return false; } });
-    
     // everyone is up here...
     replTest.awaitReplication();
     assert( dbs_match(a,b), "server data sets do not match after rollback, something is wrong");

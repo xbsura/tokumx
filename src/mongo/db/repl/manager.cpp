@@ -86,6 +86,7 @@ namespace mongo {
                 return;
             }
 
+            log() << "we see a remote is primary, relinquishing primary" << rsLog;
             rs->relinquish();
         }
 
@@ -123,6 +124,7 @@ namespace mongo {
                 // replSetStepDown tries to acquire the same lock
                 // msgCheckNewState takes, so we can't call replSetStepDown on
                 // ourselves.
+                log() << "another machine has higher priority and is close to us, relinquishing primary" << rsLog;
                 rs->relinquish();
             }
             else {
