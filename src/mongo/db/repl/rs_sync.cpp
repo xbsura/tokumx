@@ -150,7 +150,9 @@ namespace mongo {
             if (block && !_blockSync) {
                 stopReplication();
                 RSBase::lock lk(this);
-                changeState(MemberState::RS_RECOVERING);
+                if (!box.getState().fatal()) {
+                    changeState(MemberState::RS_RECOVERING);
+                }
             }
             else if (!block && _blockSync) {
                 // this is messy

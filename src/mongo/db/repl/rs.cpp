@@ -127,16 +127,17 @@ namespace mongo {
                 errmsg = "arbiters can't modify maintenance mode";
                 return false;
             }
-            else if (!box.getState().secondary() && !box.getState().recovering()) {
-                errmsg = "cannot modify maintenance mode unless in secondary state or recovering state";
-                return false;
-            }
         }
 
         if (inc) {
             log() << "replSet going into maintenance mode (" << _maintenanceMode << " other tasks)" << rsLog;
 
             stopReplication();
+            // check after stopReplication because we may be fatal
+            if (!box.getState().secondary() && !box.getState().recovering()) {
+                errmsg = "cannot modify maintenance mode unless in secondary state or recovering state";
+                return false;
+            }
             RSBase::lock lk(this);
             // Lock here to prevent state from changing between checking the state and changing it
             // also, grab GlobalWrite here, because it must be grabbed after rslock
@@ -150,6 +151,7 @@ namespace mongo {
             Lock::GlobalWrite writeLock;
             // user error
             if (_maintenanceMode <= 0) {
+                errmsg = "cannot set maintenance mode to false when not in maintenance mode to begin with";
                 return false;
             }
             _maintenanceMode--;
@@ -929,6 +931,8 @@ namespace mongo {
             log() << "stopped replication because we have a new config" << endl;
             // going into this function, we know there is no replication running
             RSBase::lock lk(this);
+            // if we are fatal, we will just fall into the catch block below
+            massert(0, "we are fatal, cannot create a new config", !state().fatal());
             if (initFromConfig(newConfig, true)) {
                 log() << "replSet replSetReconfig new config saved locally" << rsLog;
             }
