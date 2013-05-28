@@ -290,7 +290,7 @@ namespace mongo {
         try {
             // this method may actually run rollback, yes, the name is bad
             if (isRollbackRequired(r)) {
-                // sleep 1 second and try again. (The 1 is arbitrary).
+                // sleep 2 seconds and try again. (The 2 is arbitrary).
                 // If we are not fatal, then we will keep trying to sync
                 // from another machine
                 return 2;
