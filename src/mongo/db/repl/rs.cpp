@@ -89,16 +89,19 @@ namespace mongo {
     bool ReplSetImpl::assumePrimary() {
         boost::unique_lock<boost::mutex> lock(stateChangeMutex);
         
-        // Can't prove to myself that we are guaranteed to be
-        // in the secondary state here, so putting this here.
+        // Make sure replication has stopped
+        stopReplication();
+
+        // Theoretically, we could have been in the rollback state when
+        // we decided to assume primary, and then transitioned to fatal
+        // before stopping replication. If so, just get out.
+        // Given that we are not a secondary, it is ok that replication is
+        // stopped
         if (state() != MemberState::RS_SECONDARY) {
             return false;
         }
         LOG(2) << "replSet assuming primary" << endl;
         verify( iAmPotentiallyHot() );
-
-        // Make sure replication has stopped        
-        stopReplication();
 
         RSBase::lock rslk(this);
         Lock::GlobalWrite lk;
