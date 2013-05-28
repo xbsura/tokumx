@@ -298,7 +298,8 @@ namespace mongo {
             }
         }
         catch (RollbackOplogException& re){
-            // we attempted a rollback and failed, we must go fatal.            
+            // we attempted a rollback and failed, we must go fatal.
+            log() << "Caught a RollbackOplogException during rollback, going fatal" << rsLog;
             theReplSet->fatal();
         }
 
@@ -487,6 +488,7 @@ namespace mongo {
                 uint64_t remoteTS = remoteObj["ts"]._numberLong();
                 uint64_t remoteLastHash = remoteObj["h"].numberLong();
                 if (remoteTS + 1800*1000 < oplogTS) {
+                    log() << "Rollback takes us too far back, throwing exception. remoteTS: " << remoteTS << " oplogTS: " << oplogTS << rsLog;
                     throw RollbackOplogException("replSet rollback too long a time period for a rollback (at least 30 minutes).");
                     break;
                 }
@@ -525,9 +527,11 @@ namespace mongo {
             }
         }
         catch (DBException& e) {
+            log() << "Caught DBException during rollback " << e.toString() << rsLog;
             throw RollbackOplogException("DBException while trying to find ID to rollback to: " + e.toString());
         }
         catch (std::exception& e2) {
+            log() << "Caught std::exception during rollback " << e2.what() << rsLog;
             throw RollbackOplogException(str::stream() << "Exception while trying to find ID to rollback to: " << e2.what());
         }
 
@@ -599,9 +603,11 @@ namespace mongo {
             theReplSet->leaveRollbackState();
         }
         catch (DBException& e) {
+            log() << "Caught DBException during rollback " << e.toString() << rsLog;
             throw RollbackOplogException("DBException while trying to run rollback: " + e.toString());
         }
         catch (std::exception& e2) {
+            log() << "Caught std::exception during rollback " << e2.what() << rsLog;
             throw RollbackOplogException(str::stream() << "Exception while trying to run rollback: " << e2.what());
         }
         

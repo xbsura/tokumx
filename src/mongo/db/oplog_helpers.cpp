@@ -367,6 +367,7 @@ namespace OpLogHelpers{
 
     static void rollbackCommandFromOplog(const char* ns, BSONObj op) {
         BSONObj command = op[KEY_STR_ROW].embeddedObject();
+        log() << "Cannot rollback command " << op << rsLog;
         throw RollbackOplogException(str::stream() << "Could not rollback command " << command << " on ns " << ns);
     }
     
