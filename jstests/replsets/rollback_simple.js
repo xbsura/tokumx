@@ -183,58 +183,26 @@ doTest = function (signal) {
         return status.members[1].state == 2;
       });
 
-    
-    A.runCommand({ replSetTest: 1, blind: true });
-    reconnect(a, b);
-    
+    replTest.bridge();
+    master = replTest.getMaster();
+	print("disconnect primary from everywhere");
+	replTest.partition(0,1);
+	replTest.partition(0,2);
+	// do some writes to a before it realizes it can no longer be primary
+    doItemsToRollBack(a);
+	// wait for b to become master
     wait(function () { return B.isMaster().ismaster; });
-
-    doItemsToRollBack(b);
-
-    // a should not have the new data as it was in blind state.
-    B.runCommand({ replSetTest: 1, blind: true });
-    reconnect(a, b);
-    A.runCommand({ replSetTest: 1, blind: false });
-    reconnect(a,b);
+	// do some writes to b, as it is the new master
+    doWritesToKeep2(b);
+	// now bring a back
+	replTest.unPartition(0,1);
+	replTest.unPartition(0,2);
 
     wait(function () { try { return !B.isMaster().ismaster; } catch(e) { return false; } });
     wait(function () { try { return A.isMaster().ismaster; } catch(e) { return false; } });
-
-    assert(a.bar.count() >= 1, "count check");
-    doWritesToKeep2(a);
-
-    // A is 1 2 3 7 8
-    // B is 1 2 3 4 5 6
-
-    // bring B back online
-    // as A is primary, B will roll back and then catch up
-    B.runCommand({ replSetTest: 1, blind: false });
-    reconnect(a,b);
-    
-    wait(function () { return B.isMaster().ismaster || B.isMaster().secondary; });
     
     // everyone is up here...
     replTest.awaitReplication();
-
-    // theoretically, a read could slip in between StateBox::change() printing
-    // replSet SECONDARY
-    // and the replset actually becoming secondary
-    // so we're trying to wait for that here
-    print("waiting for secondary");
-    assert.soon(function() {
-        try {
-          var aim = A.isMaster();
-          var bim = B.isMaster();
-          return (aim.ismaster || aim.secondary) &&
-            (bim.ismaster || bim.secondary);
-        }
-        catch(e) {
-          print("checking A and B: "+e);
-        }
-      });
-    
-    verify(a);
-
     assert( dbs_match(a,b), "server data sets do not match after rollback, something is wrong");
 
     pause("rollback2.js SUCCESS");

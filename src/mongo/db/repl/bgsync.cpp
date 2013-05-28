@@ -339,6 +339,7 @@ namespace mongo {
                 // This is the operation we have received from the target
                 // that we must put in our oplog with an applied field of false
                 BSONObj o = r.nextSafe().getOwned();
+                log() << "replicating " << o.toString(false, true) << " from " << _currentSyncTarget->fullName() << endl;
                 uint64_t ts = o["ts"]._numberLong();
 
                 // now that we have the element in o, let's check
@@ -626,6 +627,7 @@ namespace mongo {
         GTID gtid = getGTIDFromBSON("_id", o);
 
         if( !theReplSet->gtidManager->rollbackNeeded(gtid, ts, lastHash)) {
+            log() << "Rollback NOT needed! Our GTID" << gtid << endl;
             return false;
         }
 

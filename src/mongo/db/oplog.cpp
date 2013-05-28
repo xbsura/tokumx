@@ -83,6 +83,8 @@ namespace mongo {
         b.append("ops", opInfo);
 
         BSONObj bb = b.done();
+        // write it to oplog
+        log() << "writing " << bb.toString(false, true) << " to master " << endl;
         writeEntryToOplog(bb);
     }
 
@@ -179,7 +181,6 @@ namespace mongo {
         // set the applied bool to false, to let the oplog know that
         // this entry has not been applied to collections
         BSONElementManipulator(op["a"]).setBool(false);
-        // write it to oplog
         writeEntryToOplog(op);
     }
 
