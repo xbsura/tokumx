@@ -22,6 +22,7 @@
 #include "mongo/db/repl/rs_sync.h"
 
 namespace mongo {
+    void incRBID();
     BackgroundSync* BackgroundSync::s_instance = 0;
     boost::mutex BackgroundSync::s_mutex;
 
