@@ -485,11 +485,6 @@ namespace mongo {
                 BSONObj remoteObj = rollbackCursor->next();
                 GTID remoteGTID = getGTIDFromBSON("_id", remoteObj);
                 uint64_t remoteTS = remoteObj["ts"]._numberLong();
-                if (oplogTS == 0) {
-                    // in case we are rolling back due to not finding an element,
-                    // see isRollbackRequired
-                    oplogTS = remoteTS;
-                }
                 uint64_t remoteLastHash = remoteObj["h"].numberLong();
                 if (remoteTS + 1800*1000 < oplogTS) {
                     throw RollbackOplogException("replSet rollback too long a time period for a rollback (at least 30 minutes).");
@@ -623,8 +618,7 @@ namespace mongo {
             // in either case, if it (strangely) happens, we'll just return
             // and our caller will simply try again after a short sleep.
             log() << "replSet error empty query result from " << hn << " oplog, attempting rollback" << rsLog;
-            runRollback(r, 0);
-            return true;
+             return true;
         }
 
         BSONObj o = r.nextSafe();
