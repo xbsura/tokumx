@@ -297,7 +297,8 @@ namespace mongo {
             }
         }
         catch (RollbackOplogException& re){
-            // we attempted a rollback and failed, we must go fatal.
+            // we attempted a rollback and failed, we must go fatal.            
+            theReplSet->fatal();
         }
 
         while (!_opSyncShouldExit) {
@@ -475,6 +476,7 @@ namespace mongo {
         GTID idToRollbackTo;
         uint64_t rollbackPointTS;
         uint64_t rollbackPointHash;
+        incRBID();
         try {
             shared_ptr<DBClientCursor> rollbackCursor = r.getRollbackCursor(ourLast);
             while (rollbackCursor->more()) {
@@ -544,6 +546,18 @@ namespace mongo {
             verifySettled();
         }
 
+        // now let's tell the system we are going to rollback, to do so,
+        // abort live multi statement transactions, invalidate cursors, and
+        // change the state to RS_ROLLBACK
+        {
+            rwlock(multiStmtTransactionLock, true);
+            // so we know writes are not simultaneously occurring
+            Lock::GlobalWrite lk;
+            ClientCursor::invalidateAllCursors();
+            Client::abortLiveTransactions();
+            theReplSet->goToRollbackState();
+        }
+
         try {
             // now that we are settled, we have to take care of the GTIDManager
             // and the repl info thread.
@@ -580,6 +594,7 @@ namespace mongo {
                 }
                 rollbackTransactionFromOplog(o);
             }
+            theReplSet->leaveRollbackState();
         }
         catch (DBException& e) {
             throw RollbackOplogException("DBException while trying to run rollback: " + e.toString());

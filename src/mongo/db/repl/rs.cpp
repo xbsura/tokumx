@@ -82,8 +82,12 @@ namespace mongo {
         changeState(MemberState::RS_FATAL);
     }
 
-    void ReplSetImpl::goFatal() {
-        changeState(MemberState::RS_FATAL);
+    void ReplSetImpl::goToRollbackState() {
+        changeState(MemberState::RS_ROLLBACK);
+    }
+
+    void ReplSetImpl::leaveRollbackState() {
+        changeState(MemberState::RS_SECONDARY);
     }
     
     bool ReplSetImpl::assumePrimary() {

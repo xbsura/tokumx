@@ -347,7 +347,8 @@ namespace mongo {
         void veto(const string& host, unsigned secs=10);
         bool gotForceSync();
         void goStale(const Member* stale, GTID remoteGTID);
-        void goFatal();
+        void goToRollbackState();
+        void leaveRollbackState();
     private:
         // for replInfoUpdate
         boost::mutex _replInfoMutex;
