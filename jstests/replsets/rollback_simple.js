@@ -202,9 +202,6 @@ doTest = function (signal) {
 	// wait for b to become master
 	print("wait for B to become master");
     wait(function () { return B.isMaster().ismaster; });
-	// if I don't add this line, we have interesting problems with multiple primaries, because
-	// A comes back before it has stepped down.
-    //wait(function () { return !A.isMaster().ismaster; });
 	// do some writes to b, as it is the new master
 	print("new writes on b");
     doWritesToKeep2(b);
