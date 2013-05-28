@@ -509,10 +509,10 @@ namespace mongo {
                         GTID::cmp(localGTID, remoteGTID) == 0
                         )
                     {
-                        log() << "found id to rollback to " << idToRollbackTo << rsLog;
                         idToRollbackTo = localGTID;
                         rollbackPointTS = localTS;
                         rollbackPointHash = localLastHash;
+                        log() << "found id to rollback to " << idToRollbackTo << rsLog;
                         break;
                     }
                 }
