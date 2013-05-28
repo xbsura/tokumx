@@ -81,11 +81,10 @@ namespace mongo {
         }
 
         if (rs->box.getState().primary()) {
-            // make sure exactly one primary steps down
-            if (rs->selfId() < m->id()) {
-                return;
-            }
-
+            // vanilla mongo tries to make sure that only one will step down
+            // we will step down regardless, because we want an election
+            // to figure out who should be the rightful primary.
+            
             log() << "we see a remote is primary, relinquishing primary" << rsLog;
             rs->relinquish();
         }
@@ -233,6 +232,15 @@ namespace mongo {
                         if( rs->elect.shouldRelinquish() ) {
                             log() << "can't see a majority of the set, relinquishing primary" << rsLog;
                             rs->relinquish();
+                        }
+
+                        if (GTID::cmp(theReplSet->gtidManager->getLiveState(), theReplSet->lastOtherGTID()) < 0) {
+                            // this can happen if we transiently have two primaries, which can
+                            // happen if a primary loses contact with the replica set,
+                            // triggering an election, but it connects back before it has a
+                            // chance to step down
+                            log() << "we see a secondary that is ahead, relinquishing primary" << rsLog;
+                            rs->relinquish();                            
                         }
 
                         return;
