@@ -623,7 +623,7 @@ namespace mongo {
             // in either case, if it (strangely) happens, we'll just return
             // and our caller will simply try again after a short sleep.
             log() << "replSet error empty query result from " << hn << " oplog, attempting rollback" << rsLog;
-            runRollback(r, ts);
+            runRollback(r, 0);
             return true;
         }
 
