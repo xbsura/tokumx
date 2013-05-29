@@ -51,7 +51,9 @@ namespace mongo {
                 );
         }
 
-        d->updateObject( pk, oldObj, newObj );
+        // if newObj has no _id field, it should inherit the existing value
+        BSONObj newObjWithId = inheritIdField(oldObj, newObj);
+        d->updateObject( pk, oldObj, newObjWithId );
         if (nsdt != NULL) {
             nsdt->notifyOfWriteOp();
         }
