@@ -54,8 +54,8 @@ function dbs_match(a, b) {
 
     var ac = a.system.namespaces.find().sort({name:1}).toArray();
     var bc = b.system.namespaces.find().sort({name:1}).toArray();
-    if (!friendlyEqual(ac, bc)) {
-        print("dbs_match: namespaces don't match");
+	if (ac.length != bc.length) {
+        print("dbs_match: namespaces don't match, lengths different");
         print("\n\n");
         printjson(ac);
         print("\n\n");
@@ -63,6 +63,17 @@ function dbs_match(a, b) {
         print("\n\n");
         return false;
     }
+	for (var i = 0; i < ac.length; i++) {
+		if (ac[i].name != bc[i].name) {
+	        print("dbs_match: namespaces don't match");
+	        print("\n\n");
+	        printjson(ac);
+	        print("\n\n");
+	        printjson(bc);
+	        print("\n\n");
+	        return false;
+		}
+	}
 
     var c = a.getCollectionNames();
     for( var i in c ) {
@@ -158,13 +169,12 @@ doTest = function (signal) {
 
     // Make sure we have a master
     var master = replTest.getMaster();
-    a_conn = conns[0];
+    a_conn = (master == conns[0]) ? conns[0] : conns[1];
     A = a_conn.getDB("admin");
-    b_conn = conns[1];
+    b_conn = (master == conns[0]) ? conns[1] : conns[0];
     a_conn.setSlaveOk();
     b_conn.setSlaveOk();
     B = b_conn.getDB("admin");
-    assert(master == conns[0], "conns[0] assumed to be master");
     assert(a_conn == master);
 
     //deb(master);
@@ -178,19 +188,9 @@ doTest = function (signal) {
     // Wait for initial replication
     var a = a_conn.getDB("foo");
     var b = b_conn.getDB("foo");
-    wait(function () {
-        var status = A.runCommand({replSetGetStatus : 1});
-        return status.members[1].state == 2;
-      });
 
     doInitialWrites(a);
-
-    // wait for secondary to get this data
-    wait(function () { return ifReady(a, function() { return ifReady(b, function() { return b.bar.count() == a.bar.count(); }); }); });
-    wait(function () {
-        var status = A.runCommand({replSetGetStatus : 1});
-        return status.members[1].state == 2;
-      });
+	replTest.awaitReplication();
 
     master = replTest.getMaster();
 	print("disconnect primary from everywhere");
