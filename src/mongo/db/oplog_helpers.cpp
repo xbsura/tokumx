@@ -246,6 +246,17 @@ namespace OpLogHelpers{
         }
     }
 
+    static void runRollbackInsertFromOplog(const char* ns, BSONObj op) {
+        // handle add index case
+        if (mongoutils::str::endsWith(ns, ".system.indexes")) {
+            throw RollbackOplogException(str::stream() << "Not rolling back an add index on " << ns << ". Op: " << op.toString(false, true));
+        }
+        else {
+            // the rollback of a normal insert is to do the delete
+            runDeleteFromOplog(ns, op);
+        }
+    }
+
     static void runCappedInsertFromOplogWithLock(
         const char* ns, 
         BSONObj& pk,
@@ -425,8 +436,7 @@ namespace OpLogHelpers{
         const char* ns = fields[0].valuestrsafe();
         const char* opType = fields[1].valuestrsafe();
         if (strcmp(opType, OP_STR_INSERT) == 0) {
-            // the rollback of an insert is to do the delete
-            runDeleteFromOplog(ns, op);
+            runRollbackInsertFromOplog(ns, op);
         }
         else if (strcmp(opType, OP_STR_UPDATE) == 0) {
             runUpdateFromOplog(ns, op, true);
