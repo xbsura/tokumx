@@ -84,7 +84,7 @@ namespace mongo {
 
         BSONObj bb = b.done();
         // write it to oplog
-        log() << "writing " << bb.toString(false, true) << " to master " << endl;
+        LOG(3) << "writing " << bb.toString(false, true) << " to master " << endl;
         writeEntryToOplog(bb);
     }
 
