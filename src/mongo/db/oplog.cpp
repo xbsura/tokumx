@@ -232,7 +232,8 @@ namespace mongo {
             const size_t numOps = ops.size();
 
             for(size_t i = 0; i < numOps; ++i) {
-                BSONElement* curr = &ops[i];
+                // note that we have to rollback the transaction backwards
+                BSONElement* curr = &ops[numOps - i - 1];
                 OpLogHelpers::rollbackOperationFromOplog(curr->Obj());
             }
         }
