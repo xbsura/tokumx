@@ -84,7 +84,6 @@ scratch
 /mongostat
 /mongotop
 /mongooplog
-/mongoperf
 /bsondump
 
 /docgen
@@ -139,6 +138,9 @@ debian/mongodb
 *.files
 *.includes
 *.orig
+
+# server logs from smoke.py --quiet (good until at least 2020)
+server.log.201*
 
 
 # old things that should be removed

@@ -15,13 +15,13 @@
 *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 
-#include "pch.h"
-#include "../commands.h"
-#include "../instance.h"
-#include "../clientcursor.h"
-#include "../dbhelpers.h"
-#include "../ops/delete.h"
-#include "../ops/update.h"
+#include "mongo/pch.h"
+#include "mongo/db/commands.h"
+#include "mongo/db/instance.h"
+#include "mongo/db/clientcursor.h"
+#include "mongo/db/namespace_details.h"
+#include "mongo/db/ops/delete.h"
+#include "mongo/db/ops/update.h"
 #include "../queryutil.h"
 #include "mongo/db/relock.h"
 
@@ -42,8 +42,11 @@ namespace mongo {
         virtual bool canRunInMultiStmtTxn() const { return true; }
         virtual bool logTheOp() { return false; } // the modifications will be logged directly
         virtual bool slaveOk() const { return false; }
-        virtual LockType locktype() const { return NONE; }
+        virtual LockType locktype() const { return OPLOCK; }
+        virtual bool requiresSync() const { return true; }
         virtual bool needsTxn() const { return false; }
+        virtual int txnFlags() const { return DB_SERIALIZABLE; }
+        virtual OpSettings getOpSettings() const { return OpSettings(); }
         
         /* this will eventually replace run,  once sort is handled */
         bool runNoDirectClient( const string& dbname, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
@@ -123,7 +126,8 @@ namespace mongo {
                                 bool upsert , bool returnNew , bool remove ,
                                 BSONObjBuilder& result , string& errmsg ) {
             BSONObj doc;
-            bool found = Helpers::findOne( ns.c_str() , queryOriginal , doc );
+            NamespaceDetails *d = nsdetails( ns.c_str() );
+            const bool found = d != NULL && d->findOne( queryOriginal , doc );
 
             BSONObj queryModified = queryOriginal;
             if ( found && doc["_id"].type() && ! isSimpleIdQuery( queryOriginal ) ) {
@@ -157,8 +161,6 @@ namespace mongo {
                 BSONObjBuilder b( queryOriginal.objsize() + 10 );
                 b.append( doc["_id"] );
 
-                bool addedAtomic = false;
-
                 BSONObjIterator i( queryOriginal );
                 while ( i.more() ) {
                     const BSONElement& elem = i.next();
@@ -171,11 +173,6 @@ namespace mongo {
                     if ( ! hasPositionalUpdate ) {
                         // if there is a dotted field, accept we may need more query parts
                         continue;
-                    }
-
-                    if ( ! addedAtomic ) {
-                        b.appendBool( "$atomic" , true );
-                        addedAtomic = true;
                     }
 
                     b.append( elem );
@@ -215,7 +212,8 @@ namespace mongo {
                             // we do this so that if the update changes the fields, it still matches
                             queryModified = queryModified["_id"].wrap();
                         }
-                        if ( ! Helpers::findOne( ns.c_str() , queryModified , doc ) ) {
+                        d = nsdetails( ns.c_str() );
+                        if ( d == NULL || ! d->findOne( queryModified , doc ) ) {
                             errmsg = str::stream() << "can't find object after modification  " 
                                                    << " ns: " << ns 
                                                    << " queryModified: " << queryModified 
@@ -242,80 +240,17 @@ namespace mongo {
             if ( cmdObj["sort"].eoo() )
                 return runNoDirectClient( dbname , cmdObj , x, errmsg , result, y );
 
-            const bool upsert = cmdObj["upsert"].trueValue();
             string ns = dbname + '.' + cmdObj.firstElement().valuestr();
 
-            // If we're going to do it with a DBDirectClient, we'll need a lock and a transaction to tie everything together.
-            // TODO(leif): if we can't do something below in a multi-statement transaction, that'll be bad.  Maybe reimplement if that's a problem.
-            try {
-                Lock::DBRead lk(ns.c_str());
-                Client::Transaction txn(DB_SERIALIZABLE);
-                if (upsert) {
-                    // First, check if the collection exists.
-                    Client::Context ctx(ns);
-                    NamespaceDetails *d = nsdetails(ns.c_str());
-                    if (d == NULL) {
-                        // We know we need to do fileops.  We'd normally fail below because we can't
-                        // do fileops in a multi-statement transaction, and with a DBDirectClient it
-                        // seems like that's what we're doing.  Throw immediately to get to the
-                        // catch block, and we'll create the collection down there first.
-                        throw RetryWithWriteLock();
-                    }
-                }
-                bool ok = runWithDirectClient(dbname, cmdObj, x, errmsg, result, y);
-                if (ok) {
-                    txn.commit();
-                }
-                return ok;
+            // Find and modify using a direct client is essentially a multi-statement transaction.
+            // This is the root transaction.
+            Client::Transaction txn(DB_SERIALIZABLE);
+
+            bool ok = runWithDirectClient(dbname, cmdObj, x, errmsg, result, y);
+            if (ok) {
+                txn.commit();
             }
-            catch (RetryWithWriteLock &e) {
-                Lock::DBWrite lk(ns.c_str());
-                Client::Transaction txn(DB_SERIALIZABLE);
-                bool didCreateNS = false;
-                bool ok = false;
-                if (upsert) {
-                    Client::Context ctx(ns);
-                    NamespaceDetails *d = nsdetails(ns.c_str());
-                    if (d == NULL) {
-                        // If the collection doesn't exist, we need to create it here.  The
-                        // DBDirectClient can't create it as a side effect because it looks like a
-                        // multi-statement transaction, and those can't do fileops.  We also need to
-                        // undo it in the case of an abort or other failure.
-                        NamespaceDetails *d = getAndMaybeCreateNS(ns.c_str(), true);
-                        verify(d != NULL);
-                        didCreateNS = true;
-                    }
-                }
-                try {
-                    ok = runWithDirectClient(dbname, cmdObj, x, errmsg, result, y);
-                }
-                catch (DBException &e) {
-                    if (didCreateNS) {
-                        string err;
-                        BSONObjBuilder b;
-                        dropCollection(ns, err, b, false);
-                        if (err.size()) {
-                            LOG(0) << "error dropping collection on error path for findAndModify: " << err
-                                   << ": " << b.obj() << endl;
-                        }
-                    }
-                    throw e;
-                }
-                if (ok) {
-                    txn.commit();
-                } else {
-                    if (didCreateNS) {
-                        string err;
-                        BSONObjBuilder b;
-                        dropCollection(ns, err, b, false);
-                        if (err.size()) {
-                            LOG(0) << "error dropping collection on error path for findAndModify: " << err
-                                   << ": " << b.obj() << endl;
-                        }
-                    }
-                }
-                return ok;
-            }
+            return ok;
         }
 
         bool runWithDirectClient(const string &dbname, BSONObj &cmdObj, int x, string &errmsg, BSONObjBuilder &result, bool y) {

@@ -2,6 +2,7 @@
 
 /**
 *    Copyright (C) 2008 10gen Inc.
+*    Copyright (C) 2013 Tokutek Inc.
 *
 *    This program is free software: you can redistribute it and/or  modify
 *    it under the terms of the GNU Affero General Public License, version 3,
@@ -84,7 +85,7 @@ namespace mongo {
          * @param candidateChunks possible chunks to move
          * @return number of chunks effectively moved
          */
-        int _moveChunks( const vector<CandidateChunkPtr>* candidateChunks , bool secondaryThrottle );
+        int _moveChunks( const vector<CandidateChunkPtr>* candidateChunks );
 
         /**
          * Marks this balancer as being live on the config server(s).

@@ -2,6 +2,7 @@
 
 /**
 *    Copyright (C) 2008 10gen Inc.
+*    Copyright (C) 2013 Tokutek Inc.
 *
 *    This program is free software: you can redistribute it and/or  modify
 *    it under the terms of the GNU Affero General Public License, version 3,
@@ -20,6 +21,7 @@
 
 #include <boost/thread/thread.hpp>
 
+#include "mongo/base/initializer.h"
 #include "../util/net/message.h"
 #include "../util/startup_test.h"
 #include "../client/connpool.h"
@@ -199,18 +201,18 @@ namespace mongo {
 
     void printShardingVersionInfo( bool out ) {
         if ( out ) {
-            cout << "MongoS version " << fullVersionString() << " starting: pid=" << getpid() << " port=" << cmdLine.port <<
+            cout << "TokuMX mongos router v" << fullVersionString() << " starting: pid=" << getpid() << " port=" << cmdLine.port <<
                     ( sizeof(int*) == 4 ? " 32" : " 64" ) << "-bit host=" << getHostNameCached() << " (--help for usage)" << endl;
             DEV cout << "_DEBUG build" << endl;
             cout << "git version: " << gitVersion() << endl;
             cout <<  "build sys info: " << sysInfo() << endl;
         }
         else {
-            log() << "MongoS version " << fullVersionString() << " starting: pid=" << getpid() << " port=" << cmdLine.port <<
+            log() << "TokuMX mongos router v" << fullVersionString() << " starting: pid=" << getpid() << " port=" << cmdLine.port <<
                     ( sizeof( int* ) == 4 ? " 32" : " 64" ) << "-bit host=" << getHostNameCached() << " (--help for usage)" << endl;
             DEV log() << "_DEBUG build" << endl;
             printGitVersion();
-            printTokudbVersion();
+            printTokukvVersion();
             printSysInfo();
             printCommandLineOpts();
         }
@@ -474,7 +476,8 @@ namespace mongo {
 } // namespace mongo
 #endif
 
-int main(int argc, char* argv[]) {
+int main(int argc, char* argv[], char** envp) {
+    mongo::runGlobalInitializersOrDie(argc, argv, envp);
     try {
         int exitCode = _main(argc, argv);
         ::_exit(exitCode);

@@ -48,37 +48,10 @@ doTest = function( signal ) {
   print("sleeping");  
   sleep(20000);
   var indexes = slave[0].stats().indexes;
-  assert.eq(indexes, 2, 'number of indexes');
+  assert.eq(indexes, 4, 'number of indexes');
 
   indexes = slave[1].stats().indexes;
-  assert.eq(indexes, 1);
-
-  
-  indexes = slave[0].x.stats().indexSizes;
-  printjson(indexes);
-  
-  var count = 0;
-  for (var i in indexes) {
-    count++;
-    if (i == "_id_") {
-      continue;
-    }
-    print(i);
-    print(i.match(/y_/));
-    assert(i.match(/y_/));
-  }
-
-  assert.eq(count, 2);
-  
-  indexes = slave[1].x.stats().indexSizes;
-  printjson(indexes);
-
-  count = 0;
-  for (var i in indexes) {
-    count++;
-  }  
-
-  assert.eq(count, 1);
+  assert.eq(indexes, 3);
 
   replTest.stopSet(15);
 }

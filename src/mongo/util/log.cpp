@@ -2,6 +2,7 @@
  */
 
 /*    Copyright 2009 10gen Inc.
+ *    Copyright (C) 2013 Tokutek Inc.
  *
  *    Licensed under the Apache License, Version 2.0 (the "License");
  *    you may not use this file except in compliance with the License.
@@ -278,17 +279,17 @@ namespace mongo {
             int fd = fileno( logfile );
             if ( _isatty( fd ) ) {
                 fflush( logfile );
-                writeUtf8ToWindowsConsole( s.data(), s.size() );
+                writeUtf8ToWindowsConsole( s.rawData(), s.size() );
                 return;
             }
 #else
             if ( isSyslog ) {
-                syslog( LOG_INFO , "%s" , s.data() );
+                syslog( LOG_INFO , "%s" , s.rawData() );
                 return;
             }
 #endif
 
-            if (fwrite(s.data(), s.size(), 1, logfile)) {
+            if (fwrite(s.rawData(), s.size(), 1, logfile)) {
                 fflush(logfile);
             }
             else {
@@ -297,7 +298,7 @@ namespace mongo {
             }
         }
         else {
-            cout << s.data();
+            cout << s;
             cout.flush();
         }
     }

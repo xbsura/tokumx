@@ -2,6 +2,7 @@
 
 /**
 *    Copyright (C) 2008 10gen Inc.
+*    Copyright (C) 2013 Tokutek Inc.
 *
 *    This program is free software: you can redistribute it and/or  modify
 *    it under the terms of the GNU Affero General Public License, version 3,
@@ -21,14 +22,15 @@
 #include "mongo/db/queryutil.h"
 #include "mongo/db/oplog.h"
 #include "mongo/db/clientcursor.h"
+#include "mongo/db/namespace_details.h"
 #include "mongo/db/ops/delete.h"
 #include "mongo/util/stacktrace.h"
 #include "mongo/db/oplog_helpers.h"
 
 namespace mongo {
 
-    void deleteOneObject(NamespaceDetails *d, NamespaceDetailsTransient *nsdt, const BSONObj &pk, const BSONObj &obj) {
-        d->deleteObject(pk, obj);
+    void deleteOneObject(NamespaceDetails *d, NamespaceDetailsTransient *nsdt, const BSONObj &pk, const BSONObj &obj, uint64_t flags) {
+        d->deleteObject(pk, obj, flags);
         if (nsdt != NULL) {
             nsdt->notifyOfWriteOp();
         }

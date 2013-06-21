@@ -2,6 +2,7 @@
 
 /**
  *    Copyright (C) 2011 10gen Inc.
+ *    Copyright (C) 2013 Tokutek Inc.
  *
  *    This program is free software: you can redistribute it and/or  modify
  *    it under the terms of the GNU Affero General Public License, version 3,
@@ -36,7 +37,7 @@ namespace mongo {
         virtual bool permitOptimalNaturalPlan() const { return true; }
         virtual bool permitOptimalIdPlan() const { return true; }
         virtual bool permitPlan( const QueryPlan &plan ) const { return true; }
-        virtual BSONObj planHint( const char *ns ) const { return BSONObj(); }
+        virtual BSONObj planHint( const StringData& ns ) const { return BSONObj(); }
         
         /** Allow any query plan selection, permitting the query optimizer's default behavior. */
         static const QueryPlanSelectionPolicy &any();
@@ -75,7 +76,7 @@ namespace mongo {
     public:
         virtual string name() const { return "idElseNatural"; }
         virtual bool permitPlan( const QueryPlan &plan ) const;
-        virtual BSONObj planHint( const char *ns ) const;
+        virtual BSONObj planHint( const StringData& ns ) const;
     };
     
     class FieldRangeSet;

@@ -6,6 +6,7 @@
 
 /**
 *    Copyright (C) 2012 10gen Inc.
+*    Copyright (C) 2013 Tokutek Inc.
 *
 *    This program is free software: you can redistribute it and/or  modify
 *    it under the terms of the GNU Affero General Public License, version 3,
@@ -25,13 +26,9 @@
 
 namespace mongo {
 
-    class CmdHashElt : public Command {
+    class CmdHashElt : public InformationCommand {
     public:
-        CmdHashElt() : Command("_hashBSONElement") {};
-        virtual LockType locktype() const { return NONE; }
-        virtual bool slaveOk() const { return true; }
-        virtual bool needsTxn() const { return false; }
-        virtual bool canRunInMultiStmtTxn() const { return true; }
+        CmdHashElt() : InformationCommand("_hashBSONElement") {};
         virtual void help( stringstream& help ) const {
             help << "returns the hash of the first BSONElement val in a BSONObj";
         }

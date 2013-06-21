@@ -19,13 +19,13 @@
 
 #include "mongo/client/connpool.h"
 #include "mongo/client/parallel.h"
-#include "mongo/db/db.h"
 #include "mongo/db/instance.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/matcher.h"
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/replutil.h"
 #include "mongo/db/ops/insert.h"
+#include "mongo/db/ops/update.h"
 #include "mongo/s/d_chunk_manager.h"
 #include "mongo/s/d_logic.h"
 #include "mongo/s/grid.h"
@@ -39,7 +39,7 @@ namespace mongo {
 
         AtomicUInt Config::JOB_NUMBER;
 
-        JSFunction::JSFunction( string type , const BSONElement& e ) {
+        JSFunction::JSFunction( const std::string& type , const BSONElement& e ) {
             _type = type;
             _code = e._asCode();
 
@@ -216,10 +216,7 @@ namespace mongo {
             _reduce( x , key , endSizeEstimate );
         }
 
-        Config::Config( const string& _dbname , const BSONObj& cmdObj ) :
-            outNonAtomic(false)
-        {
-
+        Config::Config( const string& _dbname , const BSONObj& cmdObj ) {
             dbname = _dbname;
             ns = dbname + "." + cmdObj.firstElement().valuestr();
 
@@ -266,12 +263,6 @@ namespace mongo {
 
                 if (o.hasElement("db")) {
                     outDB = o["db"].String();
-                }
-
-                if (o.hasElement("nonAtomic")) {
-                    outNonAtomic = o["nonAtomic"].Bool();
-                    if (outNonAtomic)
-                        uassert( 15895 , "nonAtomic option cannot be used with this output type", (outType == REDUCE || outType == MERGE) );
                 }
             }
             else {
@@ -344,7 +335,11 @@ namespace mongo {
                 {
                     Client::WriteContext ctx( _config.incLong );
                     string err;
-                    if ( ! userCreateNS( _config.incLong.c_str() , BSON( "autoIndexId" << 0 << "temp" << true ) , err , false ) ) {
+                    // Specifying { natural : 1 } creates a "natural order" collection,
+                    // which does not automaticall add/index the _id field.
+                    // write create to oplog, because the ensureIndex that happens below will be logged as well
+                    // not ideal, but harmless to have just the create, ensureIndex, and drop of this temp collection logged
+                    if ( ! userCreateNS( _config.incLong.c_str() , BSON( "natural" << 1 << "temp" << true ) , err , true ) ) {
                         uasserted( 13631 , str::stream() << "userCreateNS failed for mr incLong ns: " << _config.incLong << " err: " << err );
                     }
                 }
@@ -382,7 +377,10 @@ namespace mongo {
                     }
 
                     BSONObj indexToInsert = b.obj();
-                    insert( Namespace( _config.tempLong.c_str() ).getSisterNS( "system.indexes" ).c_str() , indexToInsert );
+
+                    string sysIndexes = getSisterNS( _config.tempLong, "system.indexes" );
+                    Client::WriteContext ctx( sysIndexes.c_str() );
+                    insert( sysIndexes.c_str() , indexToInsert );
                 }
 
             }
@@ -411,7 +409,8 @@ namespace mongo {
                     // add split points, used for shard
                     BSONObj res;
                     BSONObj idKey = BSON( "_id" << 1 );
-                    if ( ! _db.runCommand( "admin" , BSON( "splitVector" << _config.finalLong << "keyPattern" << idKey << "maxChunkSizeBytes" << _config.splitInfo ) , res ) ) {
+                    string dbname = nsToDatabase(_config.finalLong);
+                    if ( ! _db.runCommand(dbname , BSON( "splitVector" << _config.finalLong << "keyPattern" << idKey << "maxChunkSizeBytes" << _config.splitInfo ) , res ) ) {
                         uasserted( 15921 ,  str::stream() << "splitVector failed: " << res );
                     }
                     if ( res.hasField( "splitKeys" ) )
@@ -459,10 +458,7 @@ namespace mongo {
             if ( _onDisk == false || _config.outType == Config::INMEMORY )
                 return numInMemKeys();
 
-            if (_config.outNonAtomic)
-                return postProcessCollectionNonAtomic(op, pm);
-            Lock::GlobalWrite lock; // TODO(erh): this is how it was, but seems it doesn't need to be global
-            return postProcessCollectionNonAtomic(op, pm);
+            return _postProcessCollection(op, pm);
         }
 
         //
@@ -490,13 +486,24 @@ namespace mongo {
         // End SERVER-6116
         //
 
-        long long State::postProcessCollectionNonAtomic(CurOp* op, ProgressMeterHolder& pm) {
+        static void upsert( const string& ns , const BSONObj& o, bool fromMigrate = false ) {
+            OpDebug debug;
+            updateObjects(ns.c_str(),
+                          o,
+                          /*pattern=*/ o["_id"].wrap(),
+                          /*upsert=*/ true,
+                          /*multi=*/ false,
+                          /*logtheop=*/ true,
+                          debug,
+                          fromMigrate);
+        }
+
+        long long State::_postProcessCollection(CurOp* op, ProgressMeterHolder& pm) {
 
             if ( _config.finalLong == _config.tempLong )
                 return _safeCount( _db, _config.finalLong );
 
             if ( _config.outType == Config::REPLACE || _safeCount( _db, _config.finalLong ) == 0 ) {
-                Lock::GlobalWrite lock; // TODO(erh): why global???
                 // replace: just rename from temp to final collection name, dropping previous collection
                 _db.dropCollection( _config.finalLong );
                 BSONObj info;
@@ -514,13 +521,14 @@ namespace mongo {
             else if ( _config.outType == Config::MERGE ) {
                 // merge: upsert new docs into old collection
                 op->setMessage( "m/r: merge post processing" , _safeCount( _db, _config.tempLong, BSONObj() ) );
-                auto_ptr<DBClientCursor> cursor = _db.query( _config.tempLong , BSONObj() );
-                while ( cursor->more() ) {
-                    Lock::DBWrite lock( _config.finalLong );
-                    BSONObj o = cursor->next();
-                    Helpers::upsert( _config.finalLong , o );
-                    //getDur().commitIfNeeded();
-                    pm.hit();
+                {
+                    Client::ReadContext ctx( _config.finalLong );
+                    auto_ptr<DBClientCursor> cursor = _db.query( _config.tempLong , BSONObj() );
+                    while ( cursor->more() ) {
+                        BSONObj o = cursor->next();
+                        upsert( _config.finalLong , o );
+                        pm.hit();
+                    }
                 }
                 _db.dropCollection( _config.tempLong );
                 pm.finished();
@@ -528,32 +536,28 @@ namespace mongo {
             else if ( _config.outType == Config::REDUCE ) {
                 // reduce: apply reduce op on new result and existing one
                 BSONList values;
-
                 op->setMessage( "m/r: reduce post processing" , _safeCount( _db, _config.tempLong, BSONObj() ) );
-                auto_ptr<DBClientCursor> cursor = _db.query( _config.tempLong , BSONObj() );
-                while ( cursor->more() ) {
-                    Lock::GlobalWrite lock; // TODO(erh) why global?
-                    BSONObj temp = cursor->next();
-                    BSONObj old;
+                {
+                    Client::ReadContext ctx( _config.finalLong );
+                    auto_ptr<DBClientCursor> cursor = _db.query( _config.tempLong , BSONObj() );
+                    while ( cursor->more() ) {
+                        BSONObj temp = cursor->next();
+                        BSONObj old;
 
-                    bool found;
-                    {
-                        Client::Context tx( _config.finalLong );
-                        found = Helpers::findOne( _config.finalLong.c_str() , temp["_id"].wrap() , old , true );
+                        NamespaceDetails *d = nsdetails( _config.finalLong.c_str() );
+                        const bool found = d != NULL && d->findOne( temp["_id"].wrap() , old , true );
+                        if ( found ) {
+                            // need to reduce
+                            values.clear();
+                            values.push_back( temp );
+                            values.push_back( old );
+                            upsert( _config.finalLong , _config.reducer->finalReduce( values , _config.finalizer.get() ) );
+                        }
+                        else {
+                            upsert( _config.finalLong , temp );
+                        }
+                        pm.hit();
                     }
-
-                    if ( found ) {
-                        // need to reduce
-                        values.clear();
-                        values.push_back( temp );
-                        values.push_back( old );
-                        Helpers::upsert( _config.finalLong , _config.reducer->finalReduce( values , _config.finalizer.get() ) );
-                    }
-                    else {
-                        Helpers::upsert( _config.finalLong , temp );
-                    }
-                    //getDur().commitIfNeeded();
-                    pm.hit();
                 }
                 _db.dropCollection( _config.tempLong );
                 pm.finished();
@@ -568,8 +572,7 @@ namespace mongo {
         void State::insert( const string& ns , const BSONObj& o ) {
             verify( _onDisk );
 
-            Client::WriteContext ctx( ns );
-
+            Client::ReadContext ctx( ns.c_str() );
             insertObject( ns.c_str() , o );
         }
 
@@ -578,7 +581,7 @@ namespace mongo {
          */
         void State::_insertToInc( BSONObj& o ) {
             verify( _onDisk );
-            insertObject( _config.incLong.c_str() , o );
+            insertObject( _config.incLong.c_str() , o , 0 , false );
         }
 
         State::State( const Config& c ) : _config( c ), _size(0), _dupCount(0), _numEmits(0) {
@@ -806,13 +809,8 @@ namespace mongo {
                 killCurrentOp.checkForInterrupt();
             }
 
-            {
-                dbtempreleasecond tl;
-                if ( ! tl.unlocked() )
-                    LOG( LL_WARNING ) << "map/reduce can't temp release" << endl;
-                // reduce and finalize last array
-                finalReduce( all );
-            }
+            // reduce and finalize last array
+            finalReduce( all );
 
             pm.finished();
         }
@@ -842,7 +840,7 @@ namespace mongo {
                     // only 1 value for this key
                     if ( _onDisk ) {
                         // this key has low cardinality, so just write to collection
-                        Client::WriteContext ctx(_config.incLong.c_str());
+                        Client::ReadContext ctx(_config.incLong.c_str());
                         _insertToInc( *(all.begin()) );
                     }
                     else {
@@ -869,8 +867,7 @@ namespace mongo {
             if ( ! _onDisk )
                 return;
 
-            Lock::DBWrite kl(_config.incLong);
-            Client::Context ctx(_config.incLong);
+            Client::ReadContext ctx(_config.incLong);
 
             for ( InMemory::iterator i=_temp->begin(); i!=_temp->end(); i++ ) {
                 BSONList& all = i->second;
@@ -988,10 +985,9 @@ namespace mongo {
             /* why !replset ?
                bad things happen with --slave (i think because of this)
             */
-            virtual bool canRunInMultiStmtTxn() const { return true; }
             virtual bool slaveOk() const { return !replSet; }
 
-            virtual bool slaveOverrideOk() const { return true; }
+            virtual bool slaveOverrideOk() const { return false; }
 
             virtual void help( stringstream &help ) const {
                 help << "Run a map/reduce operation on the server.\n";
@@ -999,7 +995,12 @@ namespace mongo {
                 help << "http://dochub.mongodb.org/core/mapreduce";
             }
 
-            virtual LockType locktype() const { return NONE; }
+            virtual LockType locktype() const { return OPLOCK; }
+            virtual bool requiresSync() const { return false; }
+            virtual bool needsTxn() const { return false; }
+            virtual int txnFlags() const { return noTxnFlags(); }
+            virtual bool canRunInMultiStmtTxn() const { return true; }
+            virtual OpSettings getOpSettings() const { return OpSettings().setBulkFetch(true); }
 
             bool run(const string& dbname , BSONObj& cmd, int, string& errmsg, BSONObjBuilder& result, bool fromRepl ) {
                 Timer t;
@@ -1012,25 +1013,11 @@ namespace mongo {
 
                 uassert( 16149 , "cannot run map reduce without the js engine", globalScriptEngine );
 
-                ClientCursor::Holder holdCursor;
+                // Get chunk manager before we check our version, to make sure it doesn't increment
+                // in the meantime
                 ShardChunkManagerPtr chunkManager;
-
-                {
-                    // Get chunk manager before we check our version, to make sure it doesn't increment
-                    // in the meantime
-                    if ( shardingState.needShardChunkManager( config.ns ) ) {
-                        chunkManager = shardingState.getShardChunkManager( config.ns );
-                    }
-
-                    // Check our version immediately, to avoid migrations happening in the meantime while we do prep
-                    Client::ReadContext ctx( config.ns );
-
-                    // Get a very basic cursor, prevents deletion of migrated data while we m/r
-                    shared_ptr<Cursor> temp = NamespaceDetailsTransient::getCursor( config.ns.c_str(), BSONObj(), BSONObj() );
-                    uassert( 15876, str::stream() << "could not create cursor over " << config.ns << " to hold data while prepping m/r", temp.get() );
-                    holdCursor.reset( new ClientCursor( QueryOption_NoCursorTimeout , temp , config.ns.c_str() ) );
-                    uassert( 15877, str::stream() << "could not create m/r holding client cursor over " << config.ns, holdCursor );
-
+                if ( shardingState.needShardChunkManager( config.ns ) ) {
+                    chunkManager = shardingState.getShardChunkManager( config.ns );
                 }
 
                 bool shouldHaveData = false;
@@ -1040,122 +1027,120 @@ namespace mongo {
 
                 BSONObjBuilder countsBuilder;
                 BSONObjBuilder timingBuilder;
-                State state( config );
-                if ( ! state.sourceExists() ) {
-                    errmsg = "ns doesn't exist";
-                    return false;
-                }
-
-                if (replSet && state.isOnDisk()) {
-                    // this means that it will be doing a write operation, make sure we are on Master
-                    // ideally this check should be in slaveOk(), but at that point config is not known
-                    if (!isMaster(dbname.c_str())) {
-                        errmsg = "not master";
-                        return false;
-                    }
-                }
-
-                if (state.isOnDisk() && !client.getAuthenticationInfo()->isAuthorized(dbname)) {
-                    errmsg = "read-only user cannot output mapReduce to collection, use inline instead";
-                    return false;
-                }
 
                 try {
-                    state.init();
-                    state.prepTempCollection();
-                    ProgressMeterHolder pm( op->setMessage( "m/r: (1/3) emit phase" , state.incomingDocuments() ) );
-
-                    wassert( config.limit < 0x4000000 ); // see case on next line to 32 bit unsigned
-                    long long mapTime = 0;
+                    Client::Transaction transaction(DB_TXN_SNAPSHOT);
                     {
-                        // We've got a cursor preventing migrations off, now re-establish our useful cursor
-
-                        // Need lock and context to use it
-                        Lock::DBRead lock( config.ns );
-                        // This context does no version check, safe b/c we checked earlier and have an
-                        // open cursor
-                        Client::Context ctx( config.ns, dbpath, true, false );
-
-                        // obtain full cursor on data to apply mr to
-                        shared_ptr<Cursor> temp = NamespaceDetailsTransient::getCursor( config.ns.c_str(), config.filter, config.sort );
-                        uassert( 16052, str::stream() << "could not create cursor over " << config.ns << " for query : " << config.filter << " sort : " << config.sort, temp.get() );
-                        ClientCursor::Holder cursor(new ClientCursor(QueryOption_NoCursorTimeout,
-                                                                     temp,
-                                                                     config.ns.c_str()));
-                        uassert( 16053, str::stream() << "could not create client cursor over " << config.ns << " for query : " << config.filter << " sort : " << config.sort, cursor.get() );
-
-                        Timer mt;
-                        // go through each doc
-                        for ( ; cursor->ok() ; cursor->advance() ) {
-                            if ( ! cursor->currentMatches() ) {
-                                continue;
+                        State state( config );
+                        if ( ! state.sourceExists() ) {
+                            errmsg = "ns doesn't exist";
+                            return false;
+                        }
+                        
+                        if (replSet && state.isOnDisk()) {
+                            // this means that it will be doing a write operation, make sure we are on Master
+                            // ideally this check should be in slaveOk(), but at that point config is not known
+                            if (!isMaster(dbname.c_str())) {
+                                errmsg = "not master";
+                                return false;
                             }
+                        }
+                        
+                        if (state.isOnDisk() && !client.getAuthenticationInfo()->isAuthorized(dbname)) {
+                            errmsg = "read-only user cannot output mapReduce to collection, use inline instead";
+                            return false;
+                        }
+                        state.init();
+                        state.prepTempCollection();
+                        ProgressMeterHolder pm( op->setMessage( "m/r: (1/3) emit phase" , state.incomingDocuments() ) );
 
-                            // make sure we dont process duplicates in case data gets moved around during map
-                            // TODO This won't actually help when data gets moved, it's to handle multikeys.
-                            if ( cursor->currentIsDup() ) {
-                                continue;
+                        wassert( config.limit < 0x4000000 ); // see case on next line to 32 bit unsigned
+                        long long mapTime = 0;
+                        {
+                            Client::ReadContext ctx( config.ns );
+
+                            // obtain full cursor on data to apply mr to
+                            shared_ptr<Cursor> temp = NamespaceDetailsTransient::getCursor( config.ns.c_str(), config.filter, config.sort );
+                            uassert( 16052, str::stream() << "could not create cursor over " << config.ns << " for query : " << config.filter << " sort : " << config.sort, temp.get() );
+                            ClientCursor::Holder cursor(new ClientCursor(QueryOption_NoCursorTimeout,
+                                                                         temp,
+                                                                         config.ns.c_str()));
+                            uassert( 16053, str::stream() << "could not create client cursor over " << config.ns << " for query : " << config.filter << " sort : " << config.sort, cursor.get() );
+
+                            Timer mt;
+                            // go through each doc
+                            for ( ; cursor->ok() ; cursor->advance() ) {
+                                if ( ! cursor->currentMatches() ) {
+                                    continue;
+                                }
+
+                                // make sure we dont process duplicates in case data gets moved around during map
+                                // TODO This won't actually help when data gets moved, it's to handle multikeys.
+                                if ( cursor->currentIsDup() ) {
+                                    continue;
+                                }
+                                                            
+                                BSONObj o = cursor->current();
+
+                                // check to see if this is a new object we don't own yet
+                                // because of a chunk migration
+                                if ( chunkManager && ! chunkManager->belongsToMe( o ) )
+                                    continue;
+
+                                // do map
+                                if ( config.verbose ) mt.reset();
+                                config.mapper->map( o );
+                                if ( config.verbose ) mapTime += mt.micros();
+
+                                num++;
+                                pm.hit();
+
+                                if ( config.limit && num >= config.limit )
+                                    break;
                             }
-                                                        
-                            BSONObj o = cursor->current();
+                        }
+                        pm.finished();
 
-                            // check to see if this is a new object we don't own yet
-                            // because of a chunk migration
-                            if ( chunkManager && ! chunkManager->belongsToMe( o ) )
-                                continue;
+                        killCurrentOp.checkForInterrupt();
+                        // update counters
+                        countsBuilder.appendNumber( "input" , num );
+                        countsBuilder.appendNumber( "emit" , state.numEmits() );
+                        if ( state.numEmits() )
+                            shouldHaveData = true;
 
-                            // do map
-                            if ( config.verbose ) mt.reset();
-                            config.mapper->map( o );
-                            if ( config.verbose ) mapTime += mt.micros();
+                        timingBuilder.appendNumber( "mapTime" , mapTime / 1000 );
+                        timingBuilder.append( "emitLoop" , t.millis() );
 
-                            num++;
-                            pm.hit();
+                        op->setMessage( "m/r: (2/3) final reduce in memory" );
+                        Timer rt;
+                        // do reduce in memory
+                        // this will be the last reduce needed for inline mode
+                        state.reduceInMemory();
+                        // if not inline: dump the in memory map to inc collection, all data is on disk
+                        state.dumpToInc();
+                        // final reduce
+                        state.finalReduce( op , pm );
+                        inReduce += rt.micros();
+                        countsBuilder.appendNumber( "reduce" , state.numReduces() );
+                        timingBuilder.appendNumber( "reduceTime" , inReduce / 1000 );
+                        timingBuilder.append( "mode" , state.jsMode() ? "js" : "mixed" );
 
-                            if ( config.limit && num >= config.limit )
-                                break;
+                        long long finalCount = state.postProcessCollection(op, pm);
+                        state.appendResults( result );
+
+                        timingBuilder.appendNumber( "total" , t.millis() );
+                        result.appendNumber( "timeMillis" , t.millis() );
+                        countsBuilder.appendNumber( "output" , finalCount );
+                        if ( config.verbose ) result.append( "timing" , timingBuilder.obj() );
+                        result.append( "counts" , countsBuilder.obj() );
+
+                        if ( finalCount == 0 && shouldHaveData ) {
+                            result.append( "cmd" , cmd );
+                            errmsg = "there were emits but no data!";
+                            return false;
                         }
                     }
-                    pm.finished();
-
-                    killCurrentOp.checkForInterrupt();
-                    // update counters
-                    countsBuilder.appendNumber( "input" , num );
-                    countsBuilder.appendNumber( "emit" , state.numEmits() );
-                    if ( state.numEmits() )
-                        shouldHaveData = true;
-
-                    timingBuilder.appendNumber( "mapTime" , mapTime / 1000 );
-                    timingBuilder.append( "emitLoop" , t.millis() );
-
-                    op->setMessage( "m/r: (2/3) final reduce in memory" );
-                    Timer rt;
-                    // do reduce in memory
-                    // this will be the last reduce needed for inline mode
-                    state.reduceInMemory();
-                    // if not inline: dump the in memory map to inc collection, all data is on disk
-                    state.dumpToInc();
-                    // final reduce
-                    state.finalReduce( op , pm );
-                    inReduce += rt.micros();
-                    countsBuilder.appendNumber( "reduce" , state.numReduces() );
-                    timingBuilder.appendNumber( "reduceTime" , inReduce / 1000 );
-                    timingBuilder.append( "mode" , state.jsMode() ? "js" : "mixed" );
-
-                    long long finalCount = state.postProcessCollection(op, pm);
-                    state.appendResults( result );
-
-                    timingBuilder.appendNumber( "total" , t.millis() );
-                    result.appendNumber( "timeMillis" , t.millis() );
-                    countsBuilder.appendNumber( "output" , finalCount );
-                    if ( config.verbose ) result.append( "timing" , timingBuilder.obj() );
-                    result.append( "counts" , countsBuilder.obj() );
-
-                    if ( finalCount == 0 && shouldHaveData ) {
-                        result.append( "cmd" , cmd );
-                        errmsg = "there were emits but no data!";
-                        return false;
-                    }
+                    transaction.commit();
                 }
                 catch( SendStaleConfigException& e ){
                     log() << "mr detected stale config, should retry" << causedBy(e) << endl;
@@ -1191,6 +1176,12 @@ namespace mongo {
             virtual bool slaveOverrideOk() const { return true; }
 
             virtual LockType locktype() const { return NONE; }
+            virtual bool requiresSync() const { return false; }
+            virtual bool needsTxn() const { return false; }
+            virtual int txnFlags() const { return noTxnFlags(); }
+            virtual bool canRunInMultiStmtTxn() const { return true; }
+            virtual OpSettings getOpSettings() const { return OpSettings().setBulkFetch(true); }
+
             bool run(const string& dbname , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
                 ShardedConnectionInfo::addHook();
                 // legacy name
@@ -1232,6 +1223,7 @@ namespace mongo {
                     }
                 }
 
+                Client::Transaction transaction(DB_TXN_SNAPSHOT);
                 state.prepTempCollection();
 
                 BSONList values;
@@ -1330,6 +1322,7 @@ namespace mongo {
                 countsB.append("output", outputCount);
                 result.append( "counts" , countsB.obj() );
 
+                transaction.commit();
                 return 1;
             }
         } mapReduceFinishCommand;

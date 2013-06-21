@@ -1,4 +1,3 @@
-
 chunksize = 25
 
 s = new ShardingTest( "migrate_cursor1" , 2 , 1 , 1 , { chunksize : chunksize } );

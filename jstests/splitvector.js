@@ -18,11 +18,13 @@ assertChunkSizes = function ( splitVec , numDocs , maxChunkSize , msg ){
         min = splitVec[i];
         max = splitVec[i+1];
         size = db.runCommand( { datasize: "test.jstests_splitvector" , min: min , max: max } ).size;
-        
+
         // It is okay for the last chunk to be  smaller. A collection's size does not
         // need to be exactly a multiple of maxChunkSize.
-        if ( i < splitVec.length - 2 )
-            assert.close( maxChunkSize , size , "A"+i , -3 );
+        if ( i < splitVec.length - 2 ) {
+            distance = (maxChunkSize > size) ? maxChunkSize - size : size - maxChunkSize;
+            assert.lt(distance, 64<<10, "A"+i);
+        }
         else
             assert.gt( maxChunkSize , size , "A"+i , msg + "b" );
     }
@@ -50,6 +52,10 @@ var assertFieldNamesMatch = function( splitPoint , keyPattern ){
 // -------------------------
 
 f = db.jstests_splitvector;
+
+// run everything once with clustering indexes, and then again without clustering indexes
+for (var cl = 1; cl >= 0; --cl) {
+
 f.drop();
 
 // -------------------------
@@ -68,7 +74,7 @@ assert.eq( false, db.runCommand( { splitVector: "test.jstests_splitvector" , key
 // -------------------------
 // Case 3: empty collection
 
-f.ensureIndex( { x: 1} );
+f.ensureIndex( { x: 1}, {clustering:cl} );
 assert.eq( [], db.runCommand( { splitVector: "test.jstests_splitvector" , keyPattern: {x:1} , maxChunkSize: 1 } ).splitKeys , "3");
 
 
@@ -76,7 +82,7 @@ assert.eq( [], db.runCommand( { splitVector: "test.jstests_splitvector" , keyPat
 // Case 4: uniform collection
 
 f.drop();
-f.ensureIndex( { x: 1 } );
+f.ensureIndex( { x: 1 }, {clustering:cl} );
 
 var case4 = function() {
     // Get baseline document size
@@ -87,7 +93,7 @@ var case4 = function() {
     assert.gt( docSize, 500 , "4a" );
 
     // Fill collection and get split vector for 1MB maxChunkSize
-    numDocs = 20000;
+    numDocs = 50000;
     for( i=1; i<numDocs; i++ ){
         f.save( { x: i, y: filler } );
     }
@@ -95,7 +101,12 @@ var case4 = function() {
     res = db.runCommand( { splitVector: "test.jstests_splitvector" , keyPattern: {x:1} , maxChunkSize: 1 } );
 
     // splitVector aims at getting half-full chunks after split
-    factor = 0.5; 
+    factor = 0.5;
+    idx = f.getIndexes()[1];
+    if (idx.key.y !== undefined && idx.clustering) {
+        // y is duplicated because of #11, so each row looks twice as big
+        factor /= 2;
+    }
 
     assert.eq( true , res.ok , "4b" );
     assert.close( numDocs*docSize / ((1<<20) * factor), res.splitKeys.length , "num split keys" , -1 );
@@ -110,7 +121,7 @@ case4();
 // Case 5: limit number of split points
 
 f.drop();
-f.ensureIndex( { x: 1 } );
+f.ensureIndex( { x: 1 }, {clustering:cl} );
 
 var case5 = function() {
     // Fill collection and get split vector for 1MB maxChunkSize
@@ -131,9 +142,11 @@ case5();
 
 // -------------------------
 // Case 6: limit number of objects in a chunk
+// This is deprecated.
 
+if (0) {
 f.drop();
-f.ensureIndex( { x: 1 } );
+f.ensureIndex( { x: 1 }, {clustering:cl} );
 
 var case6 = function() {
     // Fill collection and get split vector for 1MB maxChunkSize
@@ -151,13 +164,14 @@ var case6 = function() {
     }
 }
 case6();
+}
 
 // -------------------------
 // Case 7: enough occurances of min key documents to pass the chunk limit
 // [1111111111111111,2,3)
 
 f.drop();
-f.ensureIndex( { x: 1 } );
+f.ensureIndex( { x: 1 }, {clustering:cl} );
 
 var case7 = function() {
     // Fill collection and get split vector for 1MB maxChunkSize
@@ -185,7 +199,7 @@ case7();
 // [1, 22222222222222, 3)
 
 f.drop();
-f.ensureIndex( { x: 1 } );
+f.ensureIndex( { x: 1 }, {clustering:cl} );
 
 var case8 = function() {
     for( i=1; i<10; i++ ){
@@ -236,7 +250,7 @@ var case9 = function(n) {
     assert.close( n/2 , res.splitKeys[0].x , "9c", -1 );
 
     if ( db.runCommand( "isMaster" ).msg != "isdbgrid" ) {
-        res = db.adminCommand( { splitVector: "test.jstests_splitvector" , keyPattern: {x:1} , force : true } );
+        res = db.runCommand( { splitVector: "test.jstests_splitvector" , keyPattern: {x:1} , force : true } );
 
         assert.eq( true , res.ok , "9a: " + tojson(res) );
         assert.eq( 1 , res.splitKeys.length , "9b: " + tojson(res) );
@@ -249,7 +263,7 @@ var case9 = function(n) {
 // Since we're going to allow approximate points for "halfway" we should test a few different sizes.
 for (var n = 3; n < 16; ++n) {
     f.drop();
-    f.ensureIndex( { x: 1 } );
+    f.ensureIndex( { x: 1 }, {clustering:cl} );
 
     case9(n);
 }
@@ -259,30 +273,34 @@ for (var n = 3; n < 16; ++n) {
 //
 
 f.drop();
-f.ensureIndex( { x: 1, y: 1 } );
+f.ensureIndex( { x: 1, y: 1 }, {clustering:cl} );
 case4();
 
 f.drop();
-f.ensureIndex( { x: 1, y: 1 } );
+f.ensureIndex( { x: 1, y: 1 }, {clustering:cl} );
 case5();
 
+if (0) {
 f.drop();
-f.ensureIndex( { x: 1, y: 1 } );
+f.ensureIndex( { x: 1, y: 1 }, {clustering:cl} );
 case6();
+}
 
 f.drop();
-f.ensureIndex( { x: 1, y: 1 } );
+f.ensureIndex( { x: 1, y: 1 }, {clustering:cl} );
 case7();
 
 f.drop();
-f.ensureIndex( { x: 1, y: 1 } );
+f.ensureIndex( { x: 1, y: 1 }, {clustering:cl} );
 case8();
 
 // Since we're going to allow approximate points for "halfway" we should test a few different sizes.
 for (var n = 3; n < 16; ++n) {
     f.drop();
-    f.ensureIndex( { x: 1, y: 1 } );
+    f.ensureIndex( { x: 1, y: 1 }, {clustering:cl} );
     case9(n);
+}
+
 }
 
 print("PASSED");

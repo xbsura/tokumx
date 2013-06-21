@@ -1,5 +1,6 @@
 /**
 *    Copyright (C) 2008 10gen Inc.
+*    Copyright (C) 2013 Tokutek Inc.
 *
 *    This program is free software: you can redistribute it and/or  modify
 *    it under the terms of the GNU Affero General Public License, version 3,
@@ -45,6 +46,7 @@ namespace mongo {
         
         // Not sure if this if clause is necessary anymore. Hard to prove
         // either way for now, so leaving it in
+        // note that because replication is not running, we cannot be in rollback state
         if (box.getState().primary() || box.getState().secondary() || box.getState().fatal()) {
             return;
         }
@@ -56,7 +58,7 @@ namespace mongo {
 
         sethbmsg("");
         changeState(MemberState::RS_SECONDARY);
-        BackgroundSync::get()->startOpSyncThread();
+        startReplication();
         return;
     }
 
@@ -139,26 +141,41 @@ namespace mongo {
     // see manager.cpp, msgCheckNewState
     // that calls checkAuth
     void ReplSetImpl::blockSync(bool block) {
-        // if told to block, and currently not blocking,
-        // stop opsync thread and go into recovering state
-        if (block && !_blockSync) {
-            BackgroundSync::get()->stopOpSyncThread();
-            RSBase::lock lk(this);
-            changeState(MemberState::RS_RECOVERING);
+        // arbiters don't sync. So check for it before we
+        // we try to modify states that put it in recovering
+        // or secondary
+        // also, can only blockSync if we are a secondary or recoverying
+        if (!myConfig().arbiterOnly && (box.getState().secondary() || box.getState().recovering())) {
+            // if told to block, and currently not blocking,
+            // stop opsync thread and go into recovering state
+            if (block && !_blockSync) {
+                stopReplication();
+                RSBase::lock lk(this);
+                if (!box.getState().fatal()) {
+                    changeState(MemberState::RS_RECOVERING);
+                }
+            }
+            else if (!block && _blockSync) {
+                // this is messy
+                // replLock is already locked on input here
+                // see usage of this function in manager.cpp
+                Lock::GlobalWrite writeLock;
+                // do this here, because tryToGoLiveAsASecondary depends on it
+                _blockSync = block;
+                tryToGoLiveAsASecondary();
+            }
+            _blockSync = block;
         }
-        else if (!block && _blockSync) {
-            // this is messy
-            // replLock is already locked on input here
-            // see usage of this function in manager.cpp
-            Lock::GlobalWrite writeLock;
-            tryToGoLiveAsASecondary();
-        }
-        _blockSync = block;
     }
 
     void GhostSync::starting() {
         Client::initThread("rsGhostSync");
         replLocalAuth();
+    }
+
+    void GhostSync::clearCache() {
+        rwlock lk(_lock, true);
+        _ghostCache.clear();
     }
 
     void GhostSync::associateSlave(const BSONObj& id, const int memberId) {
@@ -185,7 +202,7 @@ namespace mongo {
         }
     }
 
-    void GhostSync::updateSlave(const mongo::OID& rid, const OpTime& last) {
+    void GhostSync::updateSlave(const mongo::OID& rid, const GTID& lastGTID) {
         rwlock lk( _lock , false );
         MAP::iterator i = _ghostCache.find( rid );
         if ( i == _ghostCache.end() ) {
@@ -199,12 +216,12 @@ namespace mongo {
             return;
         }
 
-        ((ReplSetConfig::MemberCfg)slave.slave->config()).updateGroups(last);
+        ((ReplSetConfig::MemberCfg)slave.slave->config()).updateGroups(lastGTID);
     }
 
-    void GhostSync::percolate(const BSONObj& id, const OpTime& last) {
+    void GhostSync::percolate(const BSONObj& id, const GTID& lastGTID) {
         const OID rid = id["_id"].OID();
-        GhostSlave* slave;
+        shared_ptr<GhostSlave> slave;
         {
             rwlock lk( _lock , false );
 
@@ -214,13 +231,12 @@ namespace mongo {
                 return;
             }
 
-            slave = i->second.get();
+            slave = i->second;
             if (!slave->init) {
                 OCCASIONALLY log() << "couldn't percolate slave " << rid << " not init" << rsLog;
                 return;
             }
         }
-
         verify(slave->slave);
 
         const Member *target = BackgroundSync::get()->getSyncTarget();
@@ -233,31 +249,26 @@ namespace mongo {
             return;
         }
 
+        if ( GTID::cmp(slave->lastGTID, lastGTID) > 0 ) {
+            return;
+        }
+
         try {
-            if (!slave->reader.haveCursor()) {
+            if (!slave->reader.haveConnection()) {
                 if (!slave->reader.connect(id, slave->slave->id(), target->fullName())) {
                     // error message logged in OplogReader::connect
                     return;
                 }
-                ::abort();
-                //slave->reader.ghostQueryGTE(rsoplog, last);
             }
-
-            LOG(1) << "replSet last: " << slave->last.toString() << " to " << last.toString() << rsLog;
-            if (slave->last > last) {
-                return;
+            bool ret = slave->reader.propogateSlaveLocation(lastGTID);
+            if (ret) {
+                slave->lastGTID = lastGTID;
+                LOG(2) << "now last is " << slave->lastGTID.toString() << rsLog;
             }
-
-            while (slave->last <= last) {
-                if (!slave->reader.more()) {
-                    // we'll be back
-                    return;
-                }
-
-                BSONObj o = slave->reader.nextSafe();
-                slave->last = o["ts"]._opTime();
+            else {
+                LOG(0) << "failed to percolate to with new location" << lastGTID.toString() << rsLog;
+                slave->reader.resetConnection();
             }
-            LOG(2) << "now last is " << slave->last.toString() << rsLog;
         }
         catch (DBException& e) {
             // we'll be back

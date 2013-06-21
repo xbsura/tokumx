@@ -1,5 +1,6 @@
 /**
 *    Copyright (C) 2008 10gen Inc.
+*    Copyright (C) 2013 Tokutek Inc.
 *
 *    This program is free software: you can redistribute it and/or  modify
 *    it under the terms of the GNU Affero General Public License, version 3,
@@ -18,7 +19,6 @@
 #include "../cmdline.h"
 #include "../../util/net/sock.h"
 #include "../client.h"
-#include "../dbhelpers.h"
 #include "../../s/d_logic.h"
 #include "rs.h"
 #include "connections.h"
@@ -29,20 +29,13 @@
 #include "mongo/db/gtid.h"
 #include "mongo/db/txn_context.h"
 #include "mongo/util/time_support.h"
+#include "mongo/db/oplog.h"
 
 using namespace std;
 
 namespace mongo {
     
     using namespace bson;
-
-#ifdef MONGO_PLATFORM_64
-    const int ReplSetImpl::replWriterThreadCount = 2;
-    const int ReplSetImpl::replPrefetcherThreadCount = 2;
-#else
-    const int ReplSetImpl::replWriterThreadCount = 2;
-    const int ReplSetImpl::replPrefetcherThreadCount = 2;
-#endif
 
     bool replSet = false;
     ReplSet *theReplSet = 0;
@@ -57,7 +50,7 @@ namespace mongo {
         }
     }
 
-    void ReplSetImpl::sethbmsg(string s, int logLevel) {
+    void ReplSetImpl::sethbmsg(const std::string& s, int logLevel) {
         static time_t lastLogged;
         _hbmsgTime = time(0);
 
@@ -84,27 +77,40 @@ namespace mongo {
         log() << "replSet error RS102 too stale to catch up, at least from " << stale->fullName() << rsLog;
         log() << "replSet our last GTID : " << gtidManager->getLiveState().toString() << rsLog;
         log() << "replSet oldest at " << stale->fullName() << " : " << remoteGTID.toString() << rsLog;
-        log() << "replSet See http://dochub.mongodb.org/core/resyncingaverystalereplicasetmember" << rsLog;
 
-        sethbmsg("error RS102 too stale to catch up");
-        changeState(MemberState::RS_RECOVERING);
+        sethbmsg("error RS102 too stale to catch up, going fatal");
+        changeState(MemberState::RS_FATAL);
     }
 
+    void ReplSetImpl::goToRollbackState() {
+        changeState(MemberState::RS_ROLLBACK);
+    }
+
+    void ReplSetImpl::leaveRollbackState() {
+        changeState(MemberState::RS_SECONDARY);
+    }
+    
     bool ReplSetImpl::assumePrimary() {
         boost::unique_lock<boost::mutex> lock(stateChangeMutex);
         
-        // Can't prove to myself that we are guaranteed to be
-        // in the secondary state here, so putting this here.
+        // Make sure replication has stopped
+        stopReplication();
+
+        // Theoretically, we could have been in the rollback state when
+        // we decided to assume primary, and then transitioned to fatal
+        // before stopping replication. If so, just get out.
+        // Given that we are not a secondary, it is ok that replication is
+        // stopped
         if (state() != MemberState::RS_SECONDARY) {
             return false;
         }
         LOG(2) << "replSet assuming primary" << endl;
         verify( iAmPotentiallyHot() );
 
-        // Make sure replication has stopped        
-        BackgroundSync::get()->stopOpSyncThread();
-
         RSBase::lock rslk(this);
+        // will get running operations to interrupt so
+        // acquisition of global lock will be faster
+        NoteStateTransition nst;
         Lock::GlobalWrite lk;
 
         gtidManager->verifyReadyToBecomePrimary();
@@ -116,33 +122,47 @@ namespace mongo {
 
     void ReplSetImpl::changeState(MemberState s) { box.change(s, _self); }
 
-    bool ReplSetImpl::setMaintenanceMode(const bool inc) {
+    bool ReplSetImpl::setMaintenanceMode(const bool inc, string& errmsg) {
         boost::unique_lock<boost::mutex> lock(stateChangeMutex);
         {
             RSBase::lock lk(this);
             if (box.getState().primary()) {
+                errmsg = "primaries can't modify maintenance mode";
+                return false;
+            }
+            else if (myConfig().arbiterOnly) {
+                errmsg = "arbiters can't modify maintenance mode";
                 return false;
             }
         }
-        // Lock here to prevent state from changing between checking the state and changing it
-        Lock::GlobalWrite writeLock;
 
         if (inc) {
             log() << "replSet going into maintenance mode (" << _maintenanceMode << " other tasks)" << rsLog;
 
-            BackgroundSync::get()->stopOpSyncThread();
-            _maintenanceMode++;
+            stopReplication();
+            // check after stopReplication because we may be fatal
+            if (!box.getState().secondary() && !box.getState().recovering()) {
+                errmsg = "cannot modify maintenance mode unless in secondary state or recovering state";
+                return false;
+            }
             RSBase::lock lk(this);
+            // Lock here to prevent state from changing between checking the state and changing it
+            // also, grab GlobalWrite here, because it must be grabbed after rslock
+            Lock::GlobalWrite writeLock;
+            _maintenanceMode++;
             changeState(MemberState::RS_RECOVERING);
         }
         else {
+            // Lock here to prevent state from changing between checking the state and changing it
+            RSBase::lock lk(this);
+            Lock::GlobalWrite writeLock;
             // user error
             if (_maintenanceMode <= 0) {
+                errmsg = "cannot set maintenance mode to false when not in maintenance mode to begin with";
                 return false;
             }
             _maintenanceMode--;
             if (_maintenanceMode == 0) {
-                RSBase::lock lk(this);
                 tryToGoLiveAsASecondary();
             }
             log() << "leaving maintenance mode (" << _maintenanceMode << " other tasks)" << rsLog;
@@ -175,9 +195,14 @@ namespace mongo {
     }
 
     // Note, on input, stateChangeMutex and rslock must be held
-    void ReplSetImpl::relinquish() {
+    void ReplSetImpl::relinquish(bool startRepl) {
         {
             verify(lockedByMe());
+            // will get running operations to interrupt so
+            // acquisition of global lock will be faster
+            NoteStateTransition nst;
+            // so no operations are simultaneously occurring
+            RWLockRecursive::Exclusive e(operationLock);
             // so we know writes are not simultaneously occurring
             Lock::GlobalWrite lk;
 
@@ -191,7 +216,24 @@ namespace mongo {
                 // case they are not)
                 log() << "replSet closing client sockets after relinquishing primary" << rsLog;
                 MessagingPort::closeAllSockets(1);
-                BackgroundSync::get()->startOpSyncThread();
+
+                // abort all transactions lying around in clients. There should be no
+                // transaction happening. Because we have global write lock,  and
+                // we are not at risk of aborting a transaction that is in the middle
+                // of doing something in a thread. The only transaction a thread
+                // begins without holding some lock should be replication, and replication
+                // is not running yet. We also need to invalidate all cursors
+                // because they may have been part of multi statement
+                // transactions.
+                ClientCursor::invalidateAllCursors();
+                Client::abortLiveTransactions();
+                // note the transition is complete, otherwise 
+                // replication, which will start, may not work because
+                // queries done during replication will be interrupted
+                nst.noteTransitionComplete();
+                if (startRepl) {
+                    startReplication();
+                }
             }
         }
 
@@ -199,15 +241,6 @@ namespace mongo {
         // if and when it gets promoted to a primary again, only then it should reload the sharding state
         // the rationale here is that this mongod won't bring stale state when it regains primaryhood
         shardingState.resetShardingState();
-    }
-
-    /* look freshly for who is primary - includes relinquishing ourself. */
-    void ReplSetImpl::forgetPrimary() {
-        if( box.getState().primary() )
-            relinquish();
-        else {
-            box.setOtherPrimary(0);
-        }
     }
 
     // for the replSetStepDown command
@@ -340,7 +373,10 @@ namespace mongo {
 
     /** @param cfgString <setname>/<seedhost1>,<seedhost2> */
 
-    void parseReplsetCmdLine(string cfgString, string& setname, vector<HostAndPort>& seeds, set<HostAndPort>& seedSet ) {
+    void parseReplsetCmdLine(const std::string& cfgString,
+                             string& setname,
+                             vector<HostAndPort>& seeds,
+                             set<HostAndPort>& seedSet ) {
         const char *p = cfgString.c_str();
         const char *slash = strchr(p, '/');
         if( slash )
@@ -382,6 +418,9 @@ namespace mongo {
     }
 
     ReplSetImpl::ReplSetImpl(ReplSetCmdline& replSetCmdline) : 
+        _replInfoUpdateRunning(false),
+        _replOplogPurgeRunning(false),
+        _replBackgroundShouldRun(true),
         elect(this),
         _forceSyncTarget(0),
         _blockSync(false),
@@ -389,12 +428,8 @@ namespace mongo {
         _self(0),
         _maintenanceMode(0),
         mgr( new Manager(this) ),
-        ghost( new GhostSync(this) ),
-        _writerPool(replWriterThreadCount),
-        _prefetcherPool(replPrefetcherThreadCount),
-        _indexPrefetchConfig(PREFETCH_ALL) {
+        ghost( new GhostSync(this) ) {
 
-        gtidManager = NULL; // will be initialized in loadGTIDManager
         _cfg = 0;
         memset(_hbmsg, 0, sizeof(_hbmsg));
         strcpy( _hbmsg , "initial startup" );
@@ -420,21 +455,6 @@ namespace mongo {
                 log() << "replSet warning command line seed " << i->toString() << " is not present in the current repl set config" << rsLog;
             }
         }
-
-        // Figure out indexPrefetch setting
-        std::string& prefetch = cmdLine.rsIndexPrefetch;
-        if (!prefetch.empty()) {
-            IndexPrefetchConfig prefetchConfig = PREFETCH_ALL;
-            if (prefetch == "none")
-                prefetchConfig = PREFETCH_NONE;
-            else if (prefetch == "_id_only")
-                prefetchConfig = PREFETCH_ID_ONLY;
-            else if (prefetch == "all")
-                prefetchConfig = PREFETCH_ALL;
-            else
-                warning() << "unrecognized indexPrefetch setting: " << prefetch << endl;
-            setIndexPrefetchConfig(prefetchConfig);
-        }
     }
 
     ReplSetImpl::ReplSetImpl() :
@@ -446,32 +466,35 @@ namespace mongo {
         _maintenanceMode(0),
         mgr(0),
         ghost(0),
-        _writerPool(replWriterThreadCount),
-        _prefetcherPool(replPrefetcherThreadCount),
-        oplogVersion(0),
-        _indexPrefetchConfig(PREFETCH_ALL) {
+        oplogVersion(0) {
     }
 
     ReplSet::ReplSet(ReplSetCmdline& replSetCmdline) : ReplSetImpl(replSetCmdline) {}
     ReplSet::ReplSet() : ReplSetImpl() {}
 
-    void ReplSetImpl::loadGTIDManager(bool quiet) {
-        Lock::DBRead lk(rsoplog);
-        BSONObj o;
-        if( Helpers::getLast(rsoplog, o) ) {
+    void ReplSetImpl::loadGTIDManager() {
+        Lock::DBWrite lk(rsoplog);
+        Client::Transaction txn(DB_SERIALIZABLE);
+        const BSONObj o = getLastEntryInOplog();
+        if (!o.isEmpty()) {
             GTID lastGTID = getGTIDFromBSON("_id", o);
             uint64_t lastTime = o["ts"]._numberLong();
             uint64_t lastHash = o["h"].numberLong();
-            gtidManager = new GTIDManager(lastGTID, lastTime, lastHash);
-            setTxnGTIDManager(gtidManager);
-            
+            gtidManager.reset(new GTIDManager(lastGTID, lastTime, lastHash, _id));
+            setTxnGTIDManager(gtidManager.get());            
         }
         else {
             // make a GTIDManager that starts from scratch
             GTID lastGTID;
-            gtidManager = new GTIDManager(lastGTID, curTimeMillis64(), 0);
-            setTxnGTIDManager(gtidManager);
+            // note we initialize the lastTime to 0, so arbiters never get fooled
+            // into thinking they are ahead of actual running systems.
+            // Either this, or we need to change the code in 
+            // ReplSetHealthPollTask::up, where we check if a potential
+            // primary is within 10 seconds of this machine
+            gtidManager.reset(new GTIDManager(lastGTID, 0, 0, _id));
+            setTxnGTIDManager(gtidManager.get());
         }
+        txn.commit();
     }
 
     /* call after constructing to start */
@@ -480,9 +503,7 @@ namespace mongo {
             // this might now work on secondaries
             // on secondaries, at this point in the code, we may not have yet created
             // the oplog, but we will see
-            Client::Transaction txn(DB_SERIALIZABLE);
             loadGTIDManager();
-            txn.commit();
         }
         catch(std::exception& e) {
             log() << "replSet error fatal couldn't query the local " << rsoplog << " collection.  Terminating mongod after 30 seconds." << rsLog;
@@ -520,11 +541,10 @@ namespace mongo {
                 // a full clone from someone
                 syncDoInitialSync();
                 {
-                    Client::Transaction transaction(0);
                     Client::ReadContext ctx(rsoplog);
-                    BSONObj o;
-                    bool ret= Helpers::getLast(rsoplog, o);
-                    verify(ret);
+                    Client::Transaction transaction(0);
+                    BSONObj o = getLastEntryInOplog();
+                    verify(!o.isEmpty());
                     GTID lastGTID = getGTIDFromBSON("_id", o);
                     uint64_t lastTime = o["ts"]._numberLong();
                     uint64_t lastHash = o["h"].numberLong();
@@ -536,6 +556,9 @@ namespace mongo {
                 }
                 goLiveAsSecondary = true;
             }
+        }
+        else {
+            changeState(MemberState::RS_ARBITER);
         }
 
         // When we get here,
@@ -634,6 +657,23 @@ namespace mongo {
                 log() << c.toString() << rsLog;
 
                 loadConfig();  // redo config from scratch
+                // if we were shunned, and had to wait for a new config,
+                // reset the state to either arbiter or secondary, based on
+                // config options
+                //
+                // I don't know of a better way to do this, unfortunately
+                // The problem is I don't want the background sync threads to
+                // handle the state transitions, as those might become racy
+                // with maintenanceMode. So doing it here
+                if (iAmArbiterOnly()) {
+                    changeState(MemberState::RS_ARBITER);
+                }
+                else if (_maintenanceMode > 0 || _blockSync) {
+                    changeState(MemberState::RS_RECOVERING);
+                }
+                else {
+                    changeState(MemberState::RS_SECONDARY);
+                }
                 return false; 
             }
             uassert( 13302, "replSet error self appears twice in the repl set configuration", me<=1 );
@@ -656,7 +696,6 @@ namespace mongo {
         verify( _name.empty() || _name == config()._id );
         _name = config()._id;
         verify( !_name.empty() );
-
         // this is a shortcut for simple changes
         if( additive ) {
             log() << "replSet info : additive change to configuration" << rsLog;
@@ -685,6 +724,10 @@ namespace mongo {
         _members.orphanAll();
 
         endOldHealthTasks();
+        
+        // Clear out our memory of who might have been syncing from us.
+        // Any incoming handshake connections after this point will be newly registered.
+        ghost->clearCache();
 
         int oldPrimaryId = -1;
         {
@@ -692,7 +735,20 @@ namespace mongo {
             if( p )
                 oldPrimaryId = p->id();
         }
-        forgetPrimary();
+        
+        if( box.getState().primary() ) {
+            // If we are here, that means we must be doing
+            // a reconfig, and must have been called by
+            // haveNewConfig
+            verify(reconf);
+            // don't start replication in the middle of a config
+            // haveNewConfig will take care of restarting
+            // replication if we exit this as a secondary
+            relinquish(false);
+        }
+        else {
+            box.setOtherPrimary(0);
+        }
 
         // not setting _self to 0 as other threads use _self w/o locking
         int me = 0;
@@ -887,8 +943,25 @@ namespace mongo {
         newConfig.saveConfigLocally(comment);
 
         try {
+            boost::unique_lock<boost::mutex> lock(stateChangeMutex);
+            log() << "stopping replication because we have a new config" << endl;
+            stopReplication();
+            log() << "stopped replication because we have a new config" << endl;
+            // going into this function, we know there is no replication running
+            RSBase::lock lk(this);
+            // if we are fatal, we will just fall into the catch block below
+            massert(16803, "we are fatal, cannot create a new config", !state().fatal());
             if (initFromConfig(newConfig, true)) {
                 log() << "replSet replSetReconfig new config saved locally" << rsLog;
+            }
+            // if necessary, restart replication
+            if (isSecondary()) {
+                log() << "starting replication because we have a new config" << endl;
+                startReplication();
+                log() << "started replication because we have a new config" << endl;
+            }
+            else {
+                log() << "NOT starting replication because we have a new config" << endl;
             }
         }
         catch(DBException& e) {
@@ -937,7 +1010,8 @@ namespace mongo {
     }
 
     void ReplSet::shutdown() {
-        BackgroundSync::shutdown();
+        BackgroundSync::get()->shutdown();
+        stopReplInfoThread();
     }
 
     void replLocalAuth() {
@@ -946,25 +1020,121 @@ namespace mongo {
         cc().getAuthenticationInfo()->authorize("local","_repl");
     }
 
-    void ReplSetImpl::_updateReplInfo() {
+    void ReplSetImpl::purgeOplogThread() {
+        _replOplogPurgeRunning = true;
+        GTID lastTimeRead;
+        Client::initThread("purgeOplog");
+        while (_replBackgroundShouldRun) {
+            const uint64_t expireMillis = expireOplogMilliseconds();
+            if (expireMillis) {
+                // Allow an additional slack period of one hour.
+                const uint64_t ageAllowed = expireMillis + (3600 * 1000);
+                const uint64_t minTime = curTimeMillis64() - ageAllowed;
+                // now get the minimum entry in the oplog, if it has timestamp
+                // less than minTime, delete it, otherwise, 
+                uint64_t millisToWait = 0;
+                // do a possible deletion from the oplog, if we find an entry
+                // old enough. If not, we will sleep
+                try {
+                    BSONObj result;
+                    bool found = false;
+
+                    Client::ReadContext ctx(rsoplog);
+                    Client::Transaction transaction(DB_SERIALIZABLE);
+                    NamespaceDetails *d = nsdetails(rsoplog);
+                    if (d != NULL) {
+                        if (lastTimeRead.isInitial()) {
+                            found = d->findOne(BSONObj(), result);
+                        }
+                        else {
+                            BSONObjBuilder q;
+                            addGTIDToBSON("$gt", lastTimeRead, q);
+                            BSONObjBuilder query;
+                            query.append("_id", q.done());
+                            found = d->findOne(query.done(), result, false);
+                        }
+                    }
+                    if (found) {
+                        lastTimeRead = getGTIDFromBSON("_id", result);                    
+                        uint64_t ts = result["ts"]._numberLong();
+                        if (ts < minTime) {
+                            // delete the row "result"
+                            purgeEntryFromOplog(result);
+                        }
+                        else {
+                            millisToWait = ts - minTime;
+                        }
+                    }
+                    // there is no data, just sleep for now
+                    // this should be rare
+                    else {
+                        millisToWait = 2000;
+                    }
+                    transaction.commit(DB_TXN_NOSYNC);
+                }
+                catch (...) {
+                    log() << "exception cought in purgeOplog thread: " << rsLog;
+                    millisToWait = 2000;
+                }
+                // do a timed_wait, if necessary
+                if (millisToWait > 0) {
+                    boost::unique_lock<boost::mutex> lock(_purgeMutex);
+                    _purgeCond.timed_wait(
+                        _purgeMutex, 
+                        boost::posix_time::milliseconds(millisToWait)
+                        );
+                }
+            }
+            else {                
+                _purgeCond.wait(_purgeMutex);
+            }
+        }        
+        cc().shutdown();
+        _replOplogPurgeRunning = false;
+    }
+
+    void ReplSetImpl::forceUpdateReplInfo() {
+        boost::unique_lock<boost::mutex> lock(_replInfoMutex);
         GTID minUnappliedGTID;
         GTID minLiveGTID;
         verify(gtidManager != NULL);
         gtidManager->getMins(&minLiveGTID, &minUnappliedGTID);
+        Lock::DBRead lk("local");
         Client::Transaction transaction(DB_SERIALIZABLE);
         logToReplInfo(minLiveGTID, minUnappliedGTID);
         transaction.commit();
     }
 
     void ReplSetImpl::updateReplInfoThread() {
+        _replInfoUpdateRunning = true;
+        GTID lastMinUnappliedGTID;
+        GTID lastMinLiveGTID;
         Client::initThread("updateReplInfo");
         replLocalAuth();
         // not sure if this is correct, don't yet know how to ensure
         // that we don't have race conditions with shutdown
-        while (!inShutdown()) {
+        while (_replBackgroundShouldRun) {
             if (theReplSet) {
                 try {
-                    _updateReplInfo();
+                    boost::unique_lock<boost::mutex> lock(_replInfoMutex);
+                    GTID minUnappliedGTID;
+                    GTID minLiveGTID;
+                    verify(gtidManager != NULL);
+                    gtidManager->getMins(&minLiveGTID, &minUnappliedGTID);
+                    // Note that these CANNOT be >, they must be !=. In the
+                    // case of rollback, these values may go backwards, and this
+                    // thread must capture that information.
+                    if (GTID::cmp(lastMinLiveGTID, minLiveGTID) != 0 ||
+                        GTID::cmp(lastMinUnappliedGTID, minUnappliedGTID) != 0
+                        )
+                    {
+                        Lock::DBRead lk("local");
+                        Client::Transaction transaction(DB_SERIALIZABLE);
+                        logToReplInfo(minLiveGTID, minUnappliedGTID);
+                        lastMinUnappliedGTID = minUnappliedGTID;
+                        lastMinLiveGTID = minLiveGTID;
+                        transaction.commit();
+                    }
                 }
                 catch (...) {
                     log() << "exception cought in updateReplInfo thread: " << rsLog;
@@ -972,8 +1142,50 @@ namespace mongo {
             }
             sleepsecs(1);
         }
-
         cc().shutdown();
+        _replInfoUpdateRunning = false;
+    }
+
+    void ReplSetImpl::registerSlave(const BSONObj& rid, const int memberId) {
+        // To prevent race conditions with clearing the cache at reconfig time,
+        // we lock the replset mutex here.
+        lock lk(this);
+        ghost->associateSlave(rid, memberId);
+    }
+
+    void ReplSetImpl::stopReplInfoThread() {        
+        _replBackgroundShouldRun = false;
+        log() << "waiting for updateReplInfo thread to end" << endl;
+        while (_replInfoUpdateRunning) {
+            sleepsecs(1);
+            log() << "still waiting for updateReplInfo thread to end..." << endl;
+        }
+        {
+            boost::unique_lock<boost::mutex> lock(_purgeMutex);
+            _purgeCond.notify_all();
+        }
+        while (_replOplogPurgeRunning) {
+            sleepsecs(1);
+            log() << "still waiting for oplog purge thread to end..." << endl;
+        }
+    }
+
+    // look at comments in BackgroundSync::stopOpSyncThread for rules
+    void ReplSetImpl::stopReplication() {
+        // arbiters do not have these threads running, so only do this
+        // if we are not an arbiter
+        if (!iAmArbiterOnly()) {
+            BackgroundSync::get()->stopOpSyncThread();
+        }
+    }
+
+    // look at comments in BackgroundSync::startOpSyncThread for rules
+    void ReplSetImpl::startReplication() {
+        // arbiters do not have these threads running, so only do this
+        // if we are not an arbiter
+        if (!iAmArbiterOnly()) {
+            BackgroundSync::get()->startOpSyncThread();
+        }
     }
 }
 

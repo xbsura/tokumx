@@ -2,6 +2,7 @@
 
 /**
  *    Copyright (C) 2011 10gen Inc.
+ *    Copyright (C) 2013 Tokutek Inc.
  *
  *    This program is free software: you can redistribute it and/or  modify
  *    it under the terms of the GNU Affero General Public License, version 3,
@@ -28,7 +29,6 @@ namespace mongo {
             logForRepl = true;
             slaveOk = false;
             useReplAuth = false;
-            mayYield = true;
             mayBeInterrupted = false;
 
             syncData = true;
@@ -41,22 +41,23 @@ namespace mongo {
         bool logForRepl;
         bool slaveOk;
         bool useReplAuth;
-        bool mayYield;
         bool mayBeInterrupted;
 
         bool syncData;
         bool syncIndexes;
     };
 
+    class DBClientBase;
+
     bool cloneFrom(
         const string& masterHost , 
         const CloneOptions& options , 
-        shared_ptr<DBClientConnection> conn,
+        shared_ptr<DBClientBase> conn,
         string& errmsg /* out */
         );
     
     void cloneCollectionData(
-        shared_ptr<DBClientConnection> conn,
+        shared_ptr<DBClientBase> conn,
         const string& ns, 
         const BSONObj& query,
         bool copyIndexes,

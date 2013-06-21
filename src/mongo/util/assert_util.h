@@ -1,6 +1,7 @@
 // assert_util.h
 
 /*    Copyright 2009 10gen Inc.
+ *    Copyright (C) 2013 Tokutek Inc.
  *
  *    Licensed under the Apache License, Version 2.0 (the "License");
  *    you may not use this file except in compliance with the License.
@@ -28,7 +29,6 @@
 namespace mongo {
 
     enum CommonErrorCodes {
-        DatabaseDifferCaseCode = 13297 ,
         SendStaleConfigCode = 13388 ,
         RecvStaleConfigCode = 9996
     };
@@ -184,7 +184,7 @@ namespace mongo {
 
     /* warning only - keeps going */
 #define MONGO_wassert(_Expression) (void)( MONGO_likely(!!(_Expression)) || (mongo::wasserted(#_Expression, __FILE__, __LINE__), 0) )
-#define MONGO_wunimplemented(msg) MONGO_RARELY { problem() << "tokudb unimplemented " << msg << " " << __FILE__ << ":" << __LINE__ << endl; }
+#define MONGO_wunimplemented(msg) MONGO_RARELY { problem() << "tokumx unimplemented " << msg << " " << __FILE__ << ":" << __LINE__ << endl; }
 
     /* display a message, no context, and throw assertionexception
 
@@ -194,7 +194,7 @@ namespace mongo {
 #define MONGO_massert(msgid, msg, expr) (void)( MONGO_likely(!!(expr)) || (mongo::msgasserted(msgid, msg), 0) )
     /* same as massert except no msgid */
 #define MONGO_verify(_Expression) (void)( MONGO_likely(!!(_Expression)) || (mongo::verifyFailed(#_Expression, __FILE__, __LINE__), 0) )
-#define MONGO_unimplemented(msg) (void)(mongo::verifyFailed("tokudb unimplemented " msg, __FILE__, __LINE__), 0)
+#define MONGO_unimplemented(msg) (void)(mongo::verifyFailed("tokumx unimplemented " msg, __FILE__, __LINE__), 0)
 
     /* dassert is 'debug assert' -- might want to turn off for production as these
        could be slow.
@@ -228,9 +228,9 @@ namespace mongo {
     };
 
     /* throws a uassertion with an appropriate msg */
-    MONGO_COMPILER_NORETURN void streamNotGood( int code , std::string msg , std::ios& myios );
+    MONGO_COMPILER_NORETURN void streamNotGood( int code, const std::string& msg, std::ios& myios );
 
-    inline void assertStreamGood(unsigned msgid, std::string msg, std::ios& myios) {
+    inline void assertStreamGood(unsigned msgid, const std::string& msg, std::ios& myios) {
         if( !myios.good() ) streamNotGood(msgid, msg, myios);
     }
 

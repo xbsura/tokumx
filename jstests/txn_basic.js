@@ -1,13 +1,8 @@
 // verify that we can create multiple indexes with the same key
 
 // try committing a transaction without having begun one
-t = db.runCommand({"commitTransaction":1});
-assert(t.ok == 1);
-assert(t.status == "no transaction exists, no-op");
-
-t = db.runCommand({"rollbackTransaction":1});
-assert(t.ok == 1);
-assert(t.status == "no transaction exists, no-op");
+assert.throws(db.runCommand({"commitTransaction":1}));
+assert.throws(db.runCommand({"rollbackTransaction":1}));
 
 // begin a transaction
 t = db.runCommand({"beginTransaction":1});
@@ -15,9 +10,7 @@ assert(t.ok == 1);
 assert(t.status == "transaction began");
 
 // trying to begin again should work, but with different status
-t = db.runCommand({"beginTransaction":1});
-assert(t.ok == 1);
-assert(t.status == "transaction exists, no-op");
+assert.throws(db.runCommand({"beginTransaction":1}));
 
 // try committing a transaction
 t = db.runCommand({"commitTransaction":1});
@@ -34,7 +27,7 @@ t = db.runCommand({"rollbackTransaction":1})
 assert(t.ok == 1);
 assert(t.status == "transaction rolled back");
 
-// make sure that we cannot create a collection
+// make sure that we can create a collection
 // via an insert in a multi statement transaction
 db.jstests_txn_basic.drop(); 
 t = db.runCommand({"beginTransaction":1});
@@ -42,12 +35,12 @@ assert(t.ok == 1);
 assert(t.status == "transaction began");
 db.jstests_txn_basic.insert({a:1});
 t = db.runCommand({"getLastError":1});
-assert(t.code == 16744);
+assert(t.ok == 1);
 t = db.runCommand({"commitTransaction":1});
 assert(t.ok == 1);
 assert(t.status == "transaction committed");
 
-// make sure that we cannot add an index
+// make sure that we can add an index
 // during a multi statement transaction
 db.jstests_txn_basic.insert({a:1});
 t = db.runCommand({"beginTransaction":1});
@@ -55,7 +48,7 @@ assert(t.ok == 1);
 assert(t.status == "transaction began");
 db.jstests_txn_basic.ensureIndex({a:1});
 t = db.runCommand({"getLastError":1});
-assert(t.code == 16749);
+assert(t.ok == 1);
 t = db.runCommand({"commitTransaction":1});
 assert(t.ok == 1);
 assert(t.status == "transaction committed");

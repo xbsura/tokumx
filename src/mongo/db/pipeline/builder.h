@@ -1,5 +1,6 @@
 /**
  * Copyright (c) 2011 10gen Inc.
+ * Copyright (C) 2013 Tokutek Inc.
  *
  * This program is free software: you can redistribute it and/or  modify
  * it under the terms of the GNU Affero General Public License, version 3,
@@ -44,7 +45,7 @@ namespace mongo {
         virtual void append(int i) = 0;
         virtual void append(long long ll) = 0;
         virtual void append(double d) = 0;
-        virtual void append(string s) = 0;
+        virtual void append(const std::string& s) = 0;
         virtual void append(const OID &o) = 0;
         virtual void append(const Date_t &d) = 0;
         virtual void append(const OpTime& ot) = 0;
@@ -62,14 +63,14 @@ namespace mongo {
         virtual void append(int i);
         virtual void append(long long ll);
         virtual void append(double d);
-        virtual void append(string s);
+        virtual void append(const std::string& s);
         virtual void append(const OID &o);
         virtual void append(const Date_t &d);
         virtual void append(const OpTime& ot);
         virtual void append(BSONObjBuilder *pDone);
         virtual void append(BSONArrayBuilder *pDone);
 
-        BuilderObj(BSONObjBuilder *pBuilder, string fieldName);
+        BuilderObj(BSONObjBuilder *pBuilder, const std::string& fieldName);
 
     private:
         BSONObjBuilder *pBuilder;
@@ -86,7 +87,7 @@ namespace mongo {
         virtual void append(int i);
         virtual void append(long long ll);
         virtual void append(double d);
-        virtual void append(string s);
+        virtual void append(const std::string& s);
         virtual void append(const OID &o);
         virtual void append(const Date_t &d);
         virtual void append(const OpTime& ot);

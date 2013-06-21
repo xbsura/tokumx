@@ -2,6 +2,7 @@
 
 /**
  *    Copyright (C) 2008 10gen Inc.
+ *    Copyright (C) 2013 Tokutek Inc.
  *
  *    This program is free software: you can redistribute it and/or  modify
  *    it under the terms of the GNU Affero General Public License, version 3,
@@ -24,6 +25,9 @@
 
 namespace mongo {
 
+    class NamespaceDetails;
+    class NamespaceDetailsTransient;
+
     // ---------- public -------------
 
     struct UpdateResult {
@@ -41,20 +45,21 @@ namespace mongo {
             }
         }
     };
-
     
     struct LogOpUpdateDetails {
         bool logop;
         const char* ns;
         bool fromMigrate;
     };
+
     void updateOneObject(
         NamespaceDetails *d, 
         NamespaceDetailsTransient *nsdt, 
         const BSONObj &pk, 
         const BSONObj &oldObj, 
         const BSONObj &newObj, 
-        struct LogOpUpdateDetails* loud
+        struct LogOpUpdateDetails* loud,
+        uint64_t flags = 0
         );
 
     /* returns true if an existing object was updated, false if no existing object was found.
@@ -70,17 +75,5 @@ namespace mongo {
                                OpDebug& debug,
                                bool fromMigrate = false,
                                const QueryPlanSelectionPolicy& planPolicy = QueryPlanSelectionPolicy::any());
-
-    UpdateResult _updateObjects(bool su,
-                                const char* ns,
-                                const BSONObj& updateobj,
-                                const BSONObj& pattern,
-                                bool upsert,
-                                bool multi,
-                                bool logop,
-                                OpDebug& debug,
-                                bool fromMigrate = false,
-                                const QueryPlanSelectionPolicy& planPolicy = QueryPlanSelectionPolicy::any());
-
 
 }  // namespace mongo

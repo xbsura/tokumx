@@ -2,6 +2,7 @@
 
 /**
 *    Copyright (C) 2012 10gen Inc.
+*    Copyright (C) 2013 Tokutek Inc.
 *
 *    This program is free software: you can redistribute it and/or  modify
 *    it under the terms of the GNU Affero General Public License, version 3,
@@ -35,6 +36,22 @@ namespace mongo {
         }
 
         return doc.extractFields( _pattern );
+    }
+
+    BSONObj KeyPattern::prettyKey(const BSONObj &key) const {
+        if (_pattern.isEmpty()) {
+            return BSONObj();
+        }
+        BSONObjBuilder b;
+        BSONObjIterator keyIter(key);
+        BSONObjIterator patIter(_pattern);
+        while (patIter.more()) {
+            massert(16800, "key is shorter than expected key pattern", keyIter.more());
+            BSONElement k = keyIter.next();
+            BSONElement p = patIter.next();
+            b.appendAs(k, p.fieldName());
+        }
+        return b.obj();
     }
 
     bool KeyPattern::isSpecial() const {

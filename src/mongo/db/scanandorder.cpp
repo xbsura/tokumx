@@ -4,6 +4,7 @@
 
 /**
  *    Copyright (C) 2008 10gen Inc.
+ *    Copyright (C) 2013 Tokutek Inc.
  *
  *    This program is free software: you can redistribute it and/or  modify
  *    it under the terms of the GNU Affero General Public License, version 3,
@@ -34,13 +35,11 @@ namespace mongo {
             k = _order.getKeyFromObject(o);
         }
         catch (UserException &e) {
-#if 0
             if ( e.getCode() == ParallelArraysCode ) { // cannot get keys for parallel arrays
                 // fix lasterror text to be more accurate.
                 uasserted( 15925, "cannot sort with keys that are parallel arrays" );
             }
             else
-#endif
                 throw;
         }
 

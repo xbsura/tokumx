@@ -2,6 +2,7 @@
 
 /**
 *    Copyright (C) 2008 10gen Inc.
+*    Copyright (C) 2013 Tokutek Inc.
 *
 *    This program is free software: you can redistribute it and/or  modify
 *    it under the terms of the GNU Affero General Public License, version 3,
@@ -16,10 +17,7 @@
 *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 
-#include "../pch.h"
-#include "../db/db.h"
-#include "mongo/client/dbclientcursor.h"
-#include "tool.h"
+#include "mongo/pch.h"
 
 #include <fcntl.h>
 #include <map>
@@ -27,6 +25,10 @@
 
 #include <boost/filesystem/operations.hpp>
 #include <boost/filesystem/convenience.hpp>
+
+#include "mongo/base/initializer.h"
+#include "mongo/client/dbclientcursor.h"
+#include "mongo/tools/tool.h"
 
 using namespace mongo;
 
@@ -251,180 +253,9 @@ public:
         log() << "going to try and recover data from: " << dbname << endl;
 
         return _repair( dbname  );
-    }
-    
-#if 0
-    DiskLoc _repairExtent( Database* db , string ns, bool forward , DiskLoc eLoc , Writer& w ){
-        LogIndentLevel lil;
-        
-        if ( eLoc.getOfs() <= 0 ){
-            error() << "invalid extent ofs: " << eLoc.getOfs() << endl;
-            return DiskLoc();
-        }
-        
+    }    
 
-        MongoDataFile * mdf = db->getFile( eLoc.a() );
-
-        Extent * e = mdf->debug_getExtent( eLoc );
-        if ( ! e->isOk() ){
-            warning() << "Extent not ok magic: " << e->magic << " going to try to continue" << endl;
-        }
-        
-        log() << "length:" << e->length << endl;
-        
-        LogIndentLevel lil2;
-        
-        set<DiskLoc> seen;
-
-        DiskLoc loc = forward ? e->firstRecord : e->lastRecord;
-        while ( ! loc.isNull() ){
-            
-            if ( ! seen.insert( loc ).second ) {
-                error() << "infinite loop in extent, seen: " << loc << " before" << endl;
-                break;
-            }
-
-            if ( loc.getOfs() <= 0 ){
-                error() << "offset is 0 for record which should be impossible" << endl;
-                break;
-            }
-            LOG(1) << loc << endl;
-            Record* rec = loc.rec();
-            BSONObj obj;
-            try {
-                obj = loc.obj();
-                verify( obj.valid() );
-                LOG(1) << obj << endl;
-                w( obj );
-            }
-            catch ( std::exception& e ) {
-                log() << "found invalid document @ " << loc << " " << e.what() << endl;
-                if ( ! obj.isEmpty() ) {
-                    try {
-                        BSONElement e = obj.firstElement();
-                        stringstream ss;
-                        ss << "first element: " << e;
-                        log() << ss.str();
-                    }
-                    catch ( std::exception& ) {
-                        log() << "unable to log invalid document @ " << loc << endl;
-                    }
-                }
-            }
-            loc = forward ? rec->getNext( loc ) : rec->getPrev( loc );
-
-            // break when new loc is outside current extent boundary
-            if ( ( forward && loc.compare( e->lastRecord ) > 0 ) || 
-                 ( ! forward && loc.compare( e->firstRecord ) < 0 ) ) 
-            {
-                break;
-            }
-        }
-        log() << "wrote " << seen.size() << " documents" << endl;
-        return forward ? e->xnext : e->xprev;
-    }
-#endif
-
-    void _repair( Database* db , string ns , boost::filesystem::path outfile ){
-        NamespaceDetails * nsd = nsdetails( ns.c_str() );
-        unimplemented("_repair");
-        (void) nsd;
-        (void) db;
-        (void) outfile;
-#if 0
-        log() << "nrecords: " << nsd->stats.nrecords 
-              << " datasize: " << nsd->stats.datasize 
-              << " firstExtent: " << nsd->firstExtent 
-              << endl;
-        
-        if ( nsd->firstExtent.isNull() ){
-            log() << " ERROR fisrtExtent is null" << endl;
-            return;
-        }
-        
-        if ( ! nsd->firstExtent.isValid() ){
-            log() << " ERROR fisrtExtent is not valid" << endl;
-            return;
-        }
-
-        outfile /= ( ns.substr( ns.find( "." ) + 1 ) + ".bson" );
-        log() << "writing to: " << outfile.string() << endl;
-        
-        FilePtr f (fopen(outfile.string().c_str(), "wb"));
-
-        // init with double the docs count because we make two passes 
-        ProgressMeter m( nsd->stats.nrecords * 2 );
-        m.setUnits("objects");
-        
-        Writer w( f , &m );
-
-        try {
-            log() << "forward extent pass" << endl;
-            LogIndentLevel lil;
-            DiskLoc eLoc = nsd->firstExtent;
-            while ( ! eLoc.isNull() ){
-                log() << "extent loc: " << eLoc << endl;
-                unimplemented("_repairExtent");
-                //eLoc = _repairExtent( db , ns , true , eLoc , w );
-            }
-        }
-        catch ( DBException& e ){
-            error() << "forward extent pass failed:" << e.toString() << endl;
-        }
-        
-        try {
-            log() << "backwards extent pass" << endl;
-            LogIndentLevel lil;
-            DiskLoc eLoc = nsd->lastExtent;
-            while ( ! eLoc.isNull() ){
-                log() << "extent loc: " << eLoc << endl;
-                unimplemented("_repairExtent");
-                //eLoc = _repairExtent( db , ns , false , eLoc , w );
-            }
-        }
-        catch ( DBException& e ){
-            error() << "ERROR: backwards extent pass failed:" << e.toString() << endl;
-        }
-
-        log() << "\t\t " << m.done() << " objects" << endl;
-#endif
-    }
-    
     int _repair( string dbname ) {
-        Client::WriteContext cx( dbname );
-        Database * db = cx.ctx().db();
-        
-        list<string> namespaces;
-        db->namespaceIndex.getNamespaces( namespaces );
-        
-        boost::filesystem::path root = getParam( "out" );
-        root /= dbname;
-        boost::filesystem::create_directories( root );
-
-        for ( list<string>::iterator i=namespaces.begin(); i!=namespaces.end(); ++i ){
-            LogIndentLevel lil;
-            string ns = *i;
-
-            if ( str::endsWith( ns , ".system.namespaces" ) )
-                continue;
-            
-            if ( str::contains( ns , ".tmp.mr." ) )
-                continue;
-            
-            if ( _coll != "" && ! str::endsWith( ns , _coll ) )
-                continue;
-
-            log() << "trying to recover: " << ns << endl;
-            
-            LogIndentLevel lil2;
-            try {
-                _repair( db , ns , root );
-            }
-            catch ( DBException& e ){
-                log() << "ERROR recovering: " << ns << " " << e.toString() << endl;
-            }
-        }
-   
         return 0;
     }
 
@@ -545,7 +376,8 @@ public:
     BSONObj _query;
 };
 
-int main( int argc , char ** argv ) {
+int main( int argc , char ** argv, char ** envp ) {
+    mongo::runGlobalInitializersOrDie(argc, argv, envp);
     Dump d;
     return d.main( argc , argv );
 }

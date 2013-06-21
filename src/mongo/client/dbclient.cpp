@@ -1,6 +1,7 @@
 // dbclient.cpp - connect to a Mongo database as a database, from C++
 
 /*    Copyright 2009 10gen Inc.
+ *    Copyright (C) 2013 Tokutek Inc.
  *
  *    Licensed under the Apache License, Version 2.0 (the "License");
  *    you may not use this file except in compliance with the License.
@@ -24,7 +25,6 @@
 #include "mongo/client/syncclusterconnection.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/json.h"
-#include "mongo/db/namespace.h"
 #include "mongo/db/namespacestring.h"
 #include "mongo/s/util.h"
 #include "mongo/util/md5.hpp"
@@ -396,6 +396,23 @@ namespace mongo {
         return isOk(info);
     }
 
+    bool DBClientWithCommands::beginTransaction(const string &isolation, BSONObj *res) {
+        BSONObj o;
+        if (res == NULL) {
+            res = &o;
+        }
+        // The dbname needs to be something but it doesn't need to be anything in particular.
+        return runCommand("x", BSON("beginTransaction" << "" << "isolation" << isolation), *res);
+    }
+
+    bool DBClientWithCommands::commitTransaction(BSONObj *res) {
+        return simpleCommand("x", res, "commitTransaction");
+    }
+
+    bool DBClientWithCommands::rollbackTransaction(BSONObj *res) {
+        return simpleCommand("x", res, "rollbackTransaction");
+    }
+
     /* note - we build a bson obj here -- for something that is super common like getlasterror you
               should have that object prebuilt as that would be faster.
     */
@@ -584,7 +601,7 @@ namespace mongo {
         BSONObj o;
         if ( info == 0 )    info = &o;
         BSONObjBuilder b;
-        string db = nsToDatabase(ns.c_str());
+        string db = nsToDatabase(ns);
         b.append("create", ns.c_str() + db.length() + 1);
         if ( size ) b.append("size", size);
         if ( capped ) b.append("capped", true);
@@ -1044,7 +1061,7 @@ namespace mongo {
 
     
     auto_ptr<DBClientCursor> DBClientWithCommands::getIndexes( const string &ns ) {
-        return query( Namespace( ns.c_str() ).getSisterNS( "system.indexes" ).c_str() , BSON( "ns" << ns ) );
+        return query( getSisterNS( ns, "system.indexes" ) , BSON( "ns" << ns ) );
     }
 
     void DBClientWithCommands::dropIndex( const string& ns , BSONObj keys ) {
@@ -1054,7 +1071,7 @@ namespace mongo {
 
     void DBClientWithCommands::dropIndex( const string& ns , const string& indexName ) {
         BSONObj info;
-        if ( ! runCommand( nsToDatabase( ns.c_str() ) ,
+        if ( ! runCommand( nsToDatabase( ns ) ,
                            BSON( "deleteIndexes" << NamespaceString( ns ).coll << "index" << indexName ) ,
                            info ) ) {
             LOG(_logLevel) << "dropIndex failed: " << info << endl;
@@ -1065,7 +1082,7 @@ namespace mongo {
 
     void DBClientWithCommands::dropIndexes( const string& ns ) {
         BSONObj info;
-        uassert( 10008 ,  "dropIndexes failed" , runCommand( nsToDatabase( ns.c_str() ) ,
+        uassert( 10008 ,  "dropIndexes failed" , runCommand( nsToDatabase( ns ) ,
                  BSON( "deleteIndexes" << NamespaceString( ns ).coll << "index" << "*") ,
                  info ) );
         resetIndexCache();
@@ -1082,7 +1099,7 @@ namespace mongo {
 
         for ( list<BSONObj>::iterator i=all.begin(); i!=all.end(); i++ ) {
             BSONObj o = *i;
-            insert( Namespace( ns.c_str() ).getSisterNS( "system.indexes" ).c_str() , o );
+            insert( getSisterNS( ns, "system.indexes" ), o );
         }
 
     }
@@ -1109,7 +1126,7 @@ namespace mongo {
         return ss.str();
     }
 
-    bool DBClientWithCommands::ensureIndex( const string &ns , BSONObj keys , bool unique, const string & name , bool cache, bool background, int version ) {
+    bool DBClientWithCommands::ensureIndex( const string &ns , BSONObj keys , bool unique, bool clustering, const string & name , bool cache, bool background, int version ) {
         BSONObjBuilder toSave;
         toSave.append( "ns" , ns );
         toSave.append( "key" , keys );
@@ -1133,6 +1150,10 @@ namespace mongo {
         if ( unique )
             toSave.appendBool( "unique", unique );
 
+        if (clustering) {
+            toSave.appendBool("clustering", clustering);
+        }
+
         if( background ) 
             toSave.appendBool( "background", true );
 
@@ -1142,7 +1163,7 @@ namespace mongo {
         if ( cache )
             _seenIndexes.insert( cacheKey );
 
-        insert( Namespace( ns.c_str() ).getSisterNS( "system.indexes"  ).c_str() , toSave.obj() );
+        insert( getSisterNS( ns, "system.indexes" ).c_str() , toSave.obj() );
         return 1;
     }
 

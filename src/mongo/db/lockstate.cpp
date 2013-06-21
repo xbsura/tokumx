@@ -2,6 +2,7 @@
 
 /**
 *    Copyright (C) 2008 10gen Inc.
+*    Copyright (C) 2013 Tokutek Inc.
 *
 *    This program is free software: you can redistribute it and/or  modify
 *    it under the terms of the GNU Affero General Public License, version 3,
@@ -27,8 +28,7 @@
 namespace mongo {
 
     LockState::LockState() 
-        : _batchWriter(false),
-          _recursive(0),
+        : _recursive(0),
           _threadState(0),
           _whichNestable( Lock::notnestable ),
           _nestableCount(0), 
@@ -58,7 +58,7 @@ namespace mongo {
 
     bool LockState::isLocked( const StringData& ns ) {
         char db[MaxDatabaseNameLen];
-        nsToDatabase(ns.data(), db);
+        nsToDatabase(ns, db);
         
         DEV verify( _otherName.find( '.' ) == string::npos ); // XXX this shouldn't be here, but somewhere
         if ( _otherCount && db == _otherName )

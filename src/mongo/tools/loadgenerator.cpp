@@ -2,6 +2,7 @@
 
 /**
  *    Copyright (C) 2012 10gen Inc.
+ *    Copyright (C) 2013 Tokutek Inc.
  *
  *    This program is free software: you can redistribute it and/or  modify
  *    it under the terms of the GNU Affero General Public License, version 3,
@@ -40,6 +41,7 @@
 #include <boost/program_options.hpp>
 #include <boost/scoped_ptr.hpp>
 
+#include "mongo/base/initializer.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/scripting/bench.h"
 #include "mongo/client/dbclientinterface.h"
@@ -407,8 +409,8 @@ int parseCmdLineOptions(int argc, char **argv) {
 } // namespace
 
 
-int main(int argc, char **argv) {
-
+int main(int argc, char **argv, char** envp) {
+    mongo::runGlobalInitializersOrDie(argc, argv, envp);
     if( parseCmdLineOptions(argc, argv) )
         return 1;
 

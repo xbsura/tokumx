@@ -2,6 +2,7 @@
 
 /**
  *    Copyright (C) 2008 10gen Inc.
+ *    Copyright (C) 2013 Tokutek Inc.
  *
  *    This program is free software: you can redistribute it and/or  modify
  *    it under the terms of the GNU Affero General Public License, version 3,
@@ -255,14 +256,11 @@ namespace mongo {
     } staticShardInfo;
 
 
-    class CmdGetShardMap : public Command {
-    public:
-        CmdGetShardMap() : Command( "getShardMap" ){}
+    class CmdGetShardMap : public InformationCommand {
+      public:
+        CmdGetShardMap() : InformationCommand("getShardMap", false) {}
         virtual void help( stringstream &help ) const { help<<"internal"; }
-        virtual LockType locktype() const { return NONE; }
-        virtual bool slaveOk() const { return true; }
         virtual bool adminOnly() const { return true; }
-
         virtual bool run(const string&, mongo::BSONObj&, int, std::string& errmsg , mongo::BSONObjBuilder& result, bool) {
             return staticShardInfo.getShardMap( result , errmsg );
         }

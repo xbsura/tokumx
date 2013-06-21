@@ -2,6 +2,7 @@
 
 /**
 *    Copyright (C) 2008 10gen Inc.
+*    Copyright (C) 2013 Tokutek Inc.
 *
 *    This program is free software: you can redistribute it and/or  modify
 *    it under the terms of the GNU Affero General Public License, version 3,
@@ -18,8 +19,8 @@
 
 #include "mongo/pch.h"
 #include "mongo/server.h"
+#include "mongo/db/namespace_details.h"
 #include "mongo/db/queryoptimizer.h"
-#include "mongo/db/db.h"
 #include "mongo/db/cursor.h"
 #include "mongo/db/cmdline.h"
 #include "mongo/db/dbhelpers.h"
@@ -95,7 +96,7 @@ namespace mongo {
                                const shared_ptr<const ParsedQuery> &parsedQuery,
                                const BSONObj &startKey,
                                const BSONObj &endKey,
-                               string special ) {
+                               const std::string& special ) {
         auto_ptr<QueryPlan> ret( new QueryPlan( d, idxNo, frsp, originalQuery, order, parsedQuery,
                                                special ) );
         ret->init( originalFrsp, startKey, endKey );
@@ -108,7 +109,7 @@ namespace mongo {
                          const BSONObj &originalQuery,
                          const BSONObj &order,
                          const shared_ptr<const ParsedQuery> &parsedQuery,
-                         string special ) :
+                         const std::string& special ) :
         _d(d),
         _idxNo(idxNo),
         _frs( frsp.frsForIndex( _d, _idxNo ) ),
@@ -148,6 +149,8 @@ namespace mongo {
         }
 
         _index = &_d->idx(_idxNo);
+        const BSONObj &pkPattern = _d->pkPattern();
+        const BSONObj &keyPattern = _index->keyPattern();
 
         // If the parsing or index indicates this is a special query, don't continue the processing
         if ( _special.size() ||
@@ -263,7 +266,7 @@ doneCheckOrder:
         }
 
         if ( _parsedQuery && _parsedQuery->getFields() && !_d->isMultikey( _idxNo ) ) { // Does not check modifiedKeys()
-            _keyFieldsOnly.reset( _parsedQuery->getFields()->checkKey( _index->keyPattern() ) );
+            _keyFieldsOnly.reset( _parsedQuery->getFields()->checkKey( keyPattern, pkPattern ) );
         }
     }
 
@@ -290,27 +293,29 @@ doneCheckOrder:
 
         if ( willScanTable() ) {
             checkTableScanAllowed();
-            return Helpers::findTableScan( _frs.ns(), _order);
+            const int direction = _order.getField("$natural").number() >= 0 ? 1 : -1;
+            NamespaceDetails *d = nsdetails( _frs.ns() );
+            return shared_ptr<Cursor>( BasicCursor::make( d, direction ) );
         }
                 
         if ( _startOrEndSpec ) {
             // we are sure to spec _endKeyInclusive
-            return shared_ptr<Cursor>( new IndexCursor( _d, *_index, _startKey, _endKey, _endKeyInclusive, _direction >= 0 ? 1 : -1, numWanted ) );
+            return shared_ptr<Cursor>( IndexCursor::make( _d, *_index, _startKey, _endKey, _endKeyInclusive, _direction >= 0 ? 1 : -1, numWanted ) );
         }
         else if ( _index->getSpec().getType() ) {
-            return shared_ptr<Cursor>( new IndexCursor( _d, *_index, _frv->startKey(), _frv->endKey(), true, _direction >= 0 ? 1 : -1, numWanted ) );
+            return shared_ptr<Cursor>( IndexCursor::make( _d, *_index, _frv->startKey(), _frv->endKey(), true, _direction >= 0 ? 1 : -1, numWanted ) );
         }
         else {
-            return shared_ptr<Cursor>( new IndexCursor( _d, *_index, _frv, independentRangesSingleIntervalLimit(), _direction >= 0 ? 1 : -1, numWanted) );
+            return shared_ptr<Cursor>( IndexCursor::make( _d, *_index, _frv, independentRangesSingleIntervalLimit(), _direction >= 0 ? 1 : -1, numWanted) );
         }
     }
 
     shared_ptr<Cursor> QueryPlan::newReverseCursor() const {
         if ( willScanTable() ) {
-            int orderSpec = _order.getIntField( "$natural" );
-            if ( orderSpec == INT_MIN )
-                orderSpec = 1;
-            return Helpers::findTableScan( _frs.ns(), BSON( "$natural" << -orderSpec ) );
+            const int orderSpec = _order.getIntField( "$natural" );
+            const int direction = orderSpec == INT_MIN ? -1 : -orderSpec;
+            NamespaceDetails *d = nsdetails( _frs.ns() );
+            return shared_ptr<Cursor>( BasicCursor::make( d, direction ) );
         }
         massert( 10364 ,  "newReverseCursor() not implemented for indexed plans", false );
         return shared_ptr<Cursor>();
@@ -581,7 +586,7 @@ doneCheckOrder:
             return;
         }
         
-        // Only add a special plan if no standard btree plans have been added. SERVER-4531
+        // Only add a special plan if no standard index plans have been added. SERVER-4531
         if ( plans.empty() && specialPlan ) {
             _qps.setSinglePlan( specialPlan );
             return;
@@ -953,7 +958,7 @@ doneCheckOrder:
         return bab.arr().jsonString();
     }
     
-    MultiPlanScanner *MultiPlanScanner::make( const char *ns,
+    MultiPlanScanner *MultiPlanScanner::make( const StringData& ns,
                                              const BSONObj &query,
                                              const BSONObj &order,
                                              const shared_ptr<const ParsedQuery> &parsedQuery,
@@ -1155,12 +1160,12 @@ doneCheckOrder:
      * $nor component that would not be represented in QueryPattern.    
      */
     
-    MultiPlanScanner::MultiPlanScanner( const char *ns,
+    MultiPlanScanner::MultiPlanScanner( const StringData& ns,
                                        const BSONObj &query,
                                        const shared_ptr<const ParsedQuery> &parsedQuery,
                                        const BSONObj &hint,
                                        QueryPlanGenerator::RecordedPlanPolicy recordedPlanPolicy ) :
-        _ns( ns ),
+        _ns( ns.toString() ),
         _or( !query.getField( "$or" ).eoo() ),
         _query( query.getOwned() ),
         _parsedQuery( parsedQuery ),
@@ -1543,13 +1548,15 @@ doneCheckOrder:
         return id;
     }
     
-    shared_ptr<Cursor> NamespaceDetailsTransient::bestGuessCursor( const char *ns,
+    shared_ptr<Cursor> NamespaceDetailsTransient::bestGuessCursor( const StringData& ns,
                                                                   const BSONObj &query,
                                                                   const BSONObj &sort ) {
-        auto_ptr<FieldRangeSetPair> frsp( new FieldRangeSetPair( ns, query, true ) );
+        // TODO: make FieldRangeSet and QueryPlanSet understand StringData
+        string ns_s = ns.toString();
+        auto_ptr<FieldRangeSetPair> frsp( new FieldRangeSetPair( ns_s.c_str(), query, true ) );
         auto_ptr<FieldRangeSetPair> origFrsp( new FieldRangeSetPair( *frsp ) );
 
-        scoped_ptr<QueryPlanSet> qps( QueryPlanSet::make( ns, frsp, origFrsp, query, sort,
+        scoped_ptr<QueryPlanSet> qps( QueryPlanSet::make( ns_s.c_str(), frsp, origFrsp, query, sort,
                                                          shared_ptr<const ParsedQuery>(), BSONObj(),
                                                          QueryPlanGenerator::UseIfInOrder,
                                                          BSONObj(), BSONObj(), true ) );

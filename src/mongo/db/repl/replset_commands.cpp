@@ -1,5 +1,6 @@
 /**
 *    Copyright (C) 2008 10gen Inc.
+*    Copyright (C) 2013 Tokutek Inc.
 *
 *    This program is free software: you can redistribute it and/or  modify
 *    it under the terms of the GNU Affero General Public License, version 3,
@@ -143,6 +144,7 @@ namespace mongo {
         }
         CmdReplSetReconfig() : ReplSetCommand("replSetReconfig"), mutex("rsreconfig") { }
         virtual bool needsTxn() const { return false; }
+        virtual bool canRunInMultiStmtTxn() const { return false; }
         virtual bool run(const string& a, BSONObj& b, int e, string& errmsg, BSONObjBuilder& c, bool d) {
             try {
                 rwlock_try_write lk(mutex);
@@ -163,9 +165,14 @@ namespace mongo {
                 return false;
             }
 
+            // We might want to add the protocol version of theReplSet->config() if it exists,
+            // instead of just blindly adding our compiled-in CURRENT_PROTOCOL_VERSION.  But for
+            // TokuMX 1.0 it doesn't matter.
+            BSONObj configObj = ReplSetConfig::addProtocolVersionIfMissing(cmdObj["replSetReconfig"].Obj());
+
             bool force = cmdObj.hasField("force") && cmdObj["force"].trueValue();
             if( force && !theReplSet ) {
-                replSettings.reconfig = cmdObj["replSetReconfig"].Obj().getOwned();
+                replSettings.reconfig = configObj.getOwned();
                 result.append("msg", "will try this config momentarily, try running rs.conf() again in a few seconds");
                 return true;
             }
@@ -192,7 +199,7 @@ namespace mongo {
             }
 
             try {
-                ReplSetConfig newConfig(cmdObj["replSetReconfig"].Obj(), force);
+                ReplSetConfig newConfig(configObj, force);
 
                 log() << "replSet replSetReconfig config object parses ok, " << newConfig.members.size() << " members specified" << rsLog;
 
@@ -258,6 +265,7 @@ namespace mongo {
         }
 
         CmdReplSetStepDown() : ReplSetCommand("replSetStepDown") { }
+        virtual bool canRunInMultiStmtTxn() const { return false; }
         virtual bool run(const string& , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
             if( !check(errmsg, result) )
                 return false;
@@ -308,12 +316,12 @@ namespace mongo {
 
         CmdReplSetMaintenance() : ReplSetCommand("replSetMaintenance") { }
         virtual bool needsTxn() const { return false; }
+        virtual bool canRunInMultiStmtTxn() const { return false; }
         virtual bool run(const string& , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
             if( !check(errmsg, result) )
                 return false;
 
-            if (!theReplSet->setMaintenanceMode(cmdObj["replSetMaintenance"].trueValue())) {
-                errmsg = "primaries can't modify maintenance mode";
+            if (!theReplSet->setMaintenanceMode(cmdObj["replSetMaintenance"].trueValue(), errmsg)) {
                 return false;
             }
 
@@ -352,7 +360,7 @@ namespace mongo {
             return startsWith( url , "/_replSet" );
         }
 
-        virtual void handle( const char *rq, string url, BSONObj params,
+        virtual void handle( const char *rq, const std::string& url, BSONObj params,
                              string& responseMsg, int& responseCode,
                              vector<string>& headers,  const SockAddr &from ) {
 

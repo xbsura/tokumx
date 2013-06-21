@@ -8,6 +8,8 @@
 
 namespace mongo {
 
+    extern const BSONObj reverseNaturalObj;
+
     /* started abstracting out the querying of the primary/master's oplog
        still fairly awkward but a start.
     */
@@ -35,7 +37,7 @@ namespace mongo {
         }
 
         /* ok to call if already connected */
-        bool connect(string hostname);
+        bool connect(const std::string& hostname);
 
         bool connect(const BSONObj& rid, const int from, const string& to);
 
@@ -47,14 +49,22 @@ namespace mongo {
         }
 
         bool haveCursor() { return cursor.get() != 0; }
+        bool haveConnection() { return _conn.get() != 0; }
+
+        bool propogateSlaveLocation(GTID lastGTID);
 
         void tailingQueryGTE(const char *ns, GTID gtid, const BSONObj* fields=0);
 
         /* Do a tailing query, but only send the ts field back. */
         void ghostQueryGTE(const char *ns, GTID gtid) {
-            const BSONObj fields = BSON("ts" << 1 << "_id" << 0);
+            const BSONObj fields = BSON("ts" << 1 << "_id" << 1);
             return tailingQueryGTE(ns, gtid, &fields);
         }
+
+        // gets a cursor on the remote oplog that runs in reverse, starting from
+        // the greatest GTID that is less than or equal to lastGTID
+        shared_ptr<DBClientCursor> getRollbackCursor(GTID lastGTID);
+        
 
         bool more() {
             uassert( 15910, "Doesn't have cursor for reading oplog", cursor.get() );
@@ -68,11 +78,6 @@ namespace mongo {
 
         int getTailingQueryOptions() const { return _tailingQueryOptions; }
 
-        // only used by the OplogTool
-        // generally, the tailing query options are set
-        // on construction of the OplogReader
-        void setTailingQueryOptions( int tailingQueryOptions ) { _tailingQueryOptions = tailingQueryOptions; }
-
         void peek(vector<BSONObj>& v, int n) {
             if( cursor.get() ) {
                 cursor->peek(v,n);
@@ -80,11 +85,13 @@ namespace mongo {
         }
         BSONObj nextSafe() { return cursor->nextSafe(); }
         BSONObj next() { return cursor->next(); }
-        
+
+        shared_ptr<DBClientCursor> getOplogRefsCursor(OID &oid);
+
     private:
         /** @return true iff connection was successful */ 
         bool commonConnect(const string& hostName);
         bool passthroughHandshake(const BSONObj& rid, const int f);
-        void tailingQuery(const char *ns, const BSONObj& query, const BSONObj* fields=0);
+        void tailingQuery(const char *ns, Query& query, const BSONObj* fields=0);
     };
 }

@@ -2,6 +2,7 @@
 
 /**
  *    Copyright (C) 2011 10gen Inc.
+ *    Copyright (C) 2013 Tokutek Inc.
  *
  *    This program is free software: you can redistribute it and/or  modify
  *    it under the terms of the GNU Affero General Public License, version 3,
@@ -19,11 +20,14 @@
 
 #include "mongo/pch.h"
 #include "mongo/client/dbclientinterface.h"
+#include "mongo/db/namespace_details.h"
 #include "mongo/db/queryoptimizercursorimpl.h"
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/cursor.h"
 #include "mongo/db/explain.h"
 #include "mongo/db/queryoptimizer.h"
+#include "mongo/db/storage/env.h"
+#include "mongo/db/storage/exception.h"
 
 namespace mongo {
     
@@ -43,7 +47,7 @@ namespace mongo {
     bool QueryPlanSelectionPolicy::IdElseNatural::permitPlan( const QueryPlan &plan ) const {
         return !plan.indexed() || plan.index()->isIdIndex();
     }
-    BSONObj QueryPlanSelectionPolicy::IdElseNatural::planHint( const char *ns ) const {
+    BSONObj QueryPlanSelectionPolicy::IdElseNatural::planHint( const StringData& ns ) const {
         NamespaceDetails *nsd = nsdetails( ns );
         if ( !nsd || !nsd->hasIdIndex() ) {
             return BSON( "$hint" << BSON( "$natural" << 1 ) );
@@ -86,7 +90,7 @@ namespace mongo {
             }
             
             _c = queryPlan().newCursor();
-            // The basic and btree cursors used by this implementation do not supply their own
+            // The basic and index cursors used by this implementation do not supply their own
             // matchers, and a matcher from a query plan will be used instead.
             verify( !_c->matcher() );
 
@@ -532,7 +536,7 @@ namespace mongo {
     }
     
     shared_ptr<Cursor>
-    NamespaceDetailsTransient::getCursor( const char *ns,
+    NamespaceDetailsTransient::getCursor( const StringData &ns,
                                          const BSONObj &query,
                                          const BSONObj &order,
                                          const QueryPlanSelectionPolicy &planPolicy,
@@ -541,12 +545,19 @@ namespace mongo {
                                          bool requireOrder,
                                          QueryPlanSummary *singlePlanSummary ) {
 
-        CursorGenerator generator( ns, query, order, planPolicy, simpleEqualityMatch, parsedQuery,
-                                   requireOrder, singlePlanSummary );
-        return generator.generate();
+        try {
+            CursorGenerator generator( ns, query, order, planPolicy, simpleEqualityMatch, parsedQuery,
+                                       requireOrder, singlePlanSummary );
+            return generator.generate();
+        }
+        catch (storage::RetryableException::MvccDictionaryTooNew &e) {
+            shared_ptr<Cursor> ret;
+            ret.reset(new DummyCursor(1));
+            return ret;
+        }
     }
     
-    CursorGenerator::CursorGenerator( const char *ns,
+    CursorGenerator::CursorGenerator( const StringData &ns,
                                      const BSONObj &query,
                                      const BSONObj &order,
                                      const QueryPlanSelectionPolicy &planPolicy,
@@ -581,7 +592,7 @@ namespace mongo {
             if ( d ) {
                 int i = d->findIdIndex();
                 if( i < 0 ) {
-                    if ( strstr( _ns , ".system." ) == 0 )
+                    if ( _ns.find( ".system." ) == string::npos )
                         log() << "warning: no _id index on $snapshot query, ns:" << _ns << endl;
                 }
                 else {
@@ -607,15 +618,13 @@ namespace mongo {
             return shared_ptr<Cursor>( BasicCursor::make(d) );
         }
         if ( _planPolicy.permitOptimalIdPlan() && isSimpleIdQuery( _query ) ) {
-            Database *database = cc().database();
-            verify( database );
-            NamespaceDetails *d = database->namespaceIndex.details( _ns );
+            NamespaceDetails *d = nsdetails( _ns );
             if ( d ) {
                 int idxNo = d->findIdIndex();
                 if ( idxNo >= 0 ) {
                     IndexDetails& i = d->idx( idxNo );
                     BSONObj key = i.getKeyFromQuery( _query );
-                    return shared_ptr<Cursor>( new IndexCursor( d, i, key, key, true, 1, numWanted ) );
+                    return shared_ptr<Cursor>( IndexCursor::make( d, i, key, key, true, 1, numWanted ) );
                 }
             }
         }

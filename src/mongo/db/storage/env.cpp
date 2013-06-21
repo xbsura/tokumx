@@ -1,5 +1,5 @@
 /**
-*    Copyright (C) 2012 Tokutek Inc.
+*    Copyright (C) 2013 Tokutek Inc.
 *
 *    This program is free software: you can redistribute it and/or  modify
 *    it under the terms of the GNU Affero General Public License, version 3,
@@ -18,6 +18,7 @@
 
 #include "mongo/pch.h"
 
+#include <errno.h>
 #include <string>
 
 #include <db.h>
@@ -33,6 +34,7 @@
 
 #include "mongo/db/client.h"
 #include "mongo/db/cmdline.h"
+#include "mongo/db/storage/exception.h"
 #include "mongo/db/storage/key.h"
 #include "mongo/util/assert_util.h"
 #include "mongo/util/log.h"
@@ -48,50 +50,10 @@ namespace mongo {
 
         static int dbt_key_compare(DB *db, const DBT *dbt1, const DBT *dbt2) {
             try {
-                // Primary _id keys are represented by exactly one key.
-                // Secondary keys are represented by exactly two, the secondary
-                // key plus an associated _id key.
-                dassert(dbt1->size > 0);
-                dassert(dbt2->size > 0);
-                const KeyV1 key1(static_cast<char *>(dbt1->data));
-                const KeyV1 key2(static_cast<char *>(dbt2->data));
-                dassert((int) dbt1->size >= key1.dataSize());
-                dassert((int) dbt2->size >= key2.dataSize());
-
-                // Compare by the first key. The ordering comes from the key pattern.
-                {
-                    const Ordering &ordering(*reinterpret_cast<const Ordering *>(db->cmp_descriptor->dbt.data));
-                    const int c = key1.woCompare(key2, ordering);
-                    if (c < 0) {
-                        return -1;
-                    } else if (c > 0) {
-                        return 1;
-                    }
-                }
-
-                // Compare by the second key, stored as BSON, if it exists.
-                int key1_size = key1.dataSize();
-                int key2_size = key2.dataSize();
-                int dbt1_bytes_left = dbt1->size - key1_size;
-                int dbt2_bytes_left = dbt2->size - key2_size;
-                if (dbt1_bytes_left > 0 && dbt2_bytes_left > 0) {
-                    const BSONObj other_key1(static_cast<char *>(dbt1->data) + key1_size);
-                    const BSONObj other_key2(static_cast<char *>(dbt2->data) + key2_size);
-                    dassert(key1.dataSize() + other_key1.objsize() == (int) dbt1->size);
-                    dassert(key2.dataSize() + other_key2.objsize() == (int) dbt2->size);
-
-                    static const Ordering id_ordering = Ordering::make(BSON("_id" << 1));
-                    const int c = other_key1.woCompare(other_key2, id_ordering);
-                    if (c < 0) {
-                        return -1;
-                    } else if (c > 0) {
-                        return 1;
-                    }
-                } else {
-                    // The associated primary key must exist in both keys, or neither.
-                    dassert(dbt1_bytes_left == 0 && dbt2_bytes_left == 0);
-                }
-                return 0;
+                Key key1(dbt1);
+                Key key2(dbt2);
+                const Ordering &ordering(*reinterpret_cast<const Ordering *>(db->cmp_descriptor->dbt.data));
+                return key1.woCompare(key2, ordering);
             } catch (std::exception &e) {
                 // We don't have a way to return an error from a comparison (through the ydb), and the ydb isn't exception-safe.
                 // Of course, if a comparison throws, something is very wrong anyway.
@@ -129,7 +91,12 @@ namespace mongo {
 
             db_env_set_direct_io(cmdLine.directio);
 
-            int r = db_env_create(&env, 0);
+            int r = db_env_set_toku_product_name("tokumx");
+            if (r != 0) {
+                handle_ydb_error_fatal(r);
+            }
+
+            r = db_env_create(&env, 0);
             if (r == TOKUDB_HUGE_PAGES_ENABLED) {
                 LOG(LL_ERROR) << "Huge pages are enabled, please disable them to continue (echo never > /sys/kernel/mm/transparent_hugepages/enabled)" << endl;
             }
@@ -138,7 +105,7 @@ namespace mongo {
             }
 
             env->set_errcall(env, tokudb_print_error);
-            env->set_errpfx(env, "TokuDB");
+            env->set_errpfx(env, "TokuMX");
 
             const uint64_t cachesize = (cmdLine.cacheSize > 0
                                         ? cmdLine.cacheSize
@@ -152,7 +119,7 @@ namespace mongo {
             TOKULOG(1) << "cachesize set to " << gigabytes << " GB + " << bytes << " bytes."<< endl;
 
             // Use 10% the size of the cachetable for lock tree memory
-            const int32_t lock_memory = cachesize / 10;
+            const uint64_t lock_memory = cachesize / 10;
             r = env->set_lk_max_memory(env, lock_memory);
             if (r != 0) {
                 handle_ydb_error_fatal(r);
@@ -178,6 +145,24 @@ namespace mongo {
                 handle_ydb_error_fatal(r);
             }
             TOKULOG(1) << "filesystem redzone set to " << redzone_threshold << " percent." << endl;
+
+            const char *logDir = cmdLine.logDir.c_str();
+            if (!mongoutils::str::equals(logDir, "")) {
+                r = env->set_lg_dir(env, logDir);
+                if (r != 0) {
+                    handle_ydb_error_fatal(r);
+                }
+                TOKULOG(1) << "transaction log directory set to " << logDir << endl;
+            }
+
+            const char *tmpDir = cmdLine.tmpDir.c_str();
+            if (!mongoutils::str::equals(tmpDir, "")) {
+                r = env->set_tmp_dir(env, tmpDir);
+                if (r != 0) {
+                    handle_ydb_error_fatal(r);
+                }
+                TOKULOG(1) << "temporary bulk loader directory set to " << tmpDir << endl;
+            }
 
             const int env_flags = DB_INIT_LOCK|DB_INIT_MPOOL|DB_INIT_TXN|DB_CREATE|DB_PRIVATE|DB_INIT_LOG|DB_RECOVER;
             const int env_mode = S_IRWXU|S_IRGRP|S_IROTH|S_IXGRP|S_IXOTH;
@@ -230,6 +215,16 @@ namespace mongo {
                 handle_ydb_error_fatal(r);
             }
             TOKULOG(1) << "set db " << db << " descriptor to key pattern: " << key_pattern << endl;
+        }
+
+        static void verify_db_descriptor(DB *db, const BSONObj &key_pattern) {
+            verify(db->cmp_descriptor->dbt.size == sizeof(Ordering));
+            const Ordering ordering = Ordering::make(key_pattern);
+            const int c = memcmp(db->cmp_descriptor->dbt.data, &ordering, sizeof(Ordering));
+            if (c != 0) {
+                problem() << " bad db descriptor on open, key pattern " << key_pattern << endl;
+            }
+            verify(c == 0);
         }
 
         int db_open(DB **dbp, const string &name, const BSONObj &info, bool may_create) {
@@ -295,11 +290,17 @@ namespace mongo {
                 handle_ydb_error(r);
             }
 
+            // If this is a non-creating open for a read-only (or non-existent)
+            // transaction, we can use an alternate stack since there's nothing
+            // to roll back and no locktree locks to hold.
+            const bool needAltTxn = !may_create && (!cc().hasTxn() || cc().txn().readOnly());
+            scoped_ptr<Client::AlternateTransactionStack> altStack(!needAltTxn ? NULL :
+                                                                   new Client::AlternateTransactionStack());
+            scoped_ptr<Client::Transaction> altTxn(!needAltTxn ? NULL :
+                                                   new Client::Transaction(0));
+
             const int db_flags = may_create ? DB_CREATE : 0;
-            DB_TXN *txn = NULL;
-            if (may_create) {
-                txn = cc().txn().db_txn();
-            }
+            DB_TXN *txn = cc().txn().db_txn();
             r = db->open(db, txn, name.c_str(), NULL, DB_BTREE, db_flags, S_IRUSR|S_IWUSR|S_IRGRP|S_IROTH);
             if (r == ENOENT) {
                 verify(!may_create);
@@ -308,8 +309,14 @@ namespace mongo {
             if (r != 0) {
                 handle_ydb_error(r);
             }
+            if (altTxn.get() != NULL) {
+                altTxn->commit();
+            }
 
-            set_db_descriptor(db, txn, key_pattern);
+            if (may_create) {
+                set_db_descriptor(db, txn, key_pattern);
+            }
+            verify_db_descriptor(db, key_pattern);
             *dbp = db;
         exit:
             return r;
@@ -334,7 +341,7 @@ namespace mongo {
 
         void db_rename(const string &oldIdxNS, const string &newIdxNS) {
             int r = env->dbrename(env, cc().txn().db_txn(), oldIdxNS.c_str(), NULL, newIdxNS.c_str(), 0);
-            massert(16463, str::stream() << "tokudb dictionary rename failed: old " << oldIdxNS
+            massert(16463, str::stream() << "tokumx dictionary rename failed: old " << oldIdxNS
                            << ", new " << newIdxNS << ", r = " << r,
                            r == 0);
         }
@@ -381,6 +388,7 @@ namespace mongo {
             for (uint64_t i = 0; i < num_rows; i++) {
                 TOKU_ENGINE_STATUS_ROW row = &mystat[i];
                 switch (row->type) {
+                case FS_STATE:
                 case UINT64:
                     status.appendNumber( row->keyname, (long long) row->value.num );
                     break;
@@ -464,72 +472,56 @@ namespace mongo {
             TOKULOG(1) << "cleaner iterations set to " << num_iterations << "." << endl;
         }
 
-        static void _handle_ydb_error(int error, bool fatal) {
-#define _do_assert(_how, _code, _message)          \
-            do {                                   \
-               if (!fatal) {                       \
-                   _how(_code, _message);          \
-               } else {                            \
-                   problem() << "fatal error "     \
-                             << _code << ": "      \
-                             << _message << endl;  \
-                   verify(error == 0);             \
-               }                                   \
-            } while (0)
-
+        void handle_ydb_error(int error) {
+            switch (error) {
+                case ENOENT:
+                    throw SystemException::Enoent();
+                default:
+                    // fall through
+                    ;
+            }
             if (error > 0) {
-                msgasserted(16770, str::stream() << "Got generic error "
-                                   << error << " (" << strerror(error) << ")"
-                                   << " from the ydb layer. You may have hit a bug."
-                                   << " Check the error log for more details.");
+                throw SystemException("You may have hit a bug. Check the error log for more details.", error, 16770);
             }
             switch (error) {
                 case DB_LOCK_NOTGRANTED:
-                    //uasserted(16759, "Lock not granted. Try restarting the transaction.");
-                    _do_assert(uasserted, 16759,
-                               "Lock not granted. Try restarting the transaction.");
+                    throw LockException("Lock not granted. Try restarting the transaction.", 16759);
                 case DB_LOCK_DEADLOCK:
-                    _do_assert(uasserted, 16760,
-                               "Deadlock detected during lock acquisition. Try restarting the transaction.");
+                    throw LockException("Deadlock detected during lock acquisition. Try restarting the transaction.", 16760);
                 case DB_KEYEXIST:
-                    _do_assert(uasserted, 16769,
-                               "Duplicate key error.");
+                    throw Exception("Duplicate key error.", ASSERT_ID_DUPKEY);
                 case DB_NOTFOUND:
-                    _do_assert(uasserted, 16761,
-                               "Index key not found.");
+                    throw Exception("Index key not found.", 16761);
                 case DB_RUNRECOVERY:
-                    _do_assert(msgasserted, 16762,
-                               "Automatic environment recovery failed. There may be data corruption.");
+                    throw DataCorruptionException("Automatic environment recovery failed.", 16762);
                 case DB_BADFORMAT:
-                    _do_assert(msgasserted, 16763,
-                               "File-format error when reading dictionary from disk. There may be data corruption.");
+                    throw DataCorruptionException("File-format error when reading dictionary from disk.", 16763);
                 case TOKUDB_BAD_CHECKSUM:
-                    _do_assert(msgasserted, 16764,
-                               "Checksum mismatch when reading dictionary from disk. There may be data corruption.");
+                    throw DataCorruptionException("Checksum mismatch when reading dictionary from disk.", 16764);
                 case TOKUDB_NEEDS_REPAIR:
-                    _do_assert(msgasserted, 16765,
-                               "Repair requested when reading dictionary from disk. There may be data corruption.");
+                    throw DataCorruptionException("Repair requested when reading dictionary from disk.", 16765);
                 case TOKUDB_DICTIONARY_NO_HEADER:
-                    _do_assert(msgasserted, 16766,
-                               "No header found when reading dictionary from disk. There may be data corruption.");
+                    throw DataCorruptionException("No header found when reading dictionary from disk.", 16766);
                 case TOKUDB_MVCC_DICTIONARY_TOO_NEW:
-                    _do_assert(msgasserted, 16768,
-                               "Accessed dictionary created after this transaction began. Try restarting the transaction.");
+                    throw RetryableException::MvccDictionaryTooNew();
                 default: 
                 {
                     string s = str::stream() << "Unhandled ydb error: " << error;
-                    _do_assert(msgasserted, 16767, s);
+                    throw Exception(s, 16767);
                 }
             }
-#undef _do_assert
-        }
-
-        void handle_ydb_error(int error) {
-            _handle_ydb_error(error, false);
         }
 
         void handle_ydb_error_fatal(int error) {
-            _handle_ydb_error(error, true);
+            try {
+                handle_ydb_error(error);
+            }
+            catch (Exception &e) {
+                problem() << "fatal error " << e.getCode() << ": " << e.what() << endl;
+                problem() << e << endl;
+                fassertFailed(e.getCode());
+            }
+            msgasserted(16853, mongoutils::str::stream() << "No storage exception thrown but one should have been thrown for error " << error);
         }
     
     } // namespace storage

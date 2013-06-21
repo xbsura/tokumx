@@ -2,6 +2,7 @@
 
 /**
 *    Copyright (C) 2008 10gen Inc.
+*    Copyright (C) 2013 Tokutek Inc.
 *
 *    This program is free software: you can redistribute it and/or  modify
 *    it under the terms of the GNU Affero General Public License, version 3,
@@ -23,11 +24,10 @@
 
 #pragma once
 
-#include "db.h"
-#include "dbhelpers.h"
-#include "clientcursor.h"
-#include "../util/optime.h"
-#include "../util/timer.h"
+#include "mongo/db/clientcursor.h"
+#include "mongo/db/oplogreader.h"
+#include "mongo/util/optime.h"
+#include "mongo/util/timer.h"
 
 namespace mongo {
 
@@ -37,6 +37,8 @@ namespace mongo {
     void logOp( const char *opstr, const char *ns, const BSONObj& obj, BSONObj *patt = 0, bool fromMigrate = false );
     // Write operations to the log (local.oplog.$main)
     void logTransactionOps(GTID gtid, uint64_t timestamp, uint64_t hash, BSONArray& opInfo);
+    void logTransactionOpsRef(GTID gtid, uint64_t timestamp, uint64_t hash, OID& oid);
+    void logOpsToOplogRef(BSONObj o);
     void deleteOplogFiles();
     void openOplogFiles();
     
@@ -44,17 +46,19 @@ namespace mongo {
     bool getLastGTIDinOplog(GTID* gtid);
     bool gtidExistsInOplog(GTID gtid);
     void writeEntryToOplog(BSONObj entry);
-    void replicateTransactionToOplog(BSONObj& op);
-    void replicateTransactionToOplogToFillGap(BSONObj& op);
+    void writeEntryToOplogRefs(BSONObj entry);
+    void replicateFullTransactionToOplog(BSONObj& o, OplogReader& r, bool* bigTxn);
     void applyTransactionFromOplog(BSONObj entry);
+    void rollbackTransactionFromOplog(BSONObj entry);
+    void purgeEntryFromOplog(BSONObj entry);
+
+    // @return the age, in milliseconds, when an oplog entry expires.
+    uint64_t expireOplogMilliseconds();
     
     /** puts obj in the oplog as a comment (a no-op).  Just for diags.
         convention is
           { msg : "text", ... }
     */
-    void oplogCheckCloseDatabase( Database * db );
-
-    extern int __findingStartInitialTimeout; // configurable for testing
 
     class QueryPlan;
     

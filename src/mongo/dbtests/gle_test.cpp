@@ -1,5 +1,6 @@
 /**
  *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2013 Tokutek Inc.
  *
  *    This program is free software: you can redistribute it and/or  modify
  *    it under the terms of the GNU Affero General Public License, version 3,
@@ -35,7 +36,8 @@ namespace {
             _client.insert(_ns, BSON( "test" << "test"));
             // Cannot mix fsync + j, will make command fail
             string gleString = _client.getLastError(true, true, 10, 10);
-            ASSERT_NOT_EQUALS(gleString, "");
+            // In TokuMX this doesn't make sense, you specified w but it's not a repl set
+            ASSERT_EQUALS(gleString, "norepl");
         }
     };
 

@@ -2,6 +2,7 @@
 
 /**
 *    Copyright (C) 2008 10gen Inc.
+*    Copyright (C) 2013 Tokutek Inc.
 *
 *    This program is free software: you can redistribute it and/or  modify
 *    it under the terms of the GNU Affero General Public License, version 3,
@@ -20,6 +21,7 @@
 
 #include <boost/thread/thread.hpp>
 
+#include "mongo/base/initializer.h"
 #include "db/json.h"
 #include "../util/net/httpclient.h"
 #include "../util/text.h"
@@ -73,13 +75,8 @@ namespace mongo {
             out << "   delete   \t- # of deletes per second\n";
             out << "   getmore  \t- # of get mores (cursor batch) per second\n";
             out << "   command  \t- # of commands per second, on a slave its local|replicated\n";
-            out << "   flushes  \t- # of fsync flushes per second\n";
-            out << "   mapped   \t- amount of data mmaped (total data size) megabytes\n";
-            out << "   vsize    \t- virtual size of process in megabytes\n";
-            out << "   res      \t- resident size of process in megabytes\n";
             out << "   faults   \t- # of pages faults per sec\n";
             out << "   locked   \t- name of and percent time for most locked database\n";
-            out << "   idx miss \t- percent of btree page misses (sampled)\n";
             out << "   qr|qw    \t- queue lengths for clients waiting (read|write)\n";
             out << "   ar|aw    \t- active clients (read|write)\n";
             out << "   netIn    \t- network traffic in - bits\n";
@@ -573,7 +570,8 @@ namespace mongo {
 
 }
 
-int main( int argc , char ** argv ) {
+int main( int argc , char ** argv, char ** envp ) {
+    mongo::runGlobalInitializersOrDie(argc, argv, envp);
     mongo::Stat stat;
     return stat.main( argc , argv );
 }

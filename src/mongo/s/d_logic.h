@@ -1,6 +1,7 @@
 // @file d_logic.h
 /*
  *    Copyright (C) 2010 10gen Inc.
+ *    Copyright (C) 2013 Tokutek Inc.
  *
  *    This program is free software: you can redistribute it and/or  modify
  *    it under the terms of the GNU Affero General Public License, version 3,
@@ -250,6 +251,10 @@ namespace mongo {
         return _handlePossibleShardedMessage(m, dbresponse);
     }
 
-    void logOpForSharding( const char * opstr , const char * ns , const BSONObj& obj , BSONObj * patt );
+    bool shouldLogOpForSharding(const char *opstr, const char *ns, const BSONObj &obj);
+    bool shouldLogUpdateOpForSharding(const char *opstr, const char *ns, const BSONObj &oldObj, const BSONObj &newObj);
+    void startObjForMigrateLog(BSONObjBuilder &b);
+    void writeObjToMigrateLog(BSONObj &obj);
+    void writeObjToMigrateLogRef(BSONObj &obj);
 
 }

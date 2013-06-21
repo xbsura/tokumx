@@ -1,5 +1,6 @@
 /**
  * Copyright (c) 2011 10gen Inc.
+ * Copyright (C) 2013 Tokutek Inc.
  *
  * This program is free software: you can redistribute it and/or  modify
  * it under the terms of the GNU Affero General Public License, version 3,
@@ -32,7 +33,7 @@ namespace mongo {
         // virtuals from ExpressionNary
         virtual void addOperand(const intrusive_ptr<Expression> &pExpression);
         virtual void addToBsonObj(
-            BSONObjBuilder *pBuilder, string fieldName,
+            BSONObjBuilder *pBuilder, const std::string& fieldName,
             bool requireExpression) const;
         virtual void addToBsonArray(BSONArrayBuilder *pBuilder) const;
 
@@ -56,7 +57,7 @@ namespace mongo {
           @param opName the operator name
          */
         void opToBson(
-            BSONObjBuilder *pBuilder, string fieldName, string opName,
+            BSONObjBuilder *pBuilder, const std::string& fieldName, const std::string& opName,
             bool requireExpression) const;
     };
 

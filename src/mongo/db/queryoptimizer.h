@@ -2,6 +2,7 @@
 
 /**
 *    Copyright (C) 2008 10gen Inc.
+*    Copyright (C) 2013 Tokutek Inc.
 *
 *    This program is free software: you can redistribute it and/or  modify
 *    it under the terms of the GNU Affero General Public License, version 3,
@@ -51,7 +52,7 @@ namespace mongo {
                                        shared_ptr<const ParsedQuery>(),
                                const BSONObj &startKey = BSONObj(),
                                const BSONObj &endKey = BSONObj(),
-                               string special="" );
+                               const std::string& special="" );
 
         /** Categorical classification of a QueryPlan's utility. */
         enum Utility {
@@ -81,7 +82,7 @@ namespace mongo {
                 
         /** @return a new cursor based on this QueryPlan's index and FieldRangeSet. */
         //shared_ptr<Cursor> newCursor( const DiskLoc &startLoc = DiskLoc() ) const;
-        // XXX TokuDB: We removed the diskloc parameter
+        // XXX TokuMX: We removed the diskloc parameter
         shared_ptr<Cursor> newCursor() const;
         /** @return a new reverse cursor if this is an unindexed plan. */
         shared_ptr<Cursor> newReverseCursor() const;
@@ -122,7 +123,7 @@ namespace mongo {
                   const BSONObj &originalQuery,
                   const BSONObj &order,
                   const shared_ptr<const ParsedQuery> &parsedQuery,
-                  string special );
+                  const std::string& special );
         void init( const FieldRangeSetPair *originalFrsp,
                   const BSONObj &startKey,
                   const BSONObj &endKey );
@@ -488,7 +489,7 @@ namespace mongo {
     class MultiPlanScanner {
     public:
         
-        static MultiPlanScanner *make( const char *ns,
+        static MultiPlanScanner *make( const StringData& ns,
                                       const BSONObj &query,
                                       const BSONObj &order,
                                       const shared_ptr<const ParsedQuery> &parsedQuery =
@@ -582,7 +583,7 @@ namespace mongo {
 
     private:
 
-        MultiPlanScanner( const char *ns,
+        MultiPlanScanner( const StringData& ns,
                          const BSONObj &query,
                          const shared_ptr<const ParsedQuery> &parsedQuery,
                          const BSONObj &hint,

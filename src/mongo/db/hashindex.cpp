@@ -2,6 +2,7 @@
 
 /**
 *    Copyright (C) 2012 10gen Inc.
+*    Copyright (C) 2013 Tokutek Inc.
 *
 *    This program is free software: you can redistribute it and/or  modify
 *    it under the terms of the GNU Affero General Public License, version 3,
@@ -112,14 +113,8 @@ namespace mongo {
         vector<FieldInterval>::const_iterator i;
         for( i = intervals.begin(); i != intervals.end(); ++i ){
             if ( ! i->equality() ){
-                const shared_ptr< IndexCursor > exhaustiveCursor(
-                        new IndexCursor( d,
-                                         *idx,
-                                         BSON( "" << MINKEY ) ,
-                                         BSON( "" << MAXKEY ) ,
-                                         true ,
-                                         1,
-                                         numWanted) );
+                const shared_ptr< Cursor > exhaustiveCursor(
+                        new IndexScanCursor( d, *idx, 1 ) );
                 exhaustiveCursor->setMatcher( forceDocMatcher );
                 return exhaustiveCursor;
             }
@@ -129,18 +124,14 @@ namespace mongo {
         inObj.done();
         BSONObj newQuery = newQueryBuilder.obj();
 
-        //Use the point-intervals of the new query to create a Btree cursor
+        //Use the point-intervals of the new query to create an index cursor
         FieldRangeSet newfrs( "" , newQuery , true, true );
         shared_ptr<FieldRangeVector> newVector(
                 new FieldRangeVector( newfrs , *_spec , 1 ) );
 
-        const shared_ptr< IndexCursor > cursor(
-                new IndexCursor( d,
-                                 *idx,
-                                 newVector,
-                                 false,
-                                 1,
-                                 numWanted) );
+        const shared_ptr< Cursor > cursor(
+                IndexCursor::make( d, *idx, newVector,
+                                   false, 1, numWanted) );
         cursor->setMatcher( forceDocMatcher );
         return cursor;
     }

@@ -1,7 +1,7 @@
 //@file insert.h
 
 /**
- *    Copyright (C) 2012 Tokutek Inc.
+ *    Copyright (C) 2013 Tokutek Inc.
  *
  *    This program is free software: you can redistribute it and/or  modify
  *    it under the terms of the GNU Affero General Public License, version 3,
@@ -18,14 +18,16 @@
 
 #pragma once
 
-#include "pch.h"
-
+#include "mongo/pch.h"
 #include "mongo/bson/bsonobj.h"
 
 namespace mongo {
 
+    class NamespaceDetails;
+    class NamespaceDetailsTransient;
+
     // Insert an object into the given namespace. May modify the object (ie: maybe add _id field). Does not log.
-    void insertOneObject(NamespaceDetails *details, NamespaceDetailsTransient *nsdt, BSONObj &obj, uint64_t flags);
+    void insertOneObject(NamespaceDetails *details, NamespaceDetailsTransient *nsdt, BSONObj &obj, uint64_t flags = 0);
 
     // Insert a vector of objects into the given namespace, logging each operation individually.
     void insertObjects(const char *ns, const vector<BSONObj> &objs, bool keepGoing, uint64_t flags, bool logop);

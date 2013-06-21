@@ -2,6 +2,7 @@
 
 /**
  *    Copyright (C) 2008 10gen Inc.
+ *    Copyright (C) 2013 Tokutek Inc.
  *
  *    This program is free software: you can redistribute it and/or  modify
  *    it under the terms of the GNU Affero General Public License, version 3,
@@ -99,21 +100,33 @@ namespace mongo {
         else {
             // check for spoofing of the ns such that it does not match the one originally there for the cursor
             uassert(14833, "auth error", str::equals(ns, client_cursor->ns().c_str()));
+            uassert(16784, "oplog cursor reading data that is too old", !client_cursor->lastOpForSlaveTooOld());
 
             int queryOptions = client_cursor->queryOptions();
-            TokuCommandSettings settings;
+            OpSettings settings;
             settings.setBulkFetch(true);
             settings.setQueryCursorMode(DEFAULT_LOCK_CURSOR);
             settings.setCappedAppendPK(queryOptions & QueryOption_AddHiddenPK);
-            cc().setTokuCommandSettings(settings);
+            cc().setOpSettings(settings);
 
-            // check that we properly set the transactions when the cursor was originally saved, and restore it into the current client
-            verify(client_cursor->transactions.get() != NULL);
-            cc().swapTransactionStack(client_cursor->transactions);
+            // Check if the cursor is part of a multi-statement transaction. If it is
+            // and this is not the right client (meaning the current transaction stack
+            // does not match that in the cursor), it will uassert. If the cursor is
+            // not part of a multi-statement transaction, then we need to use the stack
+            // in the cursor for this scope.
+            const bool cursorPartOfMultiStatementTxn = client_cursor->checkMultiStatementTxn();
+            scoped_ptr<Client::WithTxnStack> wts;
+            if (!cursorPartOfMultiStatementTxn) {
+                // For simplicity, prevent multi-statement transactions from
+                // reading cursors it didn't create.
+                uassert(16813, "Cannot getMore() on a cursor not created by this multi-statement transaction",
+                           !cc().hasTxn());
+                wts.reset(new Client::WithTxnStack(client_cursor->transactions)); 
+            }
 
-            if ( pass == 0 )
+            if (pass == 0) {
                 client_cursor->updateSlaveLocation( curop );
-
+            }
             
             curop.debug().query = client_cursor->query();
 
@@ -134,8 +147,6 @@ namespace mongo {
                             continue;
 
                         if( n == 0 && (queryOptions & QueryOption_AwaitData) && pass < 1000 ) {
-                            // The cursor is still live, give back the stack.
-                            cc().swapTransactionStack(client_cursor->transactions);
                             return 0;
                         }
 
@@ -146,12 +157,6 @@ namespace mongo {
                     // Done with this cursor, steal transaction stack back to commit or abort it here.
                     bool ok = ClientCursor::erase(cursorid);
                     verify(ok);
-                    if (ok) {
-                        // transaction for this query is done,
-                        // commit it
-                        verify(cc().hasTxn());
-                        cc().commitTopTxn();
-                    }
                     cursorid = 0;
                     client_cursor = 0;
                     break;
@@ -174,6 +179,13 @@ namespace mongo {
                         //out() << "  but it's a dup \n";
                     }
                     else {
+                        // save this so that at the end of the loop,
+                        // we can update the location for write concern
+                        // in replication. Note that if this cursor is not
+                        // doing replication, this is pointless
+                        if ( client_cursor->queryOptions() & QueryOption_OplogReplay ) {
+                            client_cursor->storeOpForSlave( c->current() );
+                        }
                         n++;
 
                         client_cursor->fillQueryResultFromObj( b, &details );
@@ -189,11 +201,12 @@ namespace mongo {
             }
             
             if ( client_cursor ) {
-                //client_cursor->storeOpForSlave( last );
                 exhaust = client_cursor->queryOptions() & QueryOption_Exhaust;
-
-                // The cursor is still live, give back the stack.
-                cc().swapTransactionStack(client_cursor->transactions);
+            } else if (!cursorPartOfMultiStatementTxn) {
+                // This cursor is done and it wasn't part of a multi-statement
+                // transaction. We can commit the transaction now.
+                cc().commitTopTxn();
+                wts->release();
             }
         }
 
@@ -306,7 +319,7 @@ namespace mongo {
         if ( allowCovered ) {
             const Projection::KeyOnly *keyFieldsOnly = _cursor->keyFieldsOnly();
             if ( keyFieldsOnly ) {
-                return keyFieldsOnly->hydrate( _cursor->currKey() );
+                return keyFieldsOnly->hydrate( _cursor->currKey(), _cursor->currPK() );
             }
         }
         BSONObj ret = _cursor->current();
@@ -623,7 +636,6 @@ namespace mongo {
     
     /**
      * Run a query with a cursor provided by the query optimizer, or FindingStartCursor.
-     * @yields the db lock.
      * @returns true if client cursor was saved, false if the query has completed.
      */
     bool queryWithQueryOptimizer( int queryOptions, const string& ns,
@@ -632,7 +644,7 @@ namespace mongo {
                                   const shared_ptr<ParsedQuery> &pq_shared,
                                   const ConfigVersion &shardingVersionAtStart,
                                   const bool getCachedExplainPlan,
-                                  Client::Transaction &txn,
+                                  const bool inMultiStatementTxn,
                                   Message &result ) {
 
         const ParsedQuery &pq( *pq_shared );
@@ -663,9 +675,18 @@ namespace mongo {
         scoped_ptr<QueryResponseBuilder> queryResponseBuilder
                 ( QueryResponseBuilder::make( pq, cursor, queryPlan, oldPlan ) );
         bool saveClientCursor = false;
-        OpTime slaveReadTill;
-        ClientCursor::Holder ccPointer( new ClientCursor( QueryOption_NoCursorTimeout, cursor, ns ) );
-        
+        int options = QueryOption_NoCursorTimeout;
+        if (pq.hasOption( QueryOption_OplogReplay )) {
+            options |= QueryOption_OplogReplay;
+        }
+        ClientCursor::Holder ccPointer( new ClientCursor( options, cursor, ns ) );
+
+        // for oplog cursors, we check if we are reading data that is too old and might
+        // be stale.
+        bool opChecked = false;
+        bool slaveLocationUpdated = false;
+        BSONObj last;
+        bool lastBSONObjSet = false;
         for ( ; cursor->ok(); cursor->advance() ) {
 
             if ( pq.getMaxScan() && cursor->nscanned() > pq.getMaxScan() ) {
@@ -679,9 +700,21 @@ namespace mongo {
             // Note slave's position in the oplog.
             if ( pq.hasOption( QueryOption_OplogReplay ) ) {
                 BSONObj current = cursor->current();
-                BSONElement e = current["ts"];
-                if ( e.type() == Date || e.type() == Timestamp ) {
-                    slaveReadTill = e._opTime();
+                last = current.copy();
+                lastBSONObjSet = true;
+                
+                // the first row returned is equal to the last element that
+                // the slave has synced up to, so we might as well update
+                // the slave location
+                if (!slaveLocationUpdated) {
+                    ccPointer->updateSlaveLocation(curop);
+                    slaveLocationUpdated = true;
+                }
+                // check if data we are about to return may be too stale
+                if (!opChecked) {
+                    uint64_t ts = current["ts"]._numberLong();
+                    uassert(16785, "oplog cursor reading data that is too old", ts);
+                    opChecked = true;
                 }
             }
             
@@ -722,14 +755,9 @@ namespace mongo {
         if ( saveClientCursor ) {
             // Create a new ClientCursor, with a default timeout.
             ccPointer.reset( new ClientCursor( queryOptions, cursor, ns,
-                                              jsobj.getOwned() ) );
+                                               jsobj.getOwned(), inMultiStatementTxn ) );
             cursorid = ccPointer->cursorid();
             DEV tlog(2) << "query has more, cursorid: " << cursorid << endl;
-            
-            // Save slave's position in the oplog.
-            if ( pq.hasOption( QueryOption_OplogReplay ) && !slaveReadTill.isNull() ) {
-                ccPointer->slaveReadTill( slaveReadTill );
-            }
             
             if ( !ccPointer->ok() && ccPointer->c()->tailable() ) {
                 DEV tlog() << "query has no more but tailable, cursorid: " << cursorid << endl;
@@ -744,9 +772,16 @@ namespace mongo {
             ccPointer->setPos( nReturned );
             ccPointer->pq = pq_shared;
             ccPointer->fields = pq.getFieldPtr();
-            // Clones the transaction and hand's off responsibility
-            // of its completion to the client cursor's destructor.
-            cc().swapTransactionStack(ccPointer->transactions);
+            if (pq.hasOption( QueryOption_OplogReplay ) && lastBSONObjSet) {
+                ccPointer->storeOpForSlave(last);
+            }
+            if (!inMultiStatementTxn) {
+                // This cursor is not part of a multi-statement transaction, so
+                // we pass off the current client's transaction stack to the
+                // cursor so that it may be live as long as the cursor.
+                cc().swapTransactionStack(ccPointer->transactions);
+                verify(!cc().hasTxn());
+            }
             ccPointer.release();
         }
 
@@ -778,10 +813,10 @@ namespace mongo {
 
         bool found = false;
         {
-            TokuCommandSettings settings;
+            OpSettings settings;
             settings.setQueryCursorMode(DEFAULT_LOCK_CURSOR);
             settings.setCappedAppendPK(pq.hasOption(QueryOption_AddHiddenPK));
-            cc().setTokuCommandSettings(settings);
+            cc().setOpSettings(settings);
             Client::ReadContext ctx(ns);
             Client::Transaction transaction(DB_TXN_SNAPSHOT | DB_TXN_READ_ONLY);
             replVerifyReadsOk(&pq);
@@ -838,7 +873,6 @@ namespace mongo {
      * Run a query -- includes checking for and running a Command.
      * @return points to ns if exhaust mode. 0=normal mode
      * @locks the db mutex for reading (and potentially for writing temporarily to create a new db).
-     * @yields the db mutex periodically after acquiring it.
      * @asserts on scan and order memory exhaustion and other cases.
      */
     string runQuery(Message& m, QueryMessage& q, CurOp& curop, Message &result) {
@@ -847,7 +881,7 @@ namespace mongo {
         BSONObj jsobj = q.query;
         int queryOptions = q.queryOptions;
         const char *ns = q.ns;
-        
+
         uassert( 16332 , "can't have an empty ns" , ns[0] );
 
         if( logLevel >= 2 )
@@ -926,25 +960,36 @@ namespace mongo {
         query = query.getOwned();
         order = order.getOwned();
 
+        // Tailable cursors need to read newly written entries from the tail
+        // of the collection. They manually arbitrate with the collection over
+        // what data is readable and when, so we choose read uncommited isolation.
+        OpSettings settings;
+        settings.setQueryCursorMode(DEFAULT_LOCK_CURSOR);
+        settings.setBulkFetch(true);
+        settings.setCappedAppendPK(pq.hasOption(QueryOption_AddHiddenPK));
+        cc().setOpSettings(settings);
+
         bool hasRetried = false;
         while ( 1 ) {
             try {
                 const bool tailable = pq.hasOption( QueryOption_CursorTailable ) && pq.getNumToReturn() != 1;
 
-                // Tailable cursors need to read newly written entries from the tail
-                // of the collection. They manually arbitrate with the collection over
-                // what data is readable and when, so we choose read uncommited isolation.
-                TokuCommandSettings settings;
-                settings.setQueryCursorMode(DEFAULT_LOCK_CURSOR);
-                settings.setBulkFetch(true);
-                settings.setCappedAppendPK(pq.hasOption(QueryOption_AddHiddenPK));
-                cc().setTokuCommandSettings(settings);
+                // If our caller has a transaction, it's multi-statement.
+                const bool inMultiStatementTxn = cc().hasTxn();
+                if (tailable) {
+                    // Because it's easier to disable this. It shouldn't be happening in a normal system.
+                    uassert(16812, "May not perform a tailable query in a multi-statement transaction.",
+                                   !inMultiStatementTxn);
+                }
+
+                const int txnFlags = (tailable ? DB_READ_UNCOMMITTED : DB_TXN_SNAPSHOT) | DB_TXN_READ_ONLY;
                 Client::ReadContext ctx(ns);
-                Client::Transaction transaction((tailable ? DB_READ_UNCOMMITTED : DB_TXN_SNAPSHOT) | DB_TXN_READ_ONLY);
+                scoped_ptr<Client::Transaction> transaction(!inMultiStatementTxn ?
+                                                            new Client::Transaction(txnFlags) : NULL);
+
                 const ConfigVersion shardingVersionAtStart = shardingState.getVersion( ns );
-                
                 replVerifyReadsOk(&pq);
-                
+                        
                 if ( pq.hasOption( QueryOption_CursorTailable ) ) {
                     NamespaceDetails *d = nsdetails( ns );
                     if (d != NULL && !(d->isCapped() || str::equals(ns, rsoplog))) {
@@ -957,16 +1002,17 @@ namespace mongo {
                         uassert( 13052, "only {$natural:1} order allowed for tailable cursor", order == nat1 );
                     }
                 }
-                
+                    
                 // Run a regular query.
 
                 const bool getCachedExplainPlan = ! hasRetried && explain && ! pq.hasIndexSpecifier();
                 const bool savedCursor = queryWithQueryOptimizer( queryOptions, ns, jsobj, curop, query,
                                                                   order, pq_shared, shardingVersionAtStart,
-                                                                  getCachedExplainPlan, transaction, result );
-                // Did not save the cursor, so we can commit the transaction now.
-                if (!savedCursor) {
-                    transaction.commit();
+                                                                  getCachedExplainPlan, inMultiStatementTxn,
+                                                                  result );
+                // Did not save the cursor, so we can commit the transaction now if it exists.
+                if (transaction.get() != NULL && !savedCursor) {
+                    transaction->commit();
                 }
                 return curop.debug().exhaust ? ns : "";
             }
@@ -977,5 +1023,4 @@ namespace mongo {
             }
         }
     }
-
 } // namespace mongo

@@ -2,6 +2,7 @@
 
 /**
  *    Copyright (C) 2008 10gen Inc.
+ *    Copyright (C) 2013 Tokutek Inc.
  *
  *    This program is free software: you can redistribute it and/or  modify
  *    it under the terms of the GNU Affero General Public License, version 3,
@@ -50,7 +51,6 @@ namespace mongo {
     string Chunk::chunkMetadataNS = "config.chunks";
 
     int Chunk::MaxChunkSize = 1024 * 1024 * 64;
-    int Chunk::MaxObjectPerChunk = 250000;
 
     // Can be overridden from command line
     bool Chunk::ShouldAutoSplit = true;
@@ -152,7 +152,7 @@ namespace mongo {
         cmd.appendBool( "force" , true );
         BSONObj cmdObj = cmd.obj();
 
-        if ( ! conn->get()->runCommand( "admin" , cmdObj , result )) {
+        if ( ! conn->get()->runCommand( nsToDatabase(_manager->getns()) , cmdObj , result )) {
             conn->done();
             ostringstream os;
             os << "splitVector command (median key) failed: " << result;
@@ -167,7 +167,7 @@ namespace mongo {
         conn->done();
     }
 
-    void Chunk::pickSplitVector( vector<BSONObj>& splitPoints , int chunkSize /* bytes */, int maxPoints, int maxObjs ) const {
+    void Chunk::pickSplitVector( vector<BSONObj>& splitPoints , int chunkSize /* bytes */, int maxPoints ) const {
         // Ask the mongod holding this chunk to figure out the split points.
         scoped_ptr<ScopedDbConnection> conn(
                 ScopedDbConnection::getInternalScopedDbConnection( getShard().getConnString() ) );
@@ -179,10 +179,9 @@ namespace mongo {
         cmd.append( "max" , getMax() );
         cmd.append( "maxChunkSizeBytes" , chunkSize );
         cmd.append( "maxSplitPoints" , maxPoints );
-        cmd.append( "maxChunkObjects" , maxObjs );
         BSONObj cmdObj = cmd.obj();
 
-        if ( ! conn->get()->runCommand( "admin" , cmdObj , result )) {
+        if ( ! conn->get()->runCommand( nsToDatabase(_manager->getns()) , cmdObj , result )) {
             conn->done();
             ostringstream os;
             os << "splitVector command failed: " << result;
@@ -205,7 +204,7 @@ namespace mongo {
         if ( ! force ) {
             vector<BSONObj> candidates;
             const int maxPoints = 2;
-            pickSplitVector( candidates , getManager()->getCurrentDesiredChunkSize() , maxPoints , MaxObjectPerChunk );
+            pickSplitVector( candidates , getManager()->getCurrentDesiredChunkSize() , maxPoints );
             if ( candidates.size() <= 1 ) {
                 // no split points means there isn't enough data to split on
                 // 1 split point means we have between half the chunk size to full chunk size
@@ -303,7 +302,7 @@ namespace mongo {
         return true;
     }
 
-    bool Chunk::moveAndCommit( const Shard& to , long long chunkSize /* bytes */, bool secondaryThrottle, BSONObj& res ) const {
+    bool Chunk::moveAndCommit(const Shard &to, BSONObj &res) const {
         uassert( 10167 ,  "can't move shard to its current location!" , getShard() != to );
 
         log() << "moving chunk ns: " << _manager->getns() << " moving ( " << toString() << ") " << _shard.toString() << " -> " << to.toString() << endl;
@@ -323,10 +322,8 @@ namespace mongo {
                                                          ///////////////////////////////
                                                          "min" << _min <<
                                                          "max" << _max <<
-                                                         "maxChunkSizeBytes" << chunkSize <<
                                                          "shardId" << genID() <<
-                                                         "configdb" << configServer.modelServer() <<
-                                                         "secondaryThrottle" << secondaryThrottle
+                                                         "configdb" << configServer.modelServer()
                                                          ) ,
                                                    res
                                                    );
@@ -425,8 +422,6 @@ namespace mongo {
                 massert( 10412 ,
                          str::stream() << "moveAndCommit failed: " << res ,
                          toMove->moveAndCommit( newLocation , 
-                                                MaxChunkSize , 
-                                                false , /* secondaryThrottle - small chunk, no need */
                                                 res ) );
                 
                 // update our config
@@ -453,7 +448,7 @@ namespace mongo {
                 ScopedDbConnection::getInternalScopedDbConnection( getShard().getConnString() ) );
 
         BSONObj result;
-        uassert( 10169 ,  "datasize failed!" , conn->get()->runCommand( "admin" ,
+        uassert( 10169 ,  "datasize failed!" , conn->get()->runCommand( nsToDatabase(_manager->getns()) ,
                  BSON( "datasize" << _manager->getns()
                        << "keyPattern" << _manager->getShardKey().key()
                        << "min" << getMin()
@@ -953,14 +948,11 @@ namespace mongo {
             }
 
             if ( !initShards || !initShards->size() ) {
-                // use all shards, starting with primary
+                // If not specified, only use the primary shard (note that it's not safe for mongos
+                // to put initial chunks on other shards without the primary mongod knowing).
                 shards->push_back( primary );
-                vector<Shard> tmp;
-                primary.getAllShards( tmp );
-                for ( unsigned i = 0; i < tmp.size(); ++i ) {
-                    if ( tmp[i] != primary )
-                        shards->push_back( tmp[i] );
-                }
+            } else {
+                std::copy( initShards->begin() , initShards->end() , std::back_inserter(*shards) );
             }
         }
     }

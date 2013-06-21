@@ -2,6 +2,7 @@
 
 /**
 *    Copyright (C) 2008 10gen Inc.
+*    Copyright (C) 2013 Tokutek Inc.
 *
 *    This program is free software: you can redistribute it and/or  modify
 *    it under the terms of the GNU Affero General Public License, version 3,
@@ -144,7 +145,7 @@ namespace mongo {
          * @param maxPoints limits the number of split points that are needed, zero is max (optional)
          * @param maxObjs limits the number of objects in each chunk, zero is as max (optional)
          */
-        void pickSplitVector( vector<BSONObj>& splitPoints , int chunkSize , int maxPoints = 0, int maxObjs = 0) const;
+        void pickSplitVector( vector<BSONObj>& splitPoints , int chunkSize , int maxPoints = 0) const;
 
         //
         // migration support
@@ -154,12 +155,10 @@ namespace mongo {
          * Issues a migrate request for this chunk
          *
          * @param to shard to move this chunk to
-         * @param chunSize maximum number of bytes beyond which the migrate should no go trhough
-         * @param secondaryThrottle whether during migrate all writes should block for repl
          * @param res the object containing details about the migrate execution
          * @return true if move was successful
          */
-        bool moveAndCommit( const Shard& to , long long chunkSize , bool secondaryThrottle, BSONObj& res ) const;
+        bool moveAndCommit(const Shard &to, BSONObj &res) const;
 
         /**
          * @return size of shard in bytes
@@ -186,7 +185,6 @@ namespace mongo {
 
         static string chunkMetadataNS;
         static int MaxChunkSize;
-        static int MaxObjectPerChunk;
         static bool ShouldAutoSplit;
 
         //

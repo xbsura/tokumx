@@ -2,6 +2,7 @@
 
 /**
 *    Copyright (C) 2008 10gen Inc.
+*    Copyright (C) 2013 Tokutek Inc.
 *
 *    This program is free software: you can redistribute it and/or  modify
 *    it under the terms of the GNU Affero General Public License, version 3,
@@ -40,7 +41,7 @@ namespace mongo {
     Balancer::~Balancer() {
     }
 
-    int Balancer::_moveChunks( const vector<CandidateChunkPtr>* candidateChunks , bool secondaryThrottle ) {
+    int Balancer::_moveChunks( const vector<CandidateChunkPtr>* candidateChunks ) {
         int movedCount = 0;
 
         for ( vector<CandidateChunkPtr>::const_iterator it = candidateChunks->begin(); it != candidateChunks->end(); ++it ) {
@@ -66,7 +67,7 @@ namespace mongo {
             }
 
             BSONObj res;
-            if ( c->moveAndCommit( Shard::make( chunkInfo.to ) , Chunk::MaxChunkSize , secondaryThrottle , res ) ) {
+            if ( c->moveAndCommit( Shard::make( chunkInfo.to ) , res ) ) {
                 movedCount++;
                 continue;
             }
@@ -74,27 +75,6 @@ namespace mongo {
             // the move requires acquiring the collection metadata's lock, which can fail
             log() << "balancer move failed: " << res << " from: " << chunkInfo.from << " to: " << chunkInfo.to
                   << " chunk: " << chunkInfo.chunk << endl;
-
-            if ( res["chunkTooBig"].trueValue() ) {
-                // reload just to be safe
-                cm = cfg->getChunkManager( chunkInfo.ns );
-                verify( cm );
-                c = cm->findIntersectingChunk( chunkInfo.chunk.min );
-                
-                log() << "forcing a split because migrate failed for size reasons" << endl;
-                
-                res = BSONObj();
-                c->singleSplit( true , res );
-                log() << "forced split results: " << res << endl;
-                
-                if ( ! res["ok"].trueValue() ) {
-                    log() << "marking chunk as jumbo: " << c->toString() << endl;
-                    c->markAsJumbo();
-                    // we increment moveCount so we do another round right away
-                    movedCount++;
-                }
-
-            }
         }
 
         return movedCount;
@@ -356,7 +336,7 @@ namespace mongo {
                         _balancedLastTime = 0;
                     }
                     else {
-                        _balancedLastTime = _moveChunks( &candidateChunks, balancerConfig["_secondaryThrottle"].trueValue() );
+                        _balancedLastTime = _moveChunks( &candidateChunks );
                     }
                     
                     LOG(1) << "*** end of balancing round" << endl;

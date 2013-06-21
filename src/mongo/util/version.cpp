@@ -1,6 +1,7 @@
 // @file version.cpp
 
 /*    Copyright 2009 10gen Inc.
+ *    Copyright (C) 2013 Tokutek Inc.
  *
  *    Licensed under the Apache License, Version 2.0 (the "License");
  *    you may not use this file except in compliance with the License.
@@ -42,12 +43,12 @@ namespace mongo {
      *      1.2.3-rc4-pre-
      * If you really need to do something else you'll need to fix _versionArray()
      */
-    const char versionString[] = "2.2.4";
-    const char tokutekPatchVersionString[] = "0.2.0-pre-";
+    const char mongodbVersionString[] = "2.2.4";
+    const char tokumxVersionString[] = "1.1.0-pre-";
 
     std::string fullVersionString() {
         stringstream ss;
-        ss << versionString << "-tokutek-" << tokutekPatchVersionString;
+        ss << tokumxVersionString << "-mongodb-" << mongodbVersionString;
         return ss.str();
     }
 
@@ -90,11 +91,11 @@ namespace mongo {
         return b.arr();
     }
 
-    const BSONArray versionArray = _versionArray(versionString);
+    const BSONArray versionArray = _versionArray(mongodbVersionString);
 
     string mongodVersion() {
         stringstream ss;
-        ss << "db version v" << fullVersionString() << ", tokudb version r" << tokudbVersion();
+        ss << "TokuMX mongod server v" << fullVersionString() << ", using TokuKV rev " << tokukvVersion();
         return ss.str();
     }
 
@@ -129,10 +130,10 @@ namespace mongo {
 
 #ifndef _SCONS
     // only works in scons
-    const char *tokudbVersion() { return "not-scons"; }
+    const char *tokukvVersion() { return "not-scons"; }
 #endif
 
-    void printTokudbVersion() { log() << "tokudb version: " << tokudbVersion() << endl; }
+    void printTokukvVersion() { log() << "TokuKV version: " << tokukvVersion() << endl; }
 
 
     Tee * startupWarningsLog = new RamLog("startupWarnings"); //intentionally leaked
@@ -145,11 +146,11 @@ namespace mongo {
 
         bool warned = false;
         {
-            const char * foo = strchr( fullVersionString().c_str() , '.' ) + 1;
+            const char * foo = strchr( mongodbVersionString , '.' ) + 1;
             int bar = atoi( foo );
             if ( ( 2 * ( bar / 2 ) ) != bar ) {
                 log() << startupWarningsLog;
-                log() << "** NOTE: This is a development version (" << fullVersionString() << ") of MongoDB." << startupWarningsLog;
+                log() << "** NOTE: This is a development version (" << fullVersionString() << ") of TokuMX." << startupWarningsLog;
                 log() << "**       Not recommended for production." << startupWarningsLog;
                 warned = true;
             }
@@ -163,6 +164,7 @@ namespace mongo {
             warned = true;
         }
 
+#if 0 // unnecessary for toku
         if ( !ProcessInfo::blockCheckSupported() ) {
             log() << startupWarningsLog;
             log() << "** NOTE: your operating system version does not support the method that MongoDB" << startupWarningsLog;
@@ -170,6 +172,7 @@ namespace mongo {
             log() << "**       This may result in slower performance for certain use cases" << startupWarningsLog;
             warned = true;
         }
+#endif
 #ifdef __linux__
         if (boost::filesystem::exists("/proc/vz") && !boost::filesystem::exists("/proc/bc")) {
             log() << startupWarningsLog;
@@ -177,6 +180,7 @@ namespace mongo {
             warned = true;
         }
 
+#if 0 // unnecessary for toku
         if (boost::filesystem::exists("/sys/devices/system/node/node1")){
             // We are on a box with a NUMA enabled kernel and more than 1 numa node (they start at node0)
             // Now we look at the first line of /proc/self/numa_maps
@@ -234,6 +238,7 @@ namespace mongo {
             }
         }
 #endif
+#endif
 
 #if defined(RLIMIT_NPROC) && defined(RLIMIT_NOFILE)
         //Check that # of files rlmit > 1000 , and # of processes > # of files/2
@@ -277,20 +282,20 @@ namespace mongo {
     }
 
     int versionCmp(StringData rhs, StringData lhs) {
-        if (strcmp(rhs.data(),lhs.data()) == 0)
+        if ( rhs == lhs )
             return 0;
 
         // handle "1.2.3-" and "1.2.3-pre"
         if (rhs.size() < lhs.size()) {
-            if (strncmp(rhs.data(), lhs.data(), rhs.size()) == 0 && lhs.data()[rhs.size()] == '-')
+            if (strncmp(rhs.rawData(), lhs.rawData(), rhs.size()) == 0 && lhs[rhs.size()] == '-')
                 return +1;
         }
         else if (rhs.size() > lhs.size()) {
-            if (strncmp(rhs.data(), lhs.data(), lhs.size()) == 0 && rhs.data()[lhs.size()] == '-')
+            if (strncmp(rhs.rawData(), lhs.rawData(), lhs.size()) == 0 && rhs[lhs.size()] == '-')
                 return -1;
         }
 
-        return LexNumCmp::cmp(rhs.data(), lhs.data(), false);
+        return LexNumCmp::cmp(rhs, lhs, false);
     }
 
     class VersionCmpTest : public StartupTest {

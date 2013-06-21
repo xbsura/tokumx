@@ -3,6 +3,7 @@
 
 /**
 *    Copyright (C) 2008 10gen Inc.
+*    Copyright (C) 2013 Tokutek Inc.
 *
 *    This program is free software: you can redistribute it and/or  modify
 *    it under the terms of the GNU Affero General Public License, version 3,
@@ -81,11 +82,11 @@ namespace mongo {
         }
 
         if (rs->box.getState().primary()) {
-            // make sure exactly one primary steps down
-            if (rs->selfId() < m->id()) {
-                return;
-            }
-
+            // vanilla mongo tries to make sure that only one will step down
+            // we will step down regardless, because we want an election
+            // to figure out who should be the rightful primary.
+            
+            log() << "we see a remote is primary, relinquishing primary" << rsLog;
             rs->relinquish();
         }
 
@@ -98,7 +99,7 @@ namespace mongo {
         // make sure the electable set is up-to-date
         if (rs->elect.aMajoritySeemsToBeUp() &&
             rs->iAmPotentiallyHot() &&
-            (otherOp == 0 || rs->gtidManager->getCurrTimestamp()>= otherOp - 10000)) {
+            (otherOp == 0 || rs->gtidManager->getCurrTimestamp() + 10000 >= otherOp)) {
             theReplSet->addToElectable(rs->selfId());
         }
         else {
@@ -113,7 +114,7 @@ namespace mongo {
             highestPriority->config().priority > primary->config().priority &&
             // if we're stepping down to allow another member to become primary, we
             // better have another member (otherOp), and it should be up-to-date
-            otherOp != 0 && highestPriority->hbinfo().opTime >= otherOp - 10000) {
+            otherOp != 0 && highestPriority->hbinfo().opTime + 10000 >= otherOp) {
             log() << "stepping down " << primary->fullName() << " (priority " <<
                 primary->config().priority << "), " << highestPriority->fullName() <<
                 " is priority " << highestPriority->config().priority << " and " <<
@@ -123,6 +124,7 @@ namespace mongo {
                 // replSetStepDown tries to acquire the same lock
                 // msgCheckNewState takes, so we can't call replSetStepDown on
                 // ourselves.
+                log() << "another machine has higher priority and is close to us, relinquishing primary" << rsLog;
                 rs->relinquish();
             }
             else {
@@ -233,6 +235,15 @@ namespace mongo {
                             rs->relinquish();
                         }
 
+                        if (GTID::cmp(theReplSet->gtidManager->getLiveState(), theReplSet->lastOtherGTID()) < 0) {
+                            // this can happen if we transiently have two primaries, which can
+                            // happen if a primary loses contact with the replica set,
+                            // triggering an election, but it connects back before it has a
+                            // chance to step down
+                            log() << "we see a secondary that is ahead, relinquishing primary" << rsLog;
+                            rs->relinquish();                            
+                        }
+
                         return;
                     }
 
@@ -263,11 +274,13 @@ namespace mongo {
             // blockSync outside of rslock
             // can't hold rslock because we may try to stop the opsync thread
             if (authIssue) {
-                if (rs->box.getPrimary() == rs->_self) {
-                    log() << "auth problems, relinquishing primary" << rsLog;
-                    rs->relinquish();
+                {
+                    RSBase::lock lk(rs);
+                    if (rs->box.getPrimary() == rs->_self) {
+                        log() << "auth problems, relinquishing primary" << rsLog;
+                        rs->relinquish();
+                    }
                 }
-
                 rs->blockSync(true);
                 return;
             }

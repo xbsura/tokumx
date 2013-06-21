@@ -1,5 +1,5 @@
 /**
-*    Copyright (C) 2012 Tokutek Inc.
+*    Copyright (C) 2013 Tokutek Inc.
 *
 *    This program is free software: you can redistribute it and/or  modify
 *    it under the terms of the GNU Affero General Public License, version 3,
@@ -26,6 +26,15 @@ namespace mongo {
 // helpers for opLog stuff
 namespace OpLogHelpers{
 
+    // values for types of operations in opLog
+    static const char OP_STR_INSERT[] = "i";
+    static const char OP_STR_CAPPED_INSERT[] = "ci";
+    static const char OP_STR_UPDATE[] = "u";
+    static const char OP_STR_DELETE[] = "d";
+    static const char OP_STR_CAPPED_DELETE[] = "cd";
+    static const char OP_STR_COMMENT[] = "n";
+    static const char OP_STR_COMMAND[] = "c";
+
     void logComment(BSONObj comment, TxnContext* txn);
     void logInsert(const char* ns, BSONObj row, TxnContext* txn);    
     void logInsertForCapped(const char* ns, BSONObj pk, BSONObj row, TxnContext* txn);
@@ -34,6 +43,7 @@ namespace OpLogHelpers{
     void logDeleteForCapped(const char* ns, BSONObj pk, BSONObj row, TxnContext* txn);
     void logCommand(const char* ns, BSONObj row, TxnContext* txn);
     void applyOperationFromOplog(const BSONObj& op);
+    void rollbackOperationFromOplog(const BSONObj& op);
 }
 
 

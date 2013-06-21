@@ -2,6 +2,7 @@
 
 /**
 *    Copyright (C) 2008 10gen Inc.
+*    Copyright (C) 2013 Tokutek Inc.
 *
 *    This program is free software: you can redistribute it and/or  modify
 *    it under the terms of the GNU Affero General Public License, version 3,
@@ -35,7 +36,6 @@
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/background.h"
 #include "mongo/util/concurrency/mutex.h"
-#include "mongo/util/file_allocator.h"
 #include "mongo/util/version.h"
 
 namespace po = boost::program_options;
@@ -43,6 +43,8 @@ namespace po = boost::program_options;
 namespace mongo {
 
     CmdLine cmdLine;
+
+    extern TxnCompleteHooks _txnCompleteHooks;
 
     namespace dbtests {
 
@@ -198,7 +200,6 @@ namespace mongo {
             string dbpathString = p.native_directory_string();
             dbpath = dbpathString.c_str();
 
-            cmdLine.oplogSize = 10 * 1024 * 1024;
             Client::initThread("testsuite");
             acquirePathLock();
 
@@ -210,8 +211,6 @@ namespace mongo {
                 log() << "32bit" << endl;
             log() << "random seed: " << seed << endl;
 
-            FileAllocator::get()->start();
-
             vector<string> suites;
             if (params.count("suites")) {
                 suites = params["suites"].as< vector<string> >();
@@ -222,6 +221,7 @@ namespace mongo {
                 filter = params["filter"].as<string>();
             }
 
+            mongo::setTxnCompleteHooks(&mongo::_txnCompleteHooks);
             storage::startup();
 
             TestWatchDog twd;

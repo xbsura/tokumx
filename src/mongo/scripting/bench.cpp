@@ -2,6 +2,7 @@
 
 /*
  *    Copyright (C) 2010 10gen Inc.
+ *    Copyright (C) 2013 Tokutek Inc.
  *
  *    This program is free software: you can redistribute it and/or  modify
  *    it under the terms of the GNU Affero General Public License, version 3,
@@ -600,7 +601,7 @@ namespace mongo {
                         }
                     }
                     else if ( op == "createIndex" ) {
-                        conn->ensureIndex( ns , e["key"].Obj() , false , "" , false );
+                        conn->ensureIndex( ns , e["key"].Obj() , false , false , "" , false );
                     }
                     else if ( op == "dropIndex" ) {
                         conn->dropIndex( ns , e["key"].Obj()  );

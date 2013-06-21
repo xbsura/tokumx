@@ -1,5 +1,6 @@
 /**
  * Copyright (c) 2011 10gen Inc.
+ * Copyright (C) 2013 Tokutek Inc.
  *
  * This program is free software: you can redistribute it and/or  modify
  * it under the terms of the GNU Affero General Public License, version 3,
@@ -46,7 +47,7 @@ namespace mongo {
         pBuilder->append(fieldName, d);
     }
 
-    void BuilderObj::append(string s) {
+    void BuilderObj::append(const std::string& s) {
         pBuilder->append(fieldName, s);
     }
 
@@ -71,7 +72,7 @@ namespace mongo {
     }
 
     BuilderObj::BuilderObj(
-        BSONObjBuilder *pObjBuilder, string theFieldName):
+        BSONObjBuilder *pObjBuilder, const std::string& theFieldName):
         pBuilder(pObjBuilder),
         fieldName(theFieldName) {
     }
@@ -101,7 +102,7 @@ namespace mongo {
         pBuilder->append(d);
     }
 
-    void BuilderArray::append(string s) {
+    void BuilderArray::append(const std::string& s) {
         pBuilder->append(s);
     }
 

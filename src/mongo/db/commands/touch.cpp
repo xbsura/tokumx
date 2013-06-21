@@ -4,6 +4,7 @@
 
 /**
  *    Copyright (C) 2012 10gen Inc.
+ *    Copyright (C) 2013 Tokutek Inc.
  *
  *    This program is free software: you can redistribute it and/or  modify
  *    it under the terms of the GNU Affero General Public License, version 3,
@@ -29,14 +30,9 @@
 
 namespace mongo {
 
-    class TouchCmd : public Command {
+    class TouchCmd : public QueryCommand {
     public:
-        virtual LockType locktype() const { return READ; }
         virtual bool adminOnly() const { return false; }
-        virtual bool slaveOk() const { return true; }
-        virtual bool maintenanceMode() const { return true; }
-        virtual int txnFlags() const { return DB_TXN_SNAPSHOT | DB_TXN_READ_ONLY; }
-        virtual bool logTheOp() { return false; }
         virtual void help( stringstream& help ) const {
             help << "touch collection\n"
                 "Page in all data for the given collection\n"
@@ -44,7 +40,7 @@ namespace mongo {
                 " at least one of data or index must be true; default is both are false\n";
         }
         virtual bool requiresAuth() { return true; }
-        TouchCmd() : Command("touch") { }
+        TouchCmd() : QueryCommand("touch") {}
 
         virtual bool run(const string& db, 
                          BSONObj& cmdObj, 
@@ -87,16 +83,10 @@ namespace mongo {
                 return false;
             }
 
-            TokuCommandSettings settings;
-            settings.setBulkFetch(true);
-            settings.setQueryCursorMode(DEFAULT_LOCK_CURSOR);
-            cc().setTokuCommandSettings(settings);
-
             for (int i = 0; i < nsd->nIndexes(); i++) {
                 IndexDetails &idx = nsd->idx(i);
                 if ((nsd->isPKIndex(idx) && touch_data) || (!nsd->isPKIndex(idx) && touch_indexes)) {
-                    shared_ptr<IndexCursor> c( new IndexCursor(nsd, idx, minKey, maxKey, true, 1) );
-                    for ( ; c->ok(); c->advance()) {
+                    for (shared_ptr<Cursor> c(IndexCursor::make(nsd, idx, minKey, maxKey, true, 1)); c->ok(); c->advance()) {
                         c->current();
                     }
                 }

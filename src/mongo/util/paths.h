@@ -2,6 +2,7 @@
 // file paths and directory handling
 
 /*    Copyright 2010 10gen Inc.
+ *    Copyright (C) 2013 Tokutek Inc.
  *
  *    Licensed under the Apache License, Version 2.0 (the "License");
  *    you may not use this file except in compliance with the License.
@@ -39,7 +40,7 @@ namespace mongo {
 
         bool empty() const { return _p.empty(); }
 
-        static RelativePath fromRelativePath(string f) {
+        static RelativePath fromRelativePath(const std::string& f) {
             RelativePath rp;
             rp._p = f;
             return rp;
@@ -100,8 +101,6 @@ namespace mongo {
 
     inline void flushMyDirectory(const boost::filesystem::path& file){
 #ifdef __linux__ // this isn't needed elsewhere
-        // if called without a fully qualified path it asserts; that makes mongoperf fail. so make a warning. need a better solution longer term.
-        // massert(13652, str::stream() << "Couldn't find parent dir for file: " << file.string(), );
         if( !file.has_branch_path() ) {
             log() << "warning flushMYDirectory couldn't find parent dir for file: " << file.string() << endl;
             return;

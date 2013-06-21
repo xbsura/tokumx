@@ -1,5 +1,6 @@
 /**
 *    Copyright (C) 2008 10gen Inc.
+*    Copyright (C) 2013 Tokutek Inc.
 *
 *    This program is free software: you can redistribute it and/or  modify
 *    it under the terms of the GNU Affero General Public License, version 3,
@@ -140,9 +141,9 @@ namespace mongo {
     class FieldRange;
     class FieldRangeVector;
     class FieldRangeVectorIterator;
-    class FieldInterval;
+    struct FieldInterval;
     
-    // Class for storing rows bulk fetched from TokuDB
+    // Class for storing rows bulk fetched from TokuMX
     class RowBuffer {
     public:
         RowBuffer();
@@ -193,19 +194,20 @@ namespace mongo {
      */
     class IndexCursor : public Cursor {
     public:
-        // If numWanted is > 0, there exists a limit clause, so don't prefetch.
 
         // Create a cursor over a specific start, end key range.
-        IndexCursor( NamespaceDetails *d, const IndexDetails &idx,
-                     const BSONObj &startKey, const BSONObj &endKey,
-                     bool endKeyInclusive, int direction, int numWanted = 0);
+        static shared_ptr<IndexCursor> make( NamespaceDetails *d, const IndexDetails &idx,
+                                             const BSONObj &startKey, const BSONObj &endKey,
+                                             bool endKeyInclusive, int direction,
+                                             int numWanted = 0);
 
         // Create a cursor over a set of one or more field ranges.
-        IndexCursor( NamespaceDetails *d, const IndexDetails &idx,
-                     const shared_ptr< FieldRangeVector > &bounds,
-                     int singleIntervalLimit, int direction, int numWanted = 0);
+        static shared_ptr<IndexCursor> make( NamespaceDetails *d, const IndexDetails &idx,
+                                             const shared_ptr< FieldRangeVector > &bounds,
+                                             int singleIntervalLimit, int direction,
+                                             int numWanted = 0);
 
-        ~IndexCursor();
+        virtual ~IndexCursor();
 
         bool ok() { return _ok; }
         bool advance();
@@ -216,18 +218,15 @@ namespace mongo {
          * @return false if the pk has not been seen
          */
         bool getsetdup(const BSONObj &pk) {
-            if( _multiKey ) {
-                // We need to store a copy of the PK in this data structure, as we
-                // cannot trust that the BSONObj's buffer will uniquely identify
-                // this PK value after this call.
+            if ( _multiKey ) {
                 pair<set<BSONObj>::iterator, bool> p = _dups.insert(pk.copy());
                 return !p.second;
             }
             return false;
         }
 
-        virtual bool tailable() const { return _tailable; }
-        virtual void setTailable();
+        bool tailable() const { return _tailable; }
+        void setTailable();
 
         bool modifiedKeys() const { return _multiKey; }
         bool isMultiKey() const { return _multiKey; }
@@ -258,25 +257,63 @@ namespace mongo {
         
         long long nscanned() const { return _nscanned; }
 
-    private:
+    protected:
+        bool forward() const;
 
-        void init( const BSONObj &startKey, const BSONObj &endKey, bool endKeyInclusive, int direction );
-        void init( const shared_ptr< FieldRangeVector > &_bounds, int singleIntervalLimit, int _direction );
+        // Optionally pre-acquire row locks for this cursor. cursor_flags() and
+        // getf_flags() should be the correct flags to pass to the ydb, given the
+        // implementation of prelock() (ie: DB_PRELOCKED if locks were grabbed).
+        virtual void prelock();
+        virtual int cursor_flags();
+        virtual int getf_flags();
+
+        // True if intuitive bounds-ordering for minKey and MaxKey is reverse for
+        // this cursor, based on an index ordering and cursor direction.
+        //
+        // Example: intuitively, { min, max } describes the bounds for an index scan.
+        // But we need to possibly reverse those bounds to { max, min }. Here are
+        // the possible outcomes for ordering/direction combinations:
+        // - Descending/forward, return true (reverse to { max, min })
+        // - Ascending/reverse, return true.
+        // - Descending/reverse, return false (stay with { min, max })
+        // - Ascending/forward, return false.
+        static bool reverseMinMaxBoundsOrder(const Ordering &ordering, const int direction);
+
+        IndexCursor( NamespaceDetails *d, const IndexDetails &idx,
+                     const BSONObj &startKey, const BSONObj &endKey,
+                     bool endKeyInclusive, int direction, int numWanted = 0);
+
+        IndexCursor( NamespaceDetails *d, const IndexDetails &idx,
+                     const shared_ptr< FieldRangeVector > &bounds,
+                     int singleIntervalLimit, int direction, int numWanted = 0);
+
+    private:
 
         /** Initialize the internal DBC */
         void initializeDBC();
         void _prelockCompoundBounds(const int currentRange, vector<const FieldInterval *> &combo,
                                     BufBuilder &startKeyBuilder, BufBuilder &endKeyBuilder);
-        void prelockBounds();
-        void prelockRange(const BSONObj &startKey, const BSONObj &endKey);
+        void _prelockBounds();
+        void _prelockRange(const BSONObj &startKey, const BSONObj &endKey);
+
         /** Get the current key/pk/obj from the row buffer and set _currKey/PK/Obj */
         void getCurrentFromBuffer();
         /** Advance the internal DBC, not updating nscanned or checking the key against our bounds. */
         void _advance();
 
+        /** ydb cursor callback + flags */
+        struct cursor_getf_extra {
+            RowBuffer *buffer;
+            int rows_fetched;
+            int rows_to_fetch;
+            std::exception *ex;
+            cursor_getf_extra(RowBuffer *buf, int n_to_fetch) :
+                buffer(buf), rows_fetched(0), rows_to_fetch(n_to_fetch), ex(NULL) {
+            }
+        };
+        static int cursor_getf(const DBT *key, const DBT *val, void *extra);
         /** determine how many rows the next getf should bulk fetch */
         int getf_fetch_count();
-        int getf_flags();
         /** pull more rows from the DBC into the RowBuffer */
         bool fetchMoreRows();
         /** find by key where the PK used for search is determined by _direction */
@@ -299,14 +336,14 @@ namespace mongo {
         BSONObj _endKey;
         BSONObj _minUnsafeKey;
         bool _endKeyInclusive;
-        bool _multiKey; // this must be updated every getmore batch in case someone added a multikey
-        int _direction;
+        const bool _multiKey;
+        const int _direction;
         shared_ptr< FieldRangeVector > _bounds; // field ranges to iterate over, if non-null
         auto_ptr< FieldRangeVectorIterator > _boundsIterator;
         shared_ptr< CoveredIndexMatcher > _matcher;
         shared_ptr<Projection::KeyOnly> _keyFieldsOnly;
         long long _nscanned;
-        int _numWanted;
+        const int _numWanted;
 
         IndexDetails::Cursor _cursor;
         // An exhausted cursor has no more rows and is done iterating,
@@ -329,66 +366,62 @@ namespace mongo {
     };
 
     /**
-     * Table-scan style cursor.
-     *
-     * Implements the cursor interface by wrapping an IndexCursor
-     * constructed over the primary, clustering _id index.
+     * Abstracts index scans by generating a the start and end key
+     * based on the index's ordering and the desired direction.
      */
-    class BasicCursor : public Cursor {
+    class IndexScanCursor : public IndexCursor {
     public:
-        static Cursor *make( NamespaceDetails *d, int direction = 1 );
+        IndexScanCursor( NamespaceDetails *d, const IndexDetails &idx,
+                         int direction, int numWanted = 0);
+    private:
+        static const BSONObj &startKey(const BSONObj &keyPattern, const int direction);
+        static const BSONObj &endKey(const BSONObj &keyPattern, const int direction);
+    };
 
-        bool ok() { return _c.ok(); }
-        BSONObj current() { return _c.current(); }
-        BSONObj currPK() const { return _c.currPK(); }
-        bool advance() { return _c.advance(); }
+    /**
+     * Index-scan style cursor over the primary key.
+     */
+    class BasicCursor : public IndexScanCursor {
+    public:
+        static shared_ptr<Cursor> make( NamespaceDetails *d, int direction = 1 );
+
+        BSONObj currKey() const { return BSONObj(); }
+        virtual BSONObj indexKeyPattern() const { return BSONObj(); }
+        virtual string toString() const {
+            return forward() ? "BasicCursor" : "ReverseCursor";
+        }
+        virtual bool getsetdup(const BSONObj &pk) { return false; }
+        virtual bool isMultiKey() const { return false; }
+        virtual bool modifiedKeys() const { return false; }
+        virtual BSONObj prettyIndexBounds() const { return BSONArray(); }
+        virtual void explainDetails( BSONObjBuilder& b ) const { return; }
+
+    private:
+        BasicCursor( NamespaceDetails *d, int direction );
+    };
+
+    /**
+     * Dummy cursor returning no results.
+     * Can be used to represent a cursor over a non-existent collection.
+     */
+    class DummyCursor : public Cursor {
+    public:
+        DummyCursor( int direction = 1 ) : _direction(direction) { }
+        bool ok() { return false; }
+        BSONObj current() { return BSONObj(); }
+        bool advance() { return false; }
         virtual string toString() const {
             return _direction > 0 ? "BasicCursor" : "ReverseCursor";
         }
-        virtual void setTailable() { _c.setTailable(); }
-        virtual bool tailable() const { return _c.tailable(); }
         virtual bool getsetdup(const BSONObj &pk) { return false; }
         virtual bool isMultiKey() const { return false; }
         virtual bool modifiedKeys() const { return false; }
         virtual bool supportGetMore() { return true; }
-        virtual CoveredIndexMatcher *matcher() const { return _c.matcher(); }
-        virtual shared_ptr< CoveredIndexMatcher > matcherPtr() const { return _c.matcherPtr(); }
-        virtual void setMatcher( shared_ptr< CoveredIndexMatcher > matcher ) {
-            _c.setMatcher(matcher);
-        }
-        virtual const Projection::KeyOnly *keyFieldsOnly() const { return _c.keyFieldsOnly(); }
-        virtual void setKeyFieldsOnly( const shared_ptr<Projection::KeyOnly> &keyFieldsOnly ) {
-            _c.setKeyFieldsOnly(keyFieldsOnly);
-        }
-        virtual long long nscanned() const { return _c.nscanned(); }
-
-    protected:
-        BasicCursor( NamespaceDetails *d, int direction = 1 );
-
-        class DummyCursor : public Cursor {
-        public:
-            DummyCursor( int direction = 1 ) : _direction(direction) { }
-            bool ok() { return false; }
-            BSONObj current() { return BSONObj(); }
-            bool advance() { return false; }
-            virtual string toString() const {
-                return _direction > 0 ? "BasicCursor" : "ReverseCursor";
-            }
-            virtual bool getsetdup(const BSONObj &pk) { return false; }
-            virtual bool isMultiKey() const { return false; }
-            virtual bool modifiedKeys() const { return false; }
-            virtual bool supportGetMore() { return true; }
-            virtual void setMatcher( shared_ptr< CoveredIndexMatcher > matcher ) { }
-            virtual void setKeyFieldsOnly( const shared_ptr<Projection::KeyOnly> &keyFieldsOnly ) { }
-            virtual long long nscanned() const { return 0; }
-
-        private:
-            int _direction;
-        };
+        virtual void setMatcher( shared_ptr< CoveredIndexMatcher > matcher ) { }
+        virtual void setKeyFieldsOnly( const shared_ptr<Projection::KeyOnly> &keyFieldsOnly ) { }
+        virtual long long nscanned() const { return 0; }
 
     private:
-        IndexCursor _c;
-        int _direction;
+        const int _direction;
     };
-
 } // namespace mongo

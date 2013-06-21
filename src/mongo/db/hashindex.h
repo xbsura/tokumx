@@ -2,6 +2,7 @@
 
 /**
 *    Copyright (C) 2012 10gen Inc.
+*    Copyright (C) 2013 Tokutek Inc.
 *
 *    This program is free software: you can redistribute it and/or  modify
 *    it under the terms of the GNU Affero General Public License, version 3,
@@ -21,7 +22,6 @@
 #include "mongo/db/index.h"
 #include "mongo/db/keypattern.h"
 #include "mongo/db/matcher.h"
-#include "mongo/db/namespace.h"
 
 namespace mongo {
 
@@ -88,7 +88,7 @@ namespace mongo {
 
         /* The newCursor method works for suitable queries by generating a IndexCursor
          * using the hash of point-intervals parsed by FieldRangeSet.
-         * For unsuitable queries it just instantiates a btree cursor over the whole tree
+         * For unsuitable queries it just instantiates a cursor over the whole index.
          */
         shared_ptr<Cursor> newCursor( const BSONObj& query ,
                 const BSONObj& order , int numWanted ) const;

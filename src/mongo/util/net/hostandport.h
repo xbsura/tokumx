@@ -1,6 +1,7 @@
 // hostandport.h
 
 /*    Copyright 2009 10gen Inc.
+ *    Copyright (C) 2013 Tokutek Inc.
  *
  *    Licensed under the Apache License, Version 2.0 (the "License");
  *    you may not use this file except in compliance with the License.
@@ -34,10 +35,10 @@ namespace mongo {
         /** From a string hostname[:portnumber]
             Throws user assertion if bad config string or bad port #.
         */
-        HostAndPort(string s);
+        HostAndPort(const std::string& s);
 
         /** @param p port number. -1 is ok to use default. */
-        HostAndPort(string h, int p /*= -1*/) : _host(h), _port(p) { 
+        HostAndPort(const std::string& h, int p /*= -1*/) : _host(h), _port(p) { 
             verify( !str::startsWith(h, '#') );
         }
 
@@ -181,7 +182,7 @@ namespace mongo {
         }
     }
 
-    inline HostAndPort::HostAndPort(string s) {
+    inline HostAndPort::HostAndPort(const std::string& s) {
         init(s.c_str());
     }
 

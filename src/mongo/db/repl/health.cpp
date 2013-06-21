@@ -1,5 +1,6 @@
 /**
 *    Copyright (C) 2008 10gen Inc.
+*    Copyright (C) 2013 Tokutek Inc.
 *
 *    This program is free software: you can redistribute it and/or  modify
 *    it under the terms of the GNU Affero General Public License, version 3,
@@ -25,7 +26,6 @@
 #include "../../util/mongoutils/html.h"
 #include "../../util/goodies.h"
 #include "../../util/ramlog.h"
-#include "../helpers/dblogger.h"
 #include "connections.h"
 #include "../../util/startup_test.h"
 #include "../dbhelpers.h"
@@ -135,6 +135,8 @@ namespace mongo {
         ss << "<tr>";
 
         set<string> skip;
+        // we save ts as a timestamp, so even though we don't really
+        // use OpTimes anymore, this code is fine
         be e = op["ts"];
         if( e.type() == Date || e.type() == Timestamp ) {
             OpTime ot = e._opTime();
@@ -204,6 +206,8 @@ namespace mongo {
         ss << table(h, true);
         //ss << "<pre>\n";
         int n = 0;
+        // we save ts as a timestamp, so even though we don't really
+        // use OpTimes anymore, this code is fine
         OpTime otFirst;
         OpTime otLast;
         OpTime otEnd;
@@ -384,6 +388,7 @@ namespace mongo {
             bb.append("uptime", (unsigned)(time(0) - cmdLine.started));
             if (!_self->config().arbiterOnly) {
                 bb.appendDate("optimeDate", gtidManager->getCurrTimestamp());
+                bb.append("lastGTID", gtidManager->getLiveState().toString());
             }
 
             int maintenance = _maintenanceMode;
@@ -418,6 +423,7 @@ namespace mongo {
             bb.append("uptime", (unsigned) (m->hbinfo().upSince ? (time(0)-m->hbinfo().upSince) : 0));
             if (!m->config().arbiterOnly) {
                 bb.appendDate("optimeDate", m->hbinfo().opTime);
+                bb.append("lastGTID", m->hbinfo().gtid.toString());
             }
             bb.appendTimeT("lastHeartbeat", m->hbinfo().lastHeartbeat);
             bb.append("pingMs", m->hbinfo().ping);

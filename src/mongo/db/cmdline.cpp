@@ -2,6 +2,7 @@
 
 /**
 *    Copyright (C) 2008 10gen Inc.
+*    Copyright (C) 2013 Tokutek Inc.
 *
 *    This program is free software: you can redistribute it and/or  modify
 *    it under the terms of the GNU Affero General Public License, version 3,
@@ -532,6 +533,8 @@ namespace mongo {
                         b.appendNumber(key, (long long)value.as<long>());
                     else if (type == typeid(unsigned))
                         b.appendNumber(key, (long long)value.as<unsigned>());
+                    else if (type == typeid(unsigned long))
+                        b.appendNumber(key, (unsigned long)value.as<unsigned long>());
                     else if (type == typeid(unsigned long long))
                         b.appendNumber(key, (long long)value.as<unsigned long long>());
                     else if (type == typeid(vector<string>))
@@ -584,13 +587,11 @@ namespace mongo {
 #endif
     }
 
-    class CmdGetCmdLineOpts : Command {
+    class CmdGetCmdLineOpts : InformationCommand {
     public:
-        CmdGetCmdLineOpts(): Command("getCmdLineOpts") {}
+        CmdGetCmdLineOpts(): InformationCommand("getCmdLineOpts", false) {}
         void help(stringstream& h) const { h << "get argv"; }
-        virtual LockType locktype() const { return NONE; }
         virtual bool adminOnly() const { return true; }
-        virtual bool slaveOk() const { return true; }
 
         virtual bool run(const string&, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
             result.append("argv", argvArray);

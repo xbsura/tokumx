@@ -2,6 +2,7 @@
 
 /**
  *    Copyright (C) 2008 10gen Inc.
+ *    Copyright (C) 2013 Tokutek Inc.
  *
  *    This program is free software: you can redistribute it and/or  modify
  *    it under the terms of the GNU Affero General Public License, version 3,
@@ -19,13 +20,11 @@
 #include <boost/thread/thread.hpp>
 
 #include "mongo/db/cursor.h"
-#include "mongo/db/db.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/json.h"
 #include "mongo/db/ops/count.h"
 #include "mongo/db/ops/delete.h"
 #include "mongo/db/ops/insert.h"
-#include "mongo/db/db_flags.h"
 
 #include "mongo/dbtests/dbtests.h"
 
@@ -40,8 +39,8 @@ namespace CountTests {
         }
         ~Base() {
             try {
-                boost::shared_ptr<Cursor> c = Helpers::findTableScan( ns(), BSONObj() );
-                for(; c->ok(); c->advance() ) {
+                for( boost::shared_ptr<Cursor> c( BasicCursor::make( nsdetails(ns()) ) );
+                     c->ok(); c->advance() ) {
                     deleteOneObject( nsdetails(ns()) , &NamespaceDetailsTransient::get(ns()), c->currPK(), c->current() );
                 }
                 _transaction.commit();
@@ -70,7 +69,7 @@ namespace CountTests {
             insert( fromjson( s ) );
         }
         static void insert( const BSONObj &o ) {
-            insertObject( ns(), o, ND_UNIQUE_CHECKS_OFF );
+            insertObject( ns(), o, NamespaceDetails::NO_UNIQUE_CHECKS );
         }
         static BSONObj countCommand( const BSONObj &query ) {
             return BSON( "query" << query );
@@ -84,7 +83,7 @@ namespace CountTests {
             BSONObj cmd = fromjson( "{\"query\":{}}" );
             string err;
             int errCode;
-            ASSERT_EQUALS( 1, Helpers::runCount( ns(), cmd, err, errCode ) );
+            ASSERT_EQUALS( 1, runCount( ns(), cmd, err, errCode ) );
         }
     };
     
@@ -97,7 +96,7 @@ namespace CountTests {
             BSONObj cmd = fromjson( "{\"query\":{\"a\":\"b\"}}" );
             string err;
             int errCode;
-            ASSERT_EQUALS( 2, Helpers::runCount( ns(), cmd, err, errCode ) );
+            ASSERT_EQUALS( 2, runCount( ns(), cmd, err, errCode ) );
         }
     };
     
@@ -109,7 +108,7 @@ namespace CountTests {
             BSONObj cmd = fromjson( "{\"query\":{},\"fields\":{\"a\":1}}" );
             string err;
             int errCode;
-            ASSERT_EQUALS( 2, Helpers::runCount( ns(), cmd, err, errCode ) );
+            ASSERT_EQUALS( 2, runCount( ns(), cmd, err, errCode ) );
         }
     };
     
@@ -122,7 +121,7 @@ namespace CountTests {
             BSONObj cmd = fromjson( "{\"query\":{\"a\":\"b\"},\"fields\":{\"a\":1}}" );
             string err;
             int errCode;
-            ASSERT_EQUALS( 1, Helpers::runCount( ns(), cmd, err, errCode ) );
+            ASSERT_EQUALS( 1, runCount( ns(), cmd, err, errCode ) );
         }
     };
     
@@ -134,7 +133,7 @@ namespace CountTests {
             BSONObj cmd = fromjson( "{\"query\":{\"a\":/^b/}}" );
             string err;
             int errCode;
-            ASSERT_EQUALS( 1, Helpers::runCount( ns(), cmd, err, errCode ) );
+            ASSERT_EQUALS( 1, runCount( ns(), cmd, err, errCode ) );
         }
     };
 

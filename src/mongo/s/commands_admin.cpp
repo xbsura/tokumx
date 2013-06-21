@@ -2,6 +2,7 @@
 
 /**
 *    Copyright (C) 2008 10gen Inc.
+*    Copyright (C) 2013 Tokutek Inc.
 *
 *    This program is free software: you can redistribute it and/or  modify
 *    it under the terms of the GNU Affero General Public License, version 3,
@@ -55,19 +56,13 @@ namespace mongo {
 
     namespace dbgrid_cmds {
 
-        class GridAdminCmd : public Command {
+        class GridAdminCmd : public InformationCommand {
         public:
-            GridAdminCmd( const char * n ) : Command( n , false, tolowerString(n).c_str() ) {
-            }
-            virtual bool slaveOk() const {
-                return true;
+            GridAdminCmd( const char * n ) : InformationCommand( n , false, tolowerString(n).c_str() ) {
             }
             virtual bool adminOnly() const {
                 return true;
             }
-
-            // all grid commands are designed not to lock
-            virtual LockType locktype() const { return NONE; }
 
             bool okForConfigChanges( string& errmsg ) {
                 string e;
@@ -113,19 +108,16 @@ namespace mongo {
         } flushRouterConfigCmd;
 
 
-        class ServerStatusCmd : public Command {
+        class ServerStatusCmd : public InformationCommand {
         public:
-            ServerStatusCmd() : Command( "serverStatus" , true ) {
+            ServerStatusCmd() : InformationCommand( "serverStatus" , true ) {
                 _started = time(0);
             }
 
-            virtual bool slaveOk() const { return true; }
-            virtual LockType locktype() const { return NONE; }
-
             bool run(const string& , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
                 result.append( "host" , prettyHostName() );
-                result.append("version", versionString);
-                result.append("tokutekPatchVersion", tokutekPatchVersionString);
+                result.append("version", mongodbVersionString);
+                result.append("tokumxVersion", tokumxVersionString);
                 result.append("process","mongos");
                 result.append("uptime",(double) (time(0)-_started));
                 result.appendDate( "localTime" , jsTime() );
@@ -609,6 +601,36 @@ namespace mongo {
                     BSONObj currentKey = idx["key"].embeddedObject();
                     // Check 2.i. and 2.ii.
                     if ( ! idx["sparse"].trueValue() && proposedKey.isPrefixOf( currentKey ) ) {
+                        BSONElement ce = cmdObj["clustering"];
+                        if (idx["clustering"].trueValue()) {
+                            if (ce.ok() && !ce.trueValue()) {
+                                stringstream ss;
+                                ss << "key " << currentKey << " is clustering, but a non-clustering key was requested.";
+                                errmsg = ss.str();
+                                conn->done();
+                                return false;
+                            }
+                        }
+                        else {
+                            if (ce.ok() && !ce.trueValue()) {
+                                LOG(0) << "WARNING: Sharding " << ns << " on non-clustering key " << currentKey
+                                       << ". This may lead to poor performance of migrations and range queries." << endl;
+                            }
+                            else {
+                                stringstream ss;
+                                ss << "Sharding " << ns << " on the non-clustering key " << currentKey
+                                   << " may lead to poor performance of migrations and range queries."
+                                   << " Either consider sharding on a different key (with a clustering index)"
+                                   << " or drop the index " << currentKey << " and re-create it as a"
+                                   << " clustering index. If you are sure you want to shard on a non-clustering"
+                                   << " index, try again with sh.shardCollection(\"" << ns << "\", {key: "
+                                   << currentKey << ", clustering: false}).";
+                                errmsg = ss.str();
+                                LOG(0) << ss.str() << endl;
+                                conn->done();
+                                return false;
+                            }
+                        }
                         hasUsefulIndexForKey = true;
                     }
                 }
@@ -652,7 +674,7 @@ namespace mongo {
                 }
                 // 4. if no useful index, and collection is non-empty, fail
                 else if ( conn->get()->count( ns ) != 0 ) {
-                    errmsg = str::stream() << "please create an index that starts with the "
+                    errmsg = str::stream() << "please create a clustering index that starts with the "
                                            << "shard key before sharding.";
                     result.append( "proposedKey" , proposedKey );
                     result.appendArray( "curIndexes" , allIndexes.done() );
@@ -663,12 +685,15 @@ namespace mongo {
                 //    Only need to call ensureIndex on primary shard, since indexes get copied to
                 //    receiving shard whenever a migrate occurs.
                 else {
+                    BSONElement ce = cmdObj["clustering"];
+                    bool clustering = (ce.ok() ? ce.trueValue() : true);
                     // call ensureIndex with cache=false, see SERVER-1691
-                    bool ensureSuccess = conn->get()->ensureIndex( ns ,
-                                                                   proposedKey ,
-                                                                   careAboutUnique ,
-                                                                   "" ,
-                                                                   false );
+                    bool ensureSuccess = conn->get()->ensureIndex(ns,
+                                                                  proposedKey,
+                                                                  careAboutUnique,
+                                                                  clustering,
+                                                                  "",
+                                                                  false);
                     if ( ! ensureSuccess ) {
                         errmsg = "ensureIndex failed to create index on primary shard";
                         conn->done();
@@ -676,13 +701,130 @@ namespace mongo {
                     }
                 }
 
+                bool isEmpty = ( conn->get()->count( ns ) == 0 );
+
                 conn->done();
+
+                // Pre-splitting:
+                // For new collections which use hashed shard keys, we can can pre-split the
+                // range of possible hashes into a large number of chunks, and distribute them
+                // evenly at creation time. Until we design a better initialization scheme, the
+                // safest way to pre-split is to
+                // 1. make one big chunk for each shard
+                // 2. move them one at a time
+                // 3. split the big chunks to achieve the desired total number of initial chunks
+
+                vector<Shard> shards;
+                Shard primary = config->getPrimary();
+                primary.getAllShards( shards );
+                int numShards = shards.size();
+
+                vector<BSONObj> initSplits;  // there will be at most numShards-1 of these
+                vector<BSONObj> allSplits;   // all of the initial desired split points
+
+                bool isHashedShardKey =
+                        str::equals(proposedKey.firstElement().valuestrsafe(), "hashed");
+
+                // only pre-split when using a hashed shard key and collection is still empty
+                if ( isHashedShardKey && isEmpty ){
+
+                    int numChunks = cmdObj["numInitialChunks"].numberInt();
+                    if ( numChunks <= 0 )
+                        numChunks = 2*numShards;  // default number of initial chunks
+
+                    // hashes are signed, 64-bit ints. So we divide the range (-MIN long, +MAX long)
+                    // into intervals of size (2^64/numChunks) and create split points at the
+                    // boundaries.  The logic below ensures that initial chunks are all
+                    // symmetric around 0.
+                    long long intervalSize = ( std::numeric_limits<long long>::max()/ numChunks )*2;
+                    long long current = 0;
+                    if( numChunks % 2 == 0 ){
+                        allSplits.push_back( BSON(proposedKey.firstElementFieldName() << current) );
+                        current += intervalSize;
+                    } else {
+                        current += intervalSize/2;
+                    }
+                    for( int i=0; i < (numChunks-1)/2; i++ ){
+                        allSplits.push_back( BSON(proposedKey.firstElementFieldName() << current) );
+                        allSplits.push_back( BSON(proposedKey.firstElementFieldName() << -current));
+                        current += intervalSize;
+                    }
+                    sort( allSplits.begin() , allSplits.end() );
+
+                    // 1. the initial splits define the "big chunks" that we will subdivide later
+                    int lastIndex = -1;
+                    for ( int i = 1; i < numShards; i++ ){
+                        if ( lastIndex < (i*numChunks)/numShards - 1 ){
+                            lastIndex = (i*numChunks)/numShards - 1;
+                            initSplits.push_back( allSplits[ lastIndex ] );
+                        }
+                    }
+                }
 
                 tlog() << "CMD: shardcollection: " << cmdObj << endl;
 
-                config->shardCollection( ns , proposedKey , careAboutUnique );
+                config->shardCollection( ns , proposedKey , careAboutUnique , &initSplits );
 
                 result << "collectionsharded" << ns;
+
+                // only initially move chunks when using a hashed shard key
+                if (isHashedShardKey) {
+
+                    // Reload the new config info.  If we created more than one initial chunk, then
+                    // we need to move them around to balance.
+                    ChunkManagerPtr chunkManager = config->getChunkManager( ns , true );
+                    ChunkMap chunkMap = chunkManager->getChunkMap();
+                    if ( chunkMap.size() == 1 )
+                        return true;
+
+                    // 2. Move and commit each "big chunk" to a different shard.
+                    int i = 0;
+                    for ( ChunkMap::const_iterator c = chunkMap.begin(); c != chunkMap.end(); ++c,++i ){
+                        Shard to = shards[ i % numShards ];
+                        ChunkPtr chunk = c->second;
+
+                        // can't move chunk to shard it's already on
+                        if ( to == chunk->getShard() )
+                            continue;
+
+                        BSONObj moveResult;
+                        if ( ! chunk->moveAndCommit( to , moveResult ) ) {
+                            warning() << "Couldn't move chunk " << chunk << " to shard "  << to
+                                      << " while sharding collection " << ns << ". Reason: "
+                                      <<  moveResult << endl;
+                        }
+                    }
+
+                    // Reload the config info, after all the migrations
+                    chunkManager = config->getChunkManager( ns , true );
+
+                    // 3. Subdivide the big chunks by splitting at each of the points in "allSplits"
+                    //    that we haven't already split by.
+                    ChunkPtr currentChunk = chunkManager->findIntersectingChunk( allSplits[0] );
+                    vector<BSONObj> subSplits;
+                    for ( unsigned i = 0 ; i <= allSplits.size(); i++){
+                        if ( i == allSplits.size() || ! currentChunk->containsPoint( allSplits[i] ) ) {
+                            if ( ! subSplits.empty() ){
+                                BSONObj splitResult;
+                                if ( ! currentChunk->multiSplit( subSplits , splitResult ) ){
+                                    warning() << "Couldn't split chunk " << currentChunk
+                                              << " while sharding collection " << ns << ". Reason: "
+                                              << splitResult << endl;
+                                }
+                                subSplits.clear();
+                            }
+                            if ( i < allSplits.size() )
+                                currentChunk = chunkManager->findIntersectingChunk( allSplits[i] );
+                        } else {
+                            subSplits.push_back( allSplits[i] );
+                        }
+                    }
+
+                    // Proactively refresh the chunk manager. Not really necessary, but this way it's
+                    // immediately up-to-date the next time it's used.
+                    config->getChunkManager( ns , true );
+                }
+
                 return true;
             }
         } shardCollectionCmd;
@@ -856,12 +998,6 @@ namespace mongo {
 
                 Shard to = Shard::make( toString );
 
-                // so far, chunk size serves test purposes; it may or may not become a supported parameter
-                long long maxChunkSizeBytes = cmdObj["maxChunkSizeBytes"].numberLong();
-                if ( maxChunkSizeBytes == 0 ) {
-                    maxChunkSizeBytes = Chunk::MaxChunkSize;
-                }
-
                 tlog() << "CMD: movechunk: " << cmdObj << endl;
 
                 ChunkManagerPtr info = config->getChunkManager( ns );
@@ -874,7 +1010,7 @@ namespace mongo {
                 }
 
                 BSONObj res;
-                if ( ! c->moveAndCommit( to , maxChunkSizeBytes , cmdObj["_secondaryThrottle"].trueValue() , res ) ) {
+                if ( ! c->moveAndCommit(to, res) ) {
                     errmsg = "move failed";
                     result.append( "cause" , res );
                     return false;
@@ -1124,14 +1260,10 @@ namespace mongo {
 
         // --------------- public commands ----------------
 
-        class IsDbGridCmd : public Command {
+        class IsDbGridCmd : public InformationCommand {
         public:
-            virtual LockType locktype() const { return NONE; }
             virtual bool requiresAuth() { return false; }
-            virtual bool slaveOk() const {
-                return true;
-            }
-            IsDbGridCmd() : Command("isdbgrid") { }
+            IsDbGridCmd() : InformationCommand("isdbgrid", false) { }
             bool run(const string& , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
                 result.append("isdbgrid", 1);
                 result.append("hostname", getHostNameCached());
@@ -1139,17 +1271,13 @@ namespace mongo {
             }
         } isdbgrid;
 
-        class CmdIsMaster : public Command {
+        class CmdIsMaster : public InformationCommand {
         public:
-            virtual LockType locktype() const { return NONE; }
             virtual bool requiresAuth() { return false; }
-            virtual bool slaveOk() const {
-                return true;
-            }
             virtual void help( stringstream& help ) const {
                 help << "test if this is master half of a replica pair";
             }
-            CmdIsMaster() : Command("isMaster" , false , "ismaster") { }
+            CmdIsMaster() : InformationCommand("isMaster" , false , "ismaster") { }
             virtual bool run(const string& , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
                 result.appendBool("ismaster", true );
                 result.append("msg", "isdbgrid");
@@ -1158,16 +1286,9 @@ namespace mongo {
             }
         } ismaster;
 
-        class CmdWhatsMyUri : public Command {
+        class CmdWhatsMyUri : public InformationCommand {
         public:
-            CmdWhatsMyUri() : Command("whatsmyuri") { }
-            virtual bool logTheOp() {
-                return false; // the modification will be logged directly
-            }
-            virtual bool slaveOk() const {
-                return true;
-            }
-            virtual LockType locktype() const { return NONE; }
+            CmdWhatsMyUri() : InformationCommand("whatsmyuri", false) { }
             virtual void help( stringstream &help ) const {
                 help << "{whatsmyuri:1}";
             }
@@ -1178,34 +1299,25 @@ namespace mongo {
         } cmdWhatsMyUri;
 
 
-        class CmdShardingGetPrevError : public Command {
+        class CmdShardingGetPrevError : public InformationCommand {
         public:
-            virtual LockType locktype() const { return NONE; }
             virtual bool requiresAuth() { return false; }
-
-            virtual bool slaveOk() const {
-                return true;
-            }
             virtual void help( stringstream& help ) const {
                 help << "get previous error (since last reseterror command)";
             }
-            CmdShardingGetPrevError() : Command( "getPrevError" , false , "getpreverror") { }
+            CmdShardingGetPrevError() : InformationCommand( "getPrevError" , false , "getpreverror") { }
             virtual bool run(const string& , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
                 errmsg += "getpreverror not supported for sharded environments";
                 return false;
             }
         } cmdGetPrevError;
 
-        class CmdShardingGetLastError : public Command {
+        class CmdShardingGetLastError : public InformationCommand {
         public:
-            virtual LockType locktype() const { return NONE; }
-            virtual bool slaveOk() const {
-                return true;
-            }
             virtual void help( stringstream& help ) const {
                 help << "check for an error on the last command executed";
             }
-            CmdShardingGetLastError() : Command("getLastError" , false , "getlasterror") { }
+            CmdShardingGetLastError() : InformationCommand("getLastError" , false , "getlasterror") { }
 
             virtual bool run(const string& dbName, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
                 LastError *le = lastError.disableForCommand();
@@ -1225,14 +1337,9 @@ namespace mongo {
 
     }
 
-    class CmdShardingResetError : public Command {
+    class CmdShardingResetError : public InformationCommand {
     public:
-        CmdShardingResetError() : Command( "resetError" , false , "reseterror" ) {}
-
-        virtual LockType locktype() const { return NONE; }
-        virtual bool slaveOk() const {
-            return true;
-        }
+        CmdShardingResetError() : InformationCommand( "resetError" , false , "reseterror" ) {}
 
         bool run(const string& dbName , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool /*fromRepl*/) {
             LastError *le = lastError.get();
@@ -1254,15 +1361,12 @@ namespace mongo {
         }
     } cmdShardingResetError;
 
-    class CmdListDatabases : public Command {
+    class CmdListDatabases : public InformationCommand {
     public:
-        CmdListDatabases() : Command("listDatabases", true , "listdatabases" ) {}
+        CmdListDatabases() : InformationCommand("listDatabases", true, "listdatabases") {}
 
         virtual bool logTheOp() { return false; }
-        virtual bool slaveOk() const { return true; }
-        virtual bool slaveOverrideOk() const { return true; }
         virtual bool adminOnly() const { return true; }
-        virtual LockType locktype() const { return NONE; }
         virtual void help( stringstream& help ) const { help << "list databases on cluster"; }
 
         bool run(const string& , BSONObj& jsobj, int, string& errmsg, BSONObjBuilder& result, bool /*fromRepl*/) {
@@ -1380,14 +1484,11 @@ namespace mongo {
 
     } cmdListDatabases;
 
-    class CmdCloseAllDatabases : public Command {
+    class CmdCloseAllDatabases : public InformationCommand {
     public:
-        CmdCloseAllDatabases() : Command("closeAllDatabases", false , "closeAllDatabases" ) {}
+        CmdCloseAllDatabases() : InformationCommand("closeAllDatabases", false) {}
         virtual bool logTheOp() { return false; }
-        virtual bool slaveOk() const { return true; }
-        virtual bool slaveOverrideOk() const { return true; }
         virtual bool adminOnly() const { return true; }
-        virtual LockType locktype() const { return NONE; }
         virtual void help( stringstream& help ) const { help << "Not supported sharded"; }
 
         bool run(const string& , BSONObj& jsobj, int, string& errmsg, BSONObjBuilder& /*result*/, bool /*fromRepl*/) {
@@ -1397,13 +1498,11 @@ namespace mongo {
     } cmdCloseAllDatabases;
 
 
-    class CmdReplSetGetStatus : public Command {
+    class CmdReplSetGetStatus : public InformationCommand {
     public:
-        CmdReplSetGetStatus() : Command("replSetGetStatus"){}
+        CmdReplSetGetStatus() : InformationCommand("replSetGetStatus", false){}
         virtual bool logTheOp() { return false; }
-        virtual bool slaveOk() const { return true; }
         virtual bool adminOnly() const { return true; }
-        virtual LockType locktype() const { return NONE; }
         virtual void help( stringstream& help ) const { help << "Not supported through mongos"; }
 
         bool run(const string& , BSONObj& jsobj, int, string& errmsg, BSONObjBuilder& result, bool /*fromRepl*/) {

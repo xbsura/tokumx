@@ -2,6 +2,7 @@
 
 /**
 *    Copyright (C) 2009 10gen Inc.
+*    Copyright (C) 2013 Tokutek Inc.
 *
 *    This program is free software: you can redistribute it and/or  modify
 *    it under the terms of the GNU Affero General Public License, version 3,
@@ -40,6 +41,11 @@ namespace mongo {
         shared_ptr<TxnContext> txn_to_commit = _txns.top();
         txn_to_commit->commit(flags);
         _txns.pop();
+    }
+
+    void Client::TransactionStack::commitTxn() {
+        int flags = (cmdLine.logFlushPeriod == 0) ? 0 : DB_TXN_NOSYNC;
+        commitTxn(flags);
     }
 
     void Client::TransactionStack::abortTxn() {
@@ -98,6 +104,16 @@ namespace mongo {
         dassert(_txn == &(stack->txn()));
         dassert(_txn->isLive());
         stack->commitTxn(flags);
+        _txn = NULL;
+    }
+
+    void Client::Transaction::commit() {
+        dassert(_txn != NULL);
+        Client::TransactionStack *stack = cc()._transactions.get();
+        dassert(stack != NULL);
+        dassert(_txn == &(stack->txn()));
+        dassert(_txn->isLive());
+        stack->commitTxn();
         _txn = NULL;
     }
 

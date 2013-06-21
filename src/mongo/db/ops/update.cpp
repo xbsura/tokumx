@@ -2,6 +2,7 @@
 
 /**
  *    Copyright (C) 2008 10gen Inc.
+ *    Copyright (C) 2013 Tokutek Inc.
  *
  *    This program is free software: you can redistribute it and/or  modify
  *    it under the terms of the GNU Affero General Public License, version 3,
@@ -21,13 +22,12 @@
 #include "mongo/client/dbclientinterface.h"
 #include "mongo/db/oplog.h"
 #include "mongo/db/queryutil.h"
+#include "mongo/db/namespace_details.h"
 #include "mongo/db/ops/insert.h"
 #include "mongo/db/ops/delete.h"
 #include "mongo/db/ops/update.h"
 #include "mongo/db/ops/update_internal.h"
 #include "mongo/db/oplog_helpers.h"
-#include "mongo/db/db_flags.h"
-
 
 namespace mongo {
 
@@ -37,21 +37,22 @@ namespace mongo {
         const BSONObj &pk, 
         const BSONObj &oldObj, 
         const BSONObj &newObj, 
-        struct LogOpUpdateDetails* loud
+        struct LogOpUpdateDetails* loud,
+        uint64_t flags
         ) 
     {
-        if (loud->logop) {
+        BSONObj newObjModified = newObj;
+        d->updateObject(pk, oldObj, newObjModified, flags);
+        if (loud && loud->logop) {
             OpLogHelpers::logUpdate(
                 loud->ns,
                 pk,
                 oldObj,
-                newObj,
+                newObjModified,
                 loud->fromMigrate,
                 &cc().txn()
                 );
         }
-
-        d->updateObject( pk, oldObj, newObj );
         if (nsdt != NULL) {
             nsdt->notifyOfWriteOp();
         }
@@ -92,12 +93,15 @@ namespace mongo {
     }
 
     static void insertAndLog(const char *ns, NamespaceDetails *d, NamespaceDetailsTransient *nsdt,
-            BSONObj &newObj, bool overwrite, bool logop, bool fromMigrate) {
+            BSONObj &newObj, bool logop, bool fromMigrate) {
 
         checkNoMods( newObj );
         TOKULOG(3) << "insertAndLog for upsert: " << newObj << endl;
 
-        insertOneObject(d, nsdt, newObj, overwrite ? ND_UNIQUE_CHECKS_OFF : 0);
+        // We cannot pass NamespaceDetails::NO_UNIQUE_CHECKS because we still need to check secondary indexes.
+        // We know if we are in this function that we did a query for the object and it didn't exist yet, so the unique check on the PK won't fail.
+        // To prove this to yourself, look at the callers of insertAndLog and see that they return an UpdateResult that says the object didn't exist yet.
+        insertOneObject(d, nsdt, newObj);
         if (logop) {
             OpLogHelpers::logInsert(ns, newObj, &cc().txn());
         }
@@ -173,8 +177,7 @@ namespace mongo {
         return UpdateResult( 1 , 0 , 1 , BSONObj() );
     }
 
-    UpdateResult _updateObjects( bool su,
-                                 const char* ns,
+    UpdateResult _updateObjects( const char* ns,
                                  const BSONObj& updateobj,
                                  const BSONObj& patternOrig,
                                  bool upsert,
@@ -191,196 +194,185 @@ namespace mongo {
 
         debug.updateobj = updateobj;
 
-        const bool collIsNew = nsdetails(ns) == NULL;
         NamespaceDetails *d = getAndMaybeCreateNS(ns, logop);
-        try {
-            NamespaceDetailsTransient *nsdt = &NamespaceDetailsTransient::get(ns);
+        NamespaceDetailsTransient *nsdt = &NamespaceDetailsTransient::get(ns);
 
-            auto_ptr<ModSet> mods;
-            const bool isOperatorUpdate = updateobj.firstElementFieldName()[0] == '$';
-            bool modsAreIndexed = false;
+        auto_ptr<ModSet> mods;
+        const bool isOperatorUpdate = updateobj.firstElementFieldName()[0] == '$';
+        bool modsAreIndexed = false;
 
-            if ( isOperatorUpdate ) {
-                if ( d->indexBuildInProgress() ) {
-                    set<string> bgKeys;
-                    d->inProgIdx().keyPattern().getFieldNames(bgKeys);
-                    mods.reset( new ModSet(updateobj, nsdt->indexKeys(), &bgKeys) );
-                }
-                else {
-                    mods.reset( new ModSet(updateobj, nsdt->indexKeys()) );
-                }
-                modsAreIndexed = mods->isIndexed();
+        if ( isOperatorUpdate ) {
+            if ( d->indexBuildInProgress() ) {
+                set<string> bgKeys;
+                d->inProgIdx().keyPattern().getFieldNames(bgKeys);
+                mods.reset( new ModSet(updateobj, nsdt->indexKeys(), &bgKeys) );
             }
-
-
-            int idIdxNo = -1;
-            if ( planPolicy.permitOptimalIdPlan() && !multi && !modsAreIndexed &&
-                 (idIdxNo = d->findIdIndex()) >= 0 && mayUpdateById(d, patternOrig) ) {
-                debug.idhack = true;
-                IndexDetails &idx = d->idx(idIdxNo);
-                BSONObj pk = idx.getKeyFromQuery(patternOrig);
-                TOKULOG(3) << "_updateObjects using simple _id query, pattern " << patternOrig << ", pk " << pk << endl;
-                UpdateResult result = _updateById( pk,
-                                                   isOperatorUpdate,
-                                                   mods.get(),
-                                                   d,
-                                                   nsdt,
-                                                   ns,
-                                                   updateobj,
-                                                   patternOrig,
-                                                   logop,
-                                                   debug,
-                                                   fromMigrate);
-                if ( result.existing || ! upsert ) {
-                    return result;
-                }
-                else if ( upsert && ! isOperatorUpdate && ! logop) {
-                    // this handles repl inserts
-                    checkNoMods( updateobj );
-                    debug.upsert = true;
-                    BSONObj objModified = updateobj;
-                    insertOneObject( d, nsdt, objModified, upsert ? ND_UNIQUE_CHECKS_OFF : 0);
-                    return UpdateResult( 0 , 0 , 1 , updateobj );
-                }
+            else {
+                mods.reset( new ModSet(updateobj, nsdt->indexKeys()) );
             }
+            modsAreIndexed = mods->isIndexed();
+        }
 
-            int numModded = 0;
-            debug.nscanned = 0;
-            shared_ptr<Cursor> c =
-                    NamespaceDetailsTransient::getCursor( ns, patternOrig, BSONObj(), planPolicy );
 
-            if( c->ok() ) {
-                set<BSONObj> seenObjects;
-                MatchDetails details;
-                auto_ptr<ClientCursor> cc;
-                do {
-
-                    debug.nscanned++;
-
-                    if ( mods.get() && mods->hasDynamicArray() ) {
-                        // The Cursor must have a Matcher to record an elemMatchKey.  But currently
-                        // a modifier on a dynamic array field may be applied even if there is no
-                        // elemMatchKey, so a matcher cannot be required.
-                        //verify( c->matcher() );
-                        details.requestElemMatchKey();
-                    }
-
-                    if ( !c->currentMatches( &details ) ) {
-                        c->advance();
-                        continue;
-                    }
-
-                    BSONObj currPK = c->currPK();
-                    if ( c->getsetdup( currPK ) ) {
-                        c->advance();
-                        continue;
-                    }
-
-                    BSONObj currentObj = c->current();
-                    BSONObj pattern = patternOrig;
-
-                    if ( logop ) {
-                        BSONObjBuilder idPattern;
-                        BSONElement id;
-                        // NOTE: If the matching object lacks an id, we'll log
-                        // with the original pattern.  This isn't replay-safe.
-                        // It might make sense to suppress the log instead
-                        // if there's no id.
-                        if ( currentObj.getObjectID( id ) ) {
-                            idPattern.append( id );
-                            pattern = idPattern.obj();
-                        }
-                        else {
-                            uassert( 10157 ,  "multi-update requires all modified objects to have an _id" , ! multi );
-                        }
-                    }
-
-                    /* look for $inc etc.  note as listed here, all fields to inc must be this type, you can't set some
-                       regular ones at the moment. */
-                    struct LogOpUpdateDetails loud;
-                    loud.logop = logop;
-                    loud.ns = ns;
-                    loud.fromMigrate = fromMigrate;
-                    if ( isOperatorUpdate ) {
-
-                        if ( multi ) {
-                            // Make our own copies of the currPK and currentObj before we invalidate
-                            // them by advancing the cursor.
-                            currPK = currPK.copy();
-                            currentObj = currentObj.copy();
-
-                            // Advance past the document to be modified. This used to be because of SERVER-5198,
-                            // but TokuDB does it because we want to avoid needing to do manual deduplication
-                            // of this PK on the next iteration if the current update modifies the next
-                            // entry in the index. For example, an index scan over a:1 with mod {$inc: {a:1}}
-                            // would cause every other key read to be a duplicate if we didn't advance here.
-                            while ( c->ok() && currPK == c->currPK() ) {
-                                c->advance();
-                            }
-
-                            // Multi updates need to do their own deduplication because updates may modify the
-                            // keys the cursor is in the process of scanning over.
-                            if ( seenObjects.count( currPK ) ) {
-                                continue;
-                            } else {
-                                seenObjects.insert( currPK );
-                            }
-                        }
-
-                        ModSet* useMods = mods.get();
-
-                        auto_ptr<ModSet> mymodset;
-                        if ( details.hasElemMatchKey() && mods->hasDynamicArray() ) {
-                            useMods = mods->fixDynamicArray( details.elemMatchKey() );
-                            mymodset.reset( useMods );
-                        }
-
-                        auto_ptr<ModSetState> mss = useMods->prepare( currentObj );
-                        updateUsingMods( d, nsdt, currPK, currentObj, *mss, &loud );
-
-                        numModded++;
-                        if ( ! multi )
-                            return UpdateResult( 1 , 1 , numModded , BSONObj() );
-
-                        continue;
-                    } // end if operator is update
-
-                    uassert( 10158 ,  "multi update only works with $ operators" , ! multi );
-
-                    updateNoMods( d, nsdt, currPK, currentObj, updateobj, &loud );
-
-                    return UpdateResult( 1 , 0 , 1 , BSONObj() );
-                } while ( c->ok() );
-            } // endif
-
-            if ( numModded )
-                return UpdateResult( 1 , 1 , numModded , BSONObj() );
-
-            if ( upsert ) {
-                BSONObj newObj = updateobj;
-                if ( updateobj.firstElementFieldName()[0] == '$' ) {
-                    // upsert of an $operation. build a default object
-                    BSONObj newObj = mods->createNewFromQuery( patternOrig );
-                    debug.fastmodinsert = true;
-                    insertAndLog( ns, d, nsdt, newObj, upsert, logop, fromMigrate );
-                    return UpdateResult( 0 , 1 , 1 , newObj );
-                }
-                uassert( 10159 ,  "multi update only works with $ operators" , ! multi );
+        int idIdxNo = -1;
+        if ( planPolicy.permitOptimalIdPlan() && !multi && !modsAreIndexed &&
+             (idIdxNo = d->findIdIndex()) >= 0 && mayUpdateById(d, patternOrig) ) {
+            debug.idhack = true;
+            IndexDetails &idx = d->idx(idIdxNo);
+            BSONObj pk = idx.getKeyFromQuery(patternOrig);
+            TOKULOG(3) << "_updateObjects using simple _id query, pattern " << patternOrig << ", pk " << pk << endl;
+            UpdateResult result = _updateById( pk,
+                                               isOperatorUpdate,
+                                               mods.get(),
+                                               d,
+                                               nsdt,
+                                               ns,
+                                               updateobj,
+                                               patternOrig,
+                                               logop,
+                                               debug,
+                                               fromMigrate);
+            if ( result.existing || ! upsert ) {
+                return result;
+            }
+            else if ( upsert && ! isOperatorUpdate && ! logop) {
+                // this handles repl inserts
+                checkNoMods( updateobj );
                 debug.upsert = true;
-                insertAndLog( ns, d, nsdt, newObj, upsert, logop, fromMigrate );
-                return UpdateResult( 0 , 0 , 1 , newObj );
+                BSONObj objModified = updateobj;
+                insertOneObject( d, nsdt, objModified );
+                return UpdateResult( 0 , 0 , 1 , updateobj );
             }
+        }
 
-            return UpdateResult( 0 , isOperatorUpdate , 0 , BSONObj() );
-        }
-        catch (DBException &e) {
-            if (collIsNew) {
-                // We created the collection above just for this update, but the update failed, so we should also roll back the collection creation.
-                // This has some transaction-ignorant pieces in the NamespaceIndex so we have to manually undo them here.
-                nsindex(ns)->kill_ns(ns);
+        int numModded = 0;
+        debug.nscanned = 0;
+        shared_ptr<Cursor> c =
+                NamespaceDetailsTransient::getCursor( ns, patternOrig, BSONObj(), planPolicy );
+
+        if( c->ok() ) {
+            set<BSONObj> seenObjects;
+            MatchDetails details;
+            auto_ptr<ClientCursor> cc;
+            do {
+
+                debug.nscanned++;
+
+                if ( mods.get() && mods->hasDynamicArray() ) {
+                    // The Cursor must have a Matcher to record an elemMatchKey.  But currently
+                    // a modifier on a dynamic array field may be applied even if there is no
+                    // elemMatchKey, so a matcher cannot be required.
+                    //verify( c->matcher() );
+                    details.requestElemMatchKey();
+                }
+
+                if ( !c->currentMatches( &details ) ) {
+                    c->advance();
+                    continue;
+                }
+
+                BSONObj currPK = c->currPK();
+                if ( c->getsetdup( currPK ) ) {
+                    c->advance();
+                    continue;
+                }
+
+                BSONObj currentObj = c->current();
+                BSONObj pattern = patternOrig;
+
+                if ( logop ) {
+                    BSONObjBuilder idPattern;
+                    BSONElement id;
+                    // NOTE: If the matching object lacks an id, we'll log
+                    // with the original pattern.  This isn't replay-safe.
+                    // It might make sense to suppress the log instead
+                    // if there's no id.
+                    if ( currentObj.getObjectID( id ) ) {
+                        idPattern.append( id );
+                        pattern = idPattern.obj();
+                    }
+                    else {
+                        uassert( 10157 ,  "multi-update requires all modified objects to have an _id" , ! multi );
+                    }
+                }
+
+                /* look for $inc etc.  note as listed here, all fields to inc must be this type, you can't set some
+                   regular ones at the moment. */
+                struct LogOpUpdateDetails loud;
+                loud.logop = logop;
+                loud.ns = ns;
+                loud.fromMigrate = fromMigrate;
+                if ( isOperatorUpdate ) {
+
+                    if ( multi ) {
+                        // Make our own copies of the currPK and currentObj before we invalidate
+                        // them by advancing the cursor.
+                        currPK = currPK.copy();
+                        currentObj = currentObj.copy();
+
+                        // Advance past the document to be modified. This used to be because of SERVER-5198,
+                        // but TokuMX does it because we want to avoid needing to do manual deduplication
+                        // of this PK on the next iteration if the current update modifies the next
+                        // entry in the index. For example, an index scan over a:1 with mod {$inc: {a:1}}
+                        // would cause every other key read to be a duplicate if we didn't advance here.
+                        while ( c->ok() && currPK == c->currPK() ) {
+                            c->advance();
+                        }
+
+                        // Multi updates need to do their own deduplication because updates may modify the
+                        // keys the cursor is in the process of scanning over.
+                        if ( seenObjects.count( currPK ) ) {
+                            continue;
+                        } else {
+                            seenObjects.insert( currPK );
+                        }
+                    }
+
+                    ModSet* useMods = mods.get();
+
+                    auto_ptr<ModSet> mymodset;
+                    if ( details.hasElemMatchKey() && mods->hasDynamicArray() ) {
+                        useMods = mods->fixDynamicArray( details.elemMatchKey() );
+                        mymodset.reset( useMods );
+                    }
+
+                    auto_ptr<ModSetState> mss = useMods->prepare( currentObj );
+                    updateUsingMods( d, nsdt, currPK, currentObj, *mss, &loud );
+
+                    numModded++;
+                    if ( ! multi )
+                        return UpdateResult( 1 , 1 , numModded , BSONObj() );
+
+                    continue;
+                } // end if operator is update
+
+                uassert( 10158 ,  "multi update only works with $ operators" , ! multi );
+
+                updateNoMods( d, nsdt, currPK, currentObj, updateobj, &loud );
+
+                return UpdateResult( 1 , 0 , 1 , BSONObj() );
+            } while ( c->ok() );
+        } // endif
+
+        if ( numModded )
+            return UpdateResult( 1 , 1 , numModded , BSONObj() );
+
+        if ( upsert ) {
+            BSONObj newObj = updateobj;
+            if ( updateobj.firstElementFieldName()[0] == '$' ) {
+                // upsert of an $operation. build a default object
+                BSONObj newObj = mods->createNewFromQuery( patternOrig );
+                debug.fastmodinsert = true;
+                insertAndLog( ns, d, nsdt, newObj, logop, fromMigrate );
+                return UpdateResult( 0 , 1 , 1 , newObj );
             }
-            throw;
+            uassert( 10159 ,  "multi update only works with $ operators" , ! multi );
+            debug.upsert = true;
+            insertAndLog( ns, d, nsdt, newObj, logop, fromMigrate );
+            return UpdateResult( 0 , 0 , 1 , newObj );
         }
+
+        return UpdateResult( 0 , isOperatorUpdate , 0 , BSONObj() );
     }
 
     void validateUpdate( const char* ns , const BSONObj& updateobj, const BSONObj& patternOrig ) {
@@ -407,7 +399,7 @@ namespace mongo {
 
         validateUpdate( ns , updateobj , patternOrig );
 
-        UpdateResult ur = _updateObjects(false, ns, updateobj, patternOrig,
+        UpdateResult ur = _updateObjects(ns, updateobj, patternOrig,
                                          upsert, multi, logop,
                                          debug, fromMigrate, planPolicy );
         debug.nupdated = ur.num;

@@ -2,6 +2,7 @@
 
 /**
 *    Copyright (C) 2008 10gen Inc.
+*    Copyright (C) 2013 Tokutek Inc.
 *
 *    This program is free software: you can redistribute it and/or  modify
 *    it under the terms of the GNU Affero General Public License, version 3,
@@ -23,13 +24,12 @@
 
 #pragma once
 
-#include "../db/namespace.h"
-#include "../client/model.h"
+#include "mongo/client/model.h"
 #include "mongo/client/dbclient_rs.h"
 
-#include "chunk.h"
-#include "shard.h"
-#include "shardkey.h"
+#include "mongo/s/chunk.h"
+#include "mongo/s/shard.h"
+#include "mongo/s/shardkey.h"
 
 namespace mongo {
 
@@ -133,7 +133,20 @@ namespace mongo {
         }
 
         void enableSharding( bool save = true );
-        ChunkManagerPtr shardCollection( const string& ns , ShardKeyPattern fieldsAndOrder , bool unique , vector<BSONObj>* initPoints=0, vector<Shard>* initShards=0 );
+
+        /* Makes all the configuration changes necessary to shard a new collection.
+         * Optionally, chunks will be created based on a set of specified initial split points, and
+         * distributed in a round-robin fashion onto a set of initial shards.  If no initial shards
+         * are specified, only the primary will be used.
+         *
+         * WARNING: It's not safe to place initial chunks onto non-primary shards using this method.
+         * The initShards parameter allows legacy behavior expected by map-reduce.
+         */
+        ChunkManagerPtr shardCollection( const string& ns ,
+                                         ShardKeyPattern fieldsAndOrder ,
+                                         bool unique ,
+                                         vector<BSONObj>* initPoints = 0,
+                                         vector<Shard>* initShards = 0 );
 
         /**
            @return true if there was sharding info to remove
@@ -164,7 +177,7 @@ namespace mongo {
             return _primary;
         }
 
-        void setPrimary( string s );
+        void setPrimary( const std::string& s );
 
         bool load();
         bool reload();
@@ -226,7 +239,7 @@ namespace mongo {
         */
         bool init( vector<string> configHosts );
 
-        bool init( string s );
+        bool init( const std::string& s );
 
         bool allUp();
         bool allUp( string& errmsg );
@@ -268,7 +281,7 @@ namespace mongo {
         bool checkConfigServersConsistent( string& errmsg , int tries = 4 ) const;
 
     private:
-        string getHost( string name , bool withPort );
+        string getHost( const std::string& name , bool withPort );
         vector<string> _config;
     };
 

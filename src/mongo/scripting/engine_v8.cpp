@@ -1,6 +1,7 @@
 //engine_v8.cpp
 
 /*    Copyright 2009 10gen Inc.
+ *    Copyright (C) 2013 Tokutek Inc.
  *
  *    Licensed under the Apache License, Version 2.0 (the "License");
  *    you may not use this file except in compliance with the License.
@@ -851,7 +852,7 @@ namespace mongo {
 
         TryCatch try_catch;
 
-        Handle<Script> script = v8::Script::Compile( v8::String::New( code.data() ) ,
+        Handle<Script> script = v8::Script::Compile( v8::String::New( code.rawData(), code.size() ),
                                 v8::String::New( name.c_str() ) );
         if (script.IsEmpty()) {
             stringstream ss;

@@ -1,6 +1,7 @@
 // @file queryutil.h - Utility classes representing ranges of valid BSONElement values for a query.
 
 /*    Copyright 2009 10gen Inc.
+ *    Copyright (C) 2013 Tokutek Inc.
  *
  *    Licensed under the Apache License, Version 2.0 (the "License");
  *    you may not use this file except in compliance with the License.
@@ -636,6 +637,9 @@ namespace mongo {
         string toString() const;
 
         const vector<FieldRange> &ranges() const { return _ranges; }
+
+        // True if each FieldRange in _ranges is a point interval set.
+        bool containsOnlyPointIntervals() const;
         
     private:
         int matchingLowElement( const BSONElement &e, int i, bool direction, bool &lowEquality ) const;
@@ -663,7 +667,6 @@ namespace mongo {
 
         /**
          * @return Suggested advance method through an ordered list of keys with lookup support
-         *      (generally a btree).
          *   -2 Iteration is complete, no need to advance further.
          *   -1 Advance to the next ordered key, without skipping.
          *  >=0 Skip parameter, let's call it 'r'.  If after() is true, skip past the key prefix

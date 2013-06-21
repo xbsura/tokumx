@@ -26,49 +26,37 @@
 
 namespace mongo {
 
-    RemoteTransaction::RemoteTransaction(shared_ptr<ScopedDbConnection> conn, const string &isolation) : _conn(conn) {
-        bool ok;
-        try {
-            BSONObj beginResult;
-            // Need something for the ns here, though it's not used, the server checks that it's a valid name, so pass "x".
-            ok = _conn->get()->runCommand("x", BSON( "beginTransaction" << "" << "isolation" << isolation ), beginResult);
-        }
-        catch (DBException &e) {
-            ok = false;
-        }
+    RemoteTransaction::RemoteTransaction(DBClientWithCommands &conn, const string &isolation) : _conn(&conn) {
+        bool ok = _conn->beginTransaction(isolation);
         verify(ok);
     }
 
     RemoteTransaction::~RemoteTransaction() {
         if (_conn) {
-            rollback();
+            try {
+                rollback();
+            }
+            catch (DBException &e) {
+                LOG(1) << "error rolling back RemoteTransaction" << endl;
+                // not much else we can do
+            }
         }
     }
 
-    void RemoteTransaction::commit() {
-        bool ok;
-        try {
-            BSONObj commitResult;
-            ok = _conn->get()->runCommand("x", BSON( "commitTransaction" << "" ), commitResult);
+    bool RemoteTransaction::commit(BSONObj *res) {
+        bool ok = _conn->commitTransaction(res);
+        if (ok) {
+            _conn = NULL;
         }
-        catch (DBException &e) {
-            ok = false;
-        }
-        verify(ok);
-        _conn.reset();
+        return ok;
     }
 
-    void RemoteTransaction::rollback() {
-        bool ok;
-        try {
-            BSONObj rollbackResult;
-            ok = _conn->get()->runCommand("x", BSON( "rollbackTransaction" << "" ), rollbackResult);
+    bool RemoteTransaction::rollback(BSONObj *res) {
+        bool ok = _conn->rollbackTransaction(res);
+        if (ok) {
+            _conn = NULL;
         }
-        catch (DBException &e) {
-            ok = false;
-        }
-        verify(ok);
-        _conn.reset();
+        return ok;
     }
 
 } // namespace mongo

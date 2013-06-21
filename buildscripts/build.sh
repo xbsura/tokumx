@@ -139,22 +139,24 @@ function build_fractal_tree() {
             make install -j$makejobs
         popd
 
-        pushd $tokufractaltreedir/examples
-            # test the examples
-            sed -ie "s/LIBTOKUDB = tokufractaltree/LIBTOKUDB = $tokufractaltree/" Makefile 
-            sed -ie "s/LIBTOKUPORTABILITY = tokuportability/LIBTOKUPORTABILITY = $tokuportability/" Makefile
-            if [ x"$(uname)" = x"Darwin" ] ; then
-                set +u
-                DYLD_LIBRARY_PATH=$PWD/../lib:$DYLD_LIBRARY_PATH make check CC=$ftcc
-                set -u
-                exitcode=$?
-            else
-                make check CC=$ftcc
-                exitcode=$?
-            fi
-            echo `date` make check examples $tokufractaltree $exitcode
-            make clean
-        popd
+        if [ $tokukv_check != 0 ] ; then
+            pushd $tokufractaltreedir/examples
+                # test the examples
+                sed -ie "s/LIBTOKUDB = tokufractaltree/LIBTOKUDB = $tokufractaltree/" Makefile 
+                sed -ie "s/LIBTOKUPORTABILITY = tokuportability/LIBTOKUPORTABILITY = $tokuportability/" Makefile
+                if [ x"$(uname)" = x"Darwin" ] ; then
+                    set +u
+                    DYLD_LIBRARY_PATH=$PWD/../lib:$DYLD_LIBRARY_PATH make check CC=$ftcc
+                    set -u
+                    exitcode=$?
+                else
+                    make check CC=$ftcc
+                    exitcode=$?
+                fi
+                echo `date` make check examples $tokufractaltree $exitcode
+                make clean
+            popd
+        fi
 
         # make tarballs
         tar --create \
@@ -168,12 +170,12 @@ function build_fractal_tree() {
 
 # checkout the mongodb source from git, generate a build script, and make the mongodb source tarball
 function build_mongodb_src() {
-    mongodbsrc=mongodb-$mongodb_version-tokutek-$mongo_rev-src
+    mongodbsrc=tokumx-$mongo-src
     if [ ! -d $mongodbsrc ] ; then
         github_download Tokutek/mongo $mongo $mongodbsrc
 
         # set defaults for build script
-        sed <$mongodbsrc/buildscripts/build.tokudb.sh.in \
+        sed <$mongodbsrc/buildscripts/build.tokukv.sh.in \
             -e "s^@makejobs@^$makejobs^" \
             -e "s^@cc@^$cc^" \
             -e "s^@cxx@^$cxx^" \
@@ -182,10 +184,10 @@ function build_mongodb_src() {
             -e "s^@force_toku_version@^$ft_index_rev^" \
             -e "s^@mongodbsrc@^$mongodbsrc^" \
             -e "s^@tokufractaltreesrc@^$tokufractaltreedir^" \
-            -e "s^@LIBTOKUDB_NAME@^${tokufractaltree}_static^" \
-            -e "s^@LIBTOKUPORTABILITY_NAME@^${tokuportability}_static^" \
-            >$mongodbsrc/buildscripts/build.tokudb.sh
-        chmod +x $mongodbsrc/buildscripts/build.tokudb.sh
+            -e "s^@LIBTOKUFRACTALTREE_NAME@^${tokufractaltree}^" \
+            -e "s^@LIBTOKUPORTABILITY_NAME@^${tokuportability}^" \
+            >$mongodbsrc/buildscripts/build.tokukv.sh
+        chmod +x $mongodbsrc/buildscripts/build.tokukv.sh
 
         # make the mongodb src tarball
         tar --create \
@@ -196,42 +198,15 @@ function build_mongodb_src() {
         md5sum --check $mongodbsrc.tar.gz.md5
 
         # run the build script
-        $mongodbsrc/buildscripts/build.tokudb.sh
+        $mongodbsrc/buildscripts/build.tokukv.sh
 
-        mongodbdir=mongodb-$mongodb_version-tokutek-$mongo_rev-tokudb-${ft_index_rev}${suffix}-$system-$arch
-
-        if [ -f $mongodbsrc/mongodb*-debuginfo.tgz ]; then
-            # copy the debuginfo tarball to a name of our choosing
-            mkdir $mongodbdir-debuginfo
-            tar --extract \
-                --gzip \
-                --directory $mongodbdir-debuginfo \
-                --strip-components 1 \
-                --file $mongodbsrc/mongodb*-debuginfo.tgz
-            tar --create \
-                --gzip \
-                --file $mongodbdir-debuginfo.tar.gz \
-                $mongodbdir-debuginfo
-            md5sum $mongodbdir-debuginfo.tar.gz >$mongodbdir-debuginfo.tar.gz.md5
-            md5sum --check $mongodbdir-debuginfo.tar.gz.md5
-
-            # now remove it so the next file glob doesn't get confused
-            rm $mongodbsrc/mongodb*-debuginfo.tgz
-        fi
-
-        # copy the release tarball to a name of our choosing
-        mkdir $mongodbdir
-        tar --extract \
-            --gzip \
-            --directory $mongodbdir \
-            --strip-components 1 \
-            --file $mongodbsrc/mongodb*.tgz
-        tar --create \
-            --gzip \
-            --file $mongodbdir.tar.gz \
-            $mongodbdir
-        md5sum $mongodbdir.tar.gz >$mongodbdir.tar.gz.md5
-        md5sum --check $mongodbdir.tar.gz.md5
+        for tarball in $mongodbsrc/tokumx*.tgz
+        do
+            name=$(basename $tarball)
+            cp $tarball $name
+            md5sum $name >$name.md5
+            md5sum --check $name.md5
+        done
     fi
 }
 
@@ -254,6 +229,7 @@ github_use_ssh=0
 makejobs=$(get_ncpus)
 debugbuild=0
 staticft=1
+tokukv_check=0
 
 if [ $(uname -s) = Darwin ] ; then
     cc=cc
@@ -315,14 +291,14 @@ if [ -z $mongo_rev ] ; then
     mongo_rev=$mongo
 fi
 
-builddir=build-mongodb-${mongo_rev}-tokudb-${ft_index_rev}${suffix}
+builddir=build-tokumx-${mongo_rev}-tokukv-${ft_index_rev}${suffix}
 if [ ! -d $builddir ] ; then mkdir $builddir; fi
 pushd $builddir
 
 rootdir=$PWD
 
 # build the fractal tree tarball
-tokufractaltree=tokufractaltreeindex-${ft_index_rev}${suffix}
+tokufractaltree=tokukv-${ft_index_rev}${suffix}
 tokuportability=tokuportability-${ft_index_rev}${suffix}
 tokufractaltreedir=$tokufractaltree-$system-$arch
 build_fractal_tree

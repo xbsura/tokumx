@@ -1,6 +1,7 @@
 // @file queryutil.cpp
 
 /*    Copyright 2009 10gen Inc.
+ *    Copyright (C) 2013 Tokutek Inc.
  *
  *    Licensed under the Apache License, Version 2.0 (the "License");
  *    you may not use this file except in compliance with the License.
@@ -785,7 +786,7 @@ namespace mongo {
 
 
     /**
-     * Btree scanning for a multidimentional key range will yield a
+     * Index scanning for a multidimentional key range will yield a
      * multidimensional box.  The idea here is that if an 'other'
      * multidimensional box contains the current box we don't have to scan
      * the current box.  If the 'other' box contains the current box in
@@ -1012,6 +1013,18 @@ namespace mongo {
             if ( str::equals( matchFieldName, "$where" ) ) {
                 return;
             }
+
+            // TokuMX does not support the $atomic clause (all operations are atomic
+            // by virtue of running in their own transaction), but we need to keep
+            // this early-return for compatibility reasons. Consider the following
+            // statement:
+            //    db.foo.remove({'$atomic:true'})
+            // This means remove '{}' with options '{$atomic:true}' and without this
+            // early return, we would interpet it as remove '{$atomic:true}' with
+            // options {}, which is incorrect.
+            if ( str::equals( matchFieldName, "$atomic" ) ) {
+                return;
+            }
         }
         
         bool equality =
@@ -1164,6 +1177,15 @@ namespace mongo {
             a.done();
         }
         return b.obj();
+    }
+
+    bool FieldRangeVector::containsOnlyPointIntervals() const {
+        for( vector<FieldRange>::const_iterator i = _ranges.begin(); i != _ranges.end(); ++i ) {
+            if (!i->isPointIntervalSet()) {
+                return false;
+            }
+        }
+        return true;
     }
     
     FieldRange *FieldRangeSet::__universalRange = 0;

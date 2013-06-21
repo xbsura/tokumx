@@ -1,5 +1,6 @@
 /**
 *    Copyright (C) 2008 10gen Inc.
+*    Copyright (C) 2013 Tokutek Inc.
 *
 *    This program is free software: you can redistribute it and/or  modify
 *    it under the terms of the GNU Affero General Public License, version 3,
@@ -16,12 +17,12 @@
 
 #pragma once
 
-#include "db.h"
-#include "dbhelpers.h"
-#include "json.h"
-#include "repl.h"
-#include "cmdline.h"
-#include "repl/rs.h"
+#include "mongo/db/database.h"
+#include "mongo/db/dbhelpers.h"
+#include "mongo/db/json.h"
+#include "mongo/db/repl.h"
+#include "mongo/db/cmdline.h"
+#include "mongo/db/repl/rs.h"
 
 namespace mongo {
 
@@ -50,7 +51,7 @@ namespace mongo {
         if ( ! dbname ) {
             Database *database = cc().database();
             verify( database );
-            dbname = database->name.c_str();
+            dbname = database->name().c_str();
         }
         return strcmp( dbname , "local" ) == 0;
     }

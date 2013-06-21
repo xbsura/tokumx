@@ -83,7 +83,7 @@ namespace mongo {
         return out;
     }
 
-    vector<string> getAllIPs(StringData iporhost) {
+    vector<string> getAllIPs(const string& iporhost) {
         addrinfo* addrs = NULL;
         addrinfo hints;
         memset(&hints, 0, sizeof(addrinfo));
@@ -94,9 +94,9 @@ namespace mongo {
 
         vector<string> out;
 
-        int ret = getaddrinfo(iporhost.data(), portNum.c_str(), &hints, &addrs);
+        int ret = getaddrinfo(iporhost.c_str(), portNum.c_str(), &hints, &addrs);
         if ( ret ) {
-            warning() << "getaddrinfo(\"" << iporhost.data() << "\") failed: " << gai_strerror(ret) << endl;
+            warning() << "getaddrinfo(\"" << iporhost << "\") failed: " << gai_strerror(ret) << endl;
             return out;
         }
 
@@ -129,11 +129,9 @@ namespace mongo {
 #endif
 
 
-    class IsSelfCommand : public Command {
-    public:
-        IsSelfCommand() : Command("_isSelf") , _cacheLock( "IsSelfCommand::_cacheLock" ) {}
-        virtual bool slaveOk() const { return true; }
-        virtual LockType locktype() const { return NONE; }
+    class IsSelfCommand : public InformationCommand {
+      public:
+        IsSelfCommand() : InformationCommand("_isSelf") , _cacheLock( "IsSelfCommand::_cacheLock" ) {}
         virtual void help( stringstream &help ) const {
             help << "{ _isSelf : 1 } INTERNAL ONLY";
         }

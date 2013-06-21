@@ -2,6 +2,7 @@
 
 /**
 *    Copyright (C) 2008 10gen Inc.
+*    Copyright (C) 2013 Tokutek Inc.
 *
 *    This program is free software: you can redistribute it and/or  modify
 *    it under the terms of the GNU Affero General Public License, version 3,
@@ -28,7 +29,7 @@
 
 #include "mongo/bson/util/atomic_int.h"
 
-#include "mongo/db/db.h"
+#include "mongo/db/databaseholder.h"
 #include "mongo/db/introspect.h"
 #include "mongo/db/repl.h"
 #include "mongo/db/dbmessage.h"
@@ -54,7 +55,6 @@
 
 #include "mongo/s/d_logic.h"
 
-#include "mongo/util/file_allocator.h"
 #include "mongo/util/goodies.h"
 #include "mongo/util/time_support.h"
 
@@ -345,9 +345,9 @@ namespace mongo {
             c.getAuthenticationInfo()->startRequest();
         }
 
-        // initialize the default TokuCommandSettings, 
-        TokuCommandSettings settings;
-        c.setTokuCommandSettings(settings);
+        // initialize the default OpSettings, 
+        OpSettings settings;
+        c.setOpSettings(settings);
         
         auto_ptr<CurOp> nestedOp;
         CurOp* currentOpP = c.curop();
@@ -447,7 +447,7 @@ namespace mongo {
 
         logThreshold += currentOp.getExpectedLatencyMs();
 
-        if ( shouldLog || debug.executionTime > logThreshold ) {
+        if ( (shouldLog || debug.executionTime > logThreshold) && !debug.vetoLog(currentOp) ) {
             mongo::tlog() << debug.report( currentOp ) << endl;
         }
 
@@ -502,43 +502,29 @@ namespace mongo {
     /* db - database name
        path - db directory
     */
-    /*static*/ void Database::closeDatabase( const char *db, const string& path ) {
+    // Why is this in instance.cpp?
+    void Database::closeDatabase( const StringData &name, const StringData &path ) {
         verify( Lock::isW() );
 
         Client::Context * ctx = cc().getContext();
         verify( ctx );
-        verify( ctx->inDB( db , path ) );
+        verify( ctx->inDB( name , path ) );
         Database *database = ctx->db();
-        verify( database->name == db );
-
-        oplogCheckCloseDatabase( database ); // oplog caches some things, dirty its caches
-
-        // TokuDB: We need to watch out for this, too.
-#if 0
-        if( BackgroundOperation::inProgForDb(db) ) {
-            log() << "warning: bg op in prog during close db? " << db << endl;
-        }
-#endif
+        verify( database->name() == name );
 
         /* important: kill all open cursors on the database */
-        string prefix(db);
-        prefix += '.';
-        ClientCursor::invalidate(prefix.c_str());
+        string prefix(name.toString() + ".");
+        ClientCursor::invalidate(prefix);
 
-        NamespaceDetailsTransient::clearForPrefix( prefix.c_str() );
+        NamespaceDetailsTransient::clearForPrefix( prefix );
 
-        dbHolderW().erase( db, path );
+        dbHolderW().erase( name, path );
         ctx->_clear();
         delete database; // closes files
     }
 
-    static void lockedReceivedUpdate(const char *ns, Message &m, CurOp &op, const BSONObj &toupdate, const BSONObj &query, int flags) {
-        bool upsert = flags & UpdateOption_Upsert;
-        bool multi = flags & UpdateOption_Multi;
-        bool broadcast = flags & UpdateOption_Broadcast;
-
-        Lock::assertAtLeastReadLocked(ns);
-
+    static void lockedReceivedUpdate(const char *ns, Message &m, CurOp &op, const BSONObj &toupdate, const BSONObj &query,
+                                     const bool upsert, const bool multi, const bool broadcast) {
         // void ReplSetImpl::relinquish() uses big write lock so 
         // this is thus synchronized given our lock above.
         uassert(10054,  "not master", isMasterNs(ns));
@@ -550,7 +536,6 @@ namespace mongo {
 
         Client::Context ctx(ns);
         Client::Transaction transaction(DB_SERIALIZABLE);
-
         UpdateResult res = updateObjects(ns, toupdate, query, upsert, multi, true, op.debug() );
         lastError.getSafe()->recordUpdate( res.existing , res.num , res.upserted ); // for getlasterror
         transaction.commit();
@@ -573,41 +558,23 @@ namespace mongo {
         op.debug().query = query;
         op.setQuery(query);
 
-        TokuCommandSettings settings;
+        const bool upsert = flags & UpdateOption_Upsert;
+        const bool multi = flags & UpdateOption_Multi;
+        const bool broadcast = flags & UpdateOption_Broadcast;
+
+        OpSettings settings;
         settings.setQueryCursorMode(WRITE_LOCK_CURSOR);
-        cc().setTokuCommandSettings(settings);
+        settings.setJustOne(!multi);
+        cc().setOpSettings(settings);
 
         try {
             Lock::DBRead lk(ns);
-            lockedReceivedUpdate(ns, m, op, toupdate, query, flags);
+            lockedReceivedUpdate(ns, m, op, toupdate, query, upsert, multi, broadcast);
         }
         catch (RetryWithWriteLock &e) {
             Lock::DBWrite lk(ns);
-            lockedReceivedUpdate(ns, m, op, toupdate, query, flags);
+            lockedReceivedUpdate(ns, m, op, toupdate, query, upsert, multi, broadcast);
         }
-    }
-
-    static void lockedReceivedDelete(const char *ns, Message &m, const BSONObj &pattern, int flags) {
-        bool justOne = flags & RemoveOption_JustOne;
-        bool broadcast = flags & RemoveOption_Broadcast;
-
-        Lock::assertAtLeastReadLocked(ns);
-
-        // writelock is used to synchronize stepdowns w/ writes
-        uassert(10056, "not master", isMasterNs(ns));
-
-        // if this ever moves to outside of lock, need to adjust check Client::Context::_finishInit
-        if (!broadcast && handlePossibleShardedMessage(m, 0)) {
-            return;
-        }
-
-        Client::Context ctx(ns);
-        Client::Transaction transaction(DB_SERIALIZABLE);
-
-        long long n = deleteObjects(ns, pattern, justOne, true);
-        lastError.getSafe()->recordDelete( n );
-
-        transaction.commit();
     }
 
     void receivedDelete(Message& m, CurOp& op) {
@@ -621,18 +588,29 @@ namespace mongo {
         op.debug().query = pattern;
         op.setQuery(pattern);
 
-        TokuCommandSettings settings;
-        settings.setQueryCursorMode(WRITE_LOCK_CURSOR);
-        cc().setTokuCommandSettings(settings);
+        const bool justOne = flags & RemoveOption_JustOne;
+        const bool broadcast = flags & RemoveOption_Broadcast;
 
-        try {
-            Lock::DBRead lk(ns);
-            lockedReceivedDelete(ns, m, pattern, flags);
+        OpSettings settings;
+        settings.setQueryCursorMode(WRITE_LOCK_CURSOR);
+        settings.setJustOne(justOne);
+        cc().setOpSettings(settings);
+
+        Lock::DBRead lk(ns);
+
+        // writelock is used to synchronize stepdowns w/ writes
+        uassert(10056, "not master", isMasterNs(ns));
+
+        // if this ever moves to outside of lock, need to adjust check Client::Context::_finishInit
+        if (!broadcast && handlePossibleShardedMessage(m, 0)) {
+            return;
         }
-        catch (RetryWithWriteLock &e) {
-            Lock::DBWrite lk(ns);
-            lockedReceivedDelete(ns, m, pattern, flags);
-        }
+
+        Client::Context ctx(ns);
+        Client::Transaction transaction(DB_SERIALIZABLE);
+        long long n = deleteObjects(ns, pattern, justOne, true);
+        lastError.getSafe()->recordDelete( n );
+        transaction.commit();
     }
 
     QueryResult* emptyMoreResult(long long);
@@ -688,7 +666,7 @@ namespace mongo {
                 // It is theoretically possible that one day, the cursor will still
                 // return no new data because all new GTIDs in between these
                 // two values aborted, but that is not possible right now. Any GTID
-                // assigned is done so with the intent to commit, and tokudb
+                // assigned is done so with the intent to commit, and tokumx
                 // aborts if a coommit is not successful.
                 if (str::startsWith(ns, "local.oplog.") && theReplSet){
                     isOplog = true;
@@ -766,7 +744,9 @@ namespace mongo {
             ex->getInfo().append( err );
             BSONObj errObj = err.done();
 
-            log() << errObj << endl;
+            if (!ex->interrupted()) {
+                log() << errObj << endl;
+            }
 
             curop.debug().exceptionInfo = ex->getInfo();
 
@@ -796,9 +776,7 @@ namespace mongo {
         return ok;
     }
 
-    static void lockedReceivedInsert(const char *ns, Message &m, const vector<BSONObj> &objs, bool keepGoing) {
-        Lock::assertAtLeastReadLocked(ns);
-
+    static void lockedReceivedInsert(const char *ns, Message &m, const vector<BSONObj> &objs, const bool keepGoing) {
         // writelock is used to synchronize stepdowns w/ writes
         uassert(10058, "not master", isMasterNs(ns));
 
@@ -808,7 +786,6 @@ namespace mongo {
 
         Client::Context ctx(ns);
         Client::Transaction transaction(DB_SERIALIZABLE);
-
         insertObjects(ns, objs, keepGoing, 0, true);
         globalOpCounters.incInsertInWriteLock(objs.size());
         transaction.commit();
@@ -831,9 +808,9 @@ namespace mongo {
 
         const bool keepGoing = d.reservedField() & InsertOption_ContinueOnError;
 
-        TokuCommandSettings settings;
+        OpSettings settings;
         settings.setQueryCursorMode(WRITE_LOCK_CURSOR);
-        cc().setTokuCommandSettings(settings);
+        cc().setOpSettings(settings);
 
         try {
             Lock::DBRead lk(ns);
@@ -845,23 +822,36 @@ namespace mongo {
         }
     }
 
-    void getDatabaseNames( vector< string > &names , const string& usePath ) {
-        boost::filesystem::path path( usePath );
-        for ( boost::filesystem::directory_iterator i( path );
-                i != boost::filesystem::directory_iterator(); ++i ) {
-            if (false) {
-            //if ( directoryperdb )
-                boost::filesystem::path p = *i;
-                string dbName = p.leaf();
-                p /= ( dbName + ".ns" );
-                if ( exists( p ) )
-                    names.push_back( dbName );
+    struct getDatabaseNamesExtra {
+        vector<string> &names;
+        getDatabaseNamesExtra(vector<string> &n) : names(n) {}
+    };
+
+    static int getDatabaseNamesCallback(const DBT *key, const DBT *val, void *extra) {
+        getDatabaseNamesExtra *e = static_cast<getDatabaseNamesExtra *>(extra);
+        size_t length = key->size;
+        if (length > 0) {
+            // strip off the trailing 0 in the key
+            char *cp = (char *) key->data + length - 1;
+            if (*cp == 0)
+                length -= 1;
+            if (length >= 3 && strcmp((char *) key->data + length - 3, ".ns") == 0) {
+                e->names.push_back(string((char *) key->data, length - 3));
             }
-            else {
-                string fileName = boost::filesystem::path(*i).leaf();
-                if ( fileName.length() > 3 && fileName.substr( fileName.length() - 3, 3 ) == ".ns" )
-                    names.push_back( fileName.substr( 0, fileName.length() - 3 ) );
-            }
+        }
+        return 0;
+    } 
+
+    void getDatabaseNames( vector< string > &names) {
+        verify(Lock::isRW());
+        // create a cursor on the tokumx directory and search for <database>.ns keys
+        storage::DirectoryCursor c(storage::env, cc().txn().db_txn());
+        getDatabaseNamesExtra extra(names);
+        int r = 0;
+        while (r == 0) {
+            r = c.dbc()->c_getf_next(c.dbc(), 0, getDatabaseNamesCallback, &extra);
+            if (r != 0 && r != DB_NOTFOUND)
+                storage::handle_ydb_error(r);
         }
     }
 
@@ -871,17 +861,26 @@ namespace mongo {
     */
     bool replHasDatabases() {
         vector<string> names;
-        getDatabaseNames(names);
+        {
+            Lock::GlobalRead lk;
+            Client::Transaction txn(DB_TXN_READ_ONLY | DB_TXN_SNAPSHOT);
+            getDatabaseNames(names);
+            txn.commit();
+        }
         if( names.size() >= 2 ) return true;
         if( names.size() == 1 ) {
             if( names[0] != "local" )
                 return true;
             // we have a local database.  return true if oplog isn't empty
             {
-                Lock::DBRead lk(rsoplog);
+                Client::ReadContext ctx(rsoplog);
+                Client::Transaction txn(DB_TXN_READ_ONLY | DB_TXN_SNAPSHOT);
+                NamespaceDetails *d = nsdetails(rsoplog);
                 BSONObj o;
-                if( Helpers::getFirst(rsoplog, o) )
+                if (d != NULL && d->findOne(BSONObj(), o)) {
+                    txn.commit();
                     return true;
+                }
             }
         }
         return false;
@@ -900,7 +899,6 @@ namespace mongo {
         verify( dbResponse.response );
         dbResponse.response->concat(); // can get rid of this if we make response handling smarter
         response = *dbResponse.response;
-        //getDur().commitIfNeeded();
         return true;
     }
 
@@ -909,7 +907,6 @@ namespace mongo {
             lastError.startRequest( toSend, lastError._get() );
         DbResponse dbResponse;
         assembleResponse( toSend, dbResponse , _clientHost );
-        //getDur().commitIfNeeded();
     }
 
     auto_ptr<DBClientCursor> DBDirectClient::query(const string &ns, Query query, int nToReturn , int nToSkip ,
@@ -929,7 +926,6 @@ namespace mongo {
     HostAndPort DBDirectClient::_clientHost = HostAndPort( "0.0.0.0" , 0 );
 
     unsigned long long DBDirectClient::count(const string &ns, const BSONObj& query, int options, int limit, int skip ) {
-        Lock::DBRead lk( ns );
         string errmsg;
         int errCode;
         long long res = runCount( ns.c_str() , _countCmd( ns , query , options , limit , skip ) , errmsg, errCode );
@@ -980,47 +976,11 @@ namespace mongo {
         log() << "shutdown: going to close sockets..." << endl;
         boost::thread close_socket_thread( boost::bind(MessagingPort::closeAllSockets, 0) );
 
-        // wait until file preallocation finishes
-        // we would only hang here if the file_allocator code generates a
-        // synchronous signal, which we don't expect
-        log() << "shutdown: waiting for fs preallocator..." << endl;
-        FileAllocator::get()->waitUntilFinished();
-
-        // TODO: (figure out what this code is doing and what should happen)
-        // originally this was done when journaling was on
-        if( true ) {
-            log() << "shutdown: lock for final commit..." << endl;
-            {
-                int n = 10;
-                while( 1 ) {
-                    // we may already be in a read lock from earlier in the call stack, so do read lock here 
-                    // to be consistent with that.
-                    readlocktry w(20000);
-                    if( w.got() ) { 
-                        log() << "shutdown: final commit..." << endl;
-                        //getDur().commitNow();
-                        break;
-                    }
-                    if( --n <= 0 ) {
-                        log() << "shutdown: couldn't acquire write lock, aborting" << endl;
-                        mongoAbort("couldn't acquire write lock");
-                    }
-                    log() << "shutdown: waiting for write lock..." << endl;
-                }
-            }
-            // TODO: What should tokudb do here?
-            //MemoryMappedFile::flushAll(true);
-        }
-
-        log() << "shutdown: closing all files..." << endl;
-        stringstream ss3;
-        // TODO: What should tokudb do here?
-        //MemoryMappedFile::closeAllFiles( ss3 );
-        log() << ss3.str() << endl;
-
         {
             Lock::GlobalWrite lk;
+            log() << "shutdown: going to close databases..." << endl;
             dbHolderW().closeDatabases(dbpath);
+            log() << "shutdown: going to shutdown TokuKV..." << endl;
             storage::shutdown();
         }
 
@@ -1127,14 +1087,8 @@ namespace mongo {
 #endif
     }
 
-    void acquirePathLock(bool doingRepair) {
+    void acquirePathLock() {
         string name = ( boost::filesystem::path( dbpath ) / "mongod.lock" ).native_file_string();
-
-        bool oldFile = false;
-
-        if ( boost::filesystem::exists( name ) && boost::filesystem::file_size( name ) > 0 ) {
-            oldFile = true;
-        }
 
 #ifdef _WIN32
         lockFileHandle = CreateFileA( name.c_str(), GENERIC_READ | GENERIC_WRITE,
@@ -1164,85 +1118,6 @@ namespace mongo {
         }
 #endif
 
-        if ( oldFile ) {
-            // we check this here because we want to see if we can get the lock
-            // if we can't, then its probably just another mongod running
-            
-#if 0
-            string errmsg;
-            if (doingRepair && dur::haveJournalFiles()) { // TODO: Get rid of this check for TokuDB - always require the journal
-                errmsg = "************** \n"
-                         "You specified --repair but there are dirty journal files. Please\n"
-                         "restart without --repair to allow the journal files to be replayed.\n"
-                         "If you wish to repair all databases, please shutdown cleanly and\n"
-                         "run with --repair again.\n"
-                         "**************";
-            }
-            else if (cmdLine.dur) {
-                if (!dur::haveJournalFiles(/*anyFiles=*/true)) {
-                    // Passing anyFiles=true as we are trying to protect against starting in an
-                    // unclean state with the journal directory unmounted. If there are any files,
-                    // even prealloc files, then it means that it is mounted so we can continue.
-                    // Previously there was an issue (SERVER-5056) where we would fail to start up
-                    // if killed during prealloc.
-                    
-                    vector<string> dbnames;
-                    getDatabaseNames( dbnames );
-                    
-                    if ( dbnames.size() == 0 ) {
-                        // this means that mongod crashed
-                        // between initial startup and when journaling was initialized
-                        // it is safe to continue
-                    }
-                    else {
-                        errmsg = str::stream()
-                            << "************** \n"
-                            << "old lock file: " << name << ".  probably means unclean shutdown,\n"
-                            << "but there are no journal files to recover.\n"
-                            << "this is likely human error or filesystem corruption.\n"
-                            << "please make sure that your journal directory is mounted.\n"
-                            << "found " << dbnames.size() << " dbs.\n"
-                            << "see: http://dochub.mongodb.org/core/repair for more information\n"
-                            << "*************";
-                    }
-
-
-                }
-            }
-            else {
-                if (!dur::haveJournalFiles() && !doingRepair) {
-                    errmsg = str::stream()
-                             << "************** \n"
-                             << "Unclean shutdown detected.\n"
-                             << "Please visit http://dochub.mongodb.org/core/repair for recovery instructions.\n"
-                             << "*************";
-                }
-            }
-
-            if (!errmsg.empty()) {
-                cout << errmsg << endl;
-#ifdef _WIN32
-                CloseHandle( lockFileHandle );
-#else
-                close ( lockFile );
-#endif
-                lockFile = 0;
-                uassert( 12596 , "old lock file" , 0 );
-            }
-#endif
-        }
-
-        // Not related to lock file, but this is where we handle unclean shutdown
-#if 0
-        if( !cmdLine.dur && dur::haveJournalFiles() ) {
-            cout << "**************" << endl;
-            cout << "Error: journal files are present in journal directory, yet starting without journaling enabled." << endl;
-            cout << "It is recommended that you start with journaling enabled so that recovery may occur." << endl;
-            cout << "**************" << endl;
-            uasserted(13597, "can't start without --journal enabled when journal/ files are present");
-        }
-#endif
-
 #ifdef _WIN32
         uassert( 13625, "Unable to truncate lock file", _chsize(lockFile, 0) == 0);
         writePid( lockFile );
@@ -1255,21 +1130,6 @@ namespace mongo {
 #endif
     }
 #else
-    void acquirePathLock(bool) {
-        // TODO - this is very bad that the code above not running here.
-
-        // Not related to lock file, but this is where we handle unclean shutdown
-#if 0
-        if( !cmdLine.dur && dur::haveJournalFiles() ) {
-            cout << "**************" << endl;
-            cout << "Error: journal files are present in journal directory, yet starting without --journal enabled." << endl;
-            cout << "It is recommended that you start with journaling enabled so that recovery may occur." << endl;
-            cout << "Alternatively (not recommended), you can backup everything, then delete the journal files, and run --repair" << endl;
-            cout << "**************" << endl;
-            uasserted(13618, "can't start without --journal enabled when journal/ files are present");
-        }
-#endif
-    }
 #endif
 
     // ----- BEGIN Diaglog -----

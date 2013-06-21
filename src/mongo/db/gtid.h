@@ -1,5 +1,5 @@
 /**
-*    Copyright (C) 2012 Tokutek Inc.
+*    Copyright (C) 2013 Tokutek Inc.
 *
 *    This program is free software: you can redistribute it and/or  modify
 *    it under the terms of the GNU Affero General Public License, version 3,
@@ -18,8 +18,7 @@
 
 #include "mongo/pch.h"
 #include "mongo/db/jsobj.h"
-
-#include <db.h>
+#include <limits>
 
 namespace mongo {
 
@@ -31,7 +30,10 @@ namespace mongo {
         static int cmp(GTID a, GTID b);
         static uint32_t GTIDBinarySize();
         GTID();
-        GTID(uint64_t primarySeqNo, uint64_t GTSeqNo);
+        GTID(uint64_t primarySeqNo, uint64_t GTSeqNo){
+            _primarySeqNo = primarySeqNo;
+            _GTSeqNo = GTSeqNo;
+        }
         GTID(const char* binData);
         ~GTID(){};
         void serializeBinaryData(char* binData);
@@ -39,7 +41,10 @@ namespace mongo {
         void inc_primary();        
         string toString() const;
         bool isInitial() const;
+        friend class GTIDManagerTest; // for testing
     };
+
+    static const GTID GTID_MAX(std::numeric_limits<uint64_t>::max(), std::numeric_limits<uint64_t>::max());
 
     struct GTIDCmp {
         bool operator()( const GTID& l, const GTID& r ) const {
@@ -54,6 +59,17 @@ namespace mongo {
 
         // notified when the min live GTID changes
         boost::condition _minLiveCond;
+
+        // when a machine newly assumes primary, we want to
+        // increment the primary sequence number of the GTIDs
+        // that are handed out, but we do not want to do it
+        // until we call getGTIDForPrimary. Otherwise,
+        // in a system where no writes are happening, elections
+        // may stall because this machine will think the last GTID is
+        // some high value that has never actually been given out.
+        // So, we use this bool as a signal to getGTIDForPrimary
+        // to increment the primary sequence number
+        bool _incPrimary;
         
         // GTID to give out should a primary ask for one to use
         // On a secondary, this is the last GTID seen incremented
@@ -90,9 +106,11 @@ namespace mongo {
         // in milliseconds, derived from curTimeMillis64
         uint64_t _lastTimestamp;
         uint64_t _lastHash;
+
+        uint32_t _selfID; // used for hash construction
         
         public:            
-        GTIDManager( GTID lastGTID, uint64_t lastTime, uint64_t lastHash );
+        GTIDManager( GTID lastGTID, uint64_t lastTime, uint64_t lastHash, uint32_t id );
         ~GTIDManager();
 
         // methods for running on a primary
@@ -130,6 +148,8 @@ namespace mongo {
         void catchUnappliedToLive();
 
         bool rollbackNeeded(const GTID& last, uint64_t lastTime, uint64_t lastHash);
+
+        friend class GTIDManagerTest; // for testing
         
     };
     void addGTIDToBSON(const char* keyName, GTID gtid, BSONObjBuilder& result);

@@ -2,6 +2,7 @@
 
 /**
 *    Copyright (C) 2008 10gen Inc.
+*    Copyright (C) 2013 Tokutek Inc.
 *
 *    This program is free software: you can redistribute it and/or  modify
 *    it under the terms of the GNU Affero General Public License, version 3,
@@ -25,9 +26,11 @@
 
 namespace mongo {
 
+    const int ParallelArraysCode = 10088;
+
     class Cursor;
     class IndexSpec;
-    class IndexType; // TODO: this name sucks TODO: TokuDB: So fix it, eventually.
+    class IndexType; // TODO: this name sucks
     class IndexPlugin;
     class IndexDetails;
 

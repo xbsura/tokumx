@@ -2,6 +2,7 @@
 
 /**
 *    Copyright (C) 2008 10gen Inc.
+*    Copyright (C) 2013 Tokutek Inc.
 *
 *    This program is free software: you can redistribute it and/or  modify
 *    it under the terms of the GNU Affero General Public License, version 3,
@@ -18,11 +19,10 @@
 
 #pragma once
 
-#include "jsobj.h"
-#include "namespace.h"
-#include "../util/net/message.h"
-#include "../client/constants.h"
-#include "instance.h"
+#include "mongo/client/constants.h"
+#include "mongo/db/jsobj.h"
+#include "mongo/db/instance.h"
+#include "mongo/util/net/message.h"
 
 namespace mongo {
 
@@ -128,9 +128,6 @@ namespace mongo {
 
         const char * getns() const {
             return data;
-        }
-        void getns(Namespace& ns) const {
-            ns = data;
         }
 
         const char * afterNS() const {

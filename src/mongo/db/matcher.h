@@ -4,6 +4,7 @@
 
 /**
 *    Copyright (C) 2008 10gen Inc.
+*    Copyright (C) 2013 Tokutek Inc.
 *
 *    This program is free software: you can redistribute it and/or  modify
 *    it under the terms of the GNU Affero General Public License, version 3,
@@ -290,8 +291,6 @@ namespace mongo {
          */
         void visit( MatcherVisitor& visitor ) const;
         
-        bool atomic() const { return _atomic; }
-
         string toString() const {
             return _jsobj.toString();
         }
@@ -345,13 +344,6 @@ namespace mongo {
         bool _all;
         bool _hasArray;
         bool _haveNeg;
-
-        /* $atomic - if true, a multi document operation (some removes, updates)
-                     should be done atomically.  in that case, we do not yield -
-                     i.e. we stay locked the whole time.
-                     http://dochub.mongodb.org/core/remove
-        */
-        bool _atomic;
 
         vector<RegexMatcher> _regexs;
         vector<GeoMatcher> _geo;

@@ -14,8 +14,7 @@
 *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 
-#ifndef MONGO_DB_STORAGE_TXN_H
-#define MONGO_DB_STORAGE_TXN_H
+#pragma once
 
 #include "mongo/pch.h"
 
@@ -34,6 +33,7 @@ namespace mongo {
          */
         class Txn : boost::noncopyable {
             DB_TXN *_db_txn;
+            int _flags;
             void retire();
           public:
             Txn(const Txn *parent, int flags);
@@ -45,10 +45,11 @@ namespace mongo {
             DB_TXN *db_txn() const { return _db_txn; }
             /** @return true iff this transaction is live */
             bool isLive() const { return _db_txn != NULL; }
+            /** @return the flags used to create this transaction */
+            int flags() const { return _flags; }
         };
 
     } // namespace storage
 
 } // namespace mongo
 
-#endif // MONGO_DB_STORAGE_TXN_H

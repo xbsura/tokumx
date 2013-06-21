@@ -1,5 +1,6 @@
 /*
  *    Copyright (C) 2010 10gen Inc.
+ *    Copyright (C) 2013 Tokutek Inc.
  *
  *    This program is free software: you can redistribute it and/or  modify
  *    it under the terms of the GNU Affero General Public License, version 3,
@@ -28,7 +29,6 @@
 #include "mongo/db/namespace_details.h"
 #include "mongo/db/json.h"
 #include "mongo/db/storage/env.h"
-#include "mongo/util/file_allocator.h"
 #include "mongo/util/password.h"
 #include "mongo/util/version.h"
 
@@ -238,8 +238,10 @@ namespace mongo {
                 ::_exit(-1);
             }
 
-            FileAllocator::get()->start();
-
+            // the last thing we do before initializing storage is to install the
+            // txn complete hooks, which live in namespace_details.cpp
+            extern TxnCompleteHooks _txnCompleteHooks;
+            setTxnCompleteHooks(&_txnCompleteHooks);
             storage::startup();
         }
 

@@ -1,6 +1,7 @@
 // @file mms.cpp
 /*
  *    Copyright (C) 2010 10gen Inc.
+ *    Copyright (C) 2013 Tokutek Inc.
  *
  *    This program is free software: you can redistribute it and/or  modify
  *    it under the terms of the GNU Affero General Public License, version 3,
@@ -16,13 +17,13 @@
  */
 
 
-#include "pch.h"
-#include "../db.h"
-#include "../instance.h"
-#include "../module.h"
-#include "../../util/net/httpclient.h"
-#include "../../util/background.h"
-#include "../commands.h"
+#include "mongo/pch.h"
+
+#include "mongo/db/instance.h"
+#include "mongo/db/module.h"
+#include "mongo/db/commands.h"
+#include "mongo/util/net/httpclient.h"
+#include "mongo/util/background.h"
 
 namespace po = boost::program_options;
 

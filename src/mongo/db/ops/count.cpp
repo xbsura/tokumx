@@ -2,6 +2,7 @@
 
 /**
  *    Copyright (C) 2008 10gen Inc.
+ *    Copyright (C) 2013 Tokutek Inc.
  *
  *    This program is free software: you can redistribute it and/or  modify
  *    it under the terms of the GNU Affero General Public License, version 3,
@@ -16,18 +17,18 @@
  *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#include "count.h"
-
-#include "../client.h"
-#include "../clientcursor.h"
-#include "../namespace.h"
-#include "../queryutil.h"
+#include "mongo/db/ops/count.h"
+#include "mongo/db/client.h"
+#include "mongo/db/clientcursor.h"
+#include "mongo/db/namespace_details.h"
+#include "mongo/db/queryutil.h"
+#include "mongo/db/queryoptimizercursor.h"
 #include "mongo/client/dbclientinterface.h"
 
 namespace mongo {
 
     long long runCount( const char *ns, const BSONObj &cmd, string &err, int &errCode ) {
-        Client::Context ctx(ns);
+        Client::ReadContext ctx(ns);
         NamespaceDetails *d = nsdetails( ns );
         if ( !d ) {
             err = "ns missing";
@@ -37,7 +38,7 @@ namespace mongo {
 
         // count of all objects
         if ( query.isEmpty() ) {
-            // TODO: TokuDB: call this with in-memory stats once we maintain them
+            // TODO: TokuMX: call this with in-memory stats once we maintain them
             //return applySkipLimit( d->stats.nrecords , cmd );
         }
 
@@ -49,10 +50,10 @@ namespace mongo {
             limit  = -limit;
         }
 
-        TokuCommandSettings settings;
+        OpSettings settings;
         settings.setBulkFetch(true);
         settings.setQueryCursorMode(DEFAULT_LOCK_CURSOR);
-        cc().setTokuCommandSettings(settings);
+        cc().setOpSettings(settings);
 
         Lock::assertAtLeastReadLocked(ns);
         Client::Transaction transaction(DB_TXN_SNAPSHOT | DB_TXN_READ_ONLY);

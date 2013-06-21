@@ -19,7 +19,9 @@
 #pragma once
 
 #include <map>
-#include "../security_common.h"
+
+#include "mongo/db/repl/rs.h"
+#include "mongo/db/security_common.h"
 
 namespace mongo {
 
@@ -42,7 +44,7 @@ namespace mongo {
     class ScopedConn {
     public:
         /** throws assertions if connect failure etc. */
-        ScopedConn(string hostport);
+        ScopedConn(const std::string& hostport);
         ~ScopedConn() {
             // conLock releases...
         }
@@ -119,7 +121,7 @@ namespace mongo {
         }
     };
 
-    inline ScopedConn::ScopedConn(string hostport) : _hostport(hostport) {
+    inline ScopedConn::ScopedConn(const std::string& hostport) : _hostport(hostport) {
         bool first = false;
         {
             scoped_lock lk(mapMutex);

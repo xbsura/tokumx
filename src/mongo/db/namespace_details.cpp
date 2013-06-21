@@ -1,5 +1,6 @@
 /**
 *    Copyright (C) 2008 10gen Inc.
+*    Copyright (C) 2013 Tokutek Inc.
 *
 *    This program is free software: you can redistribute it and/or  modify
 *    it under the terms of the GNU Affero General Public License, version 3,
@@ -25,7 +26,8 @@
 #include <boost/filesystem/operations.hpp>
 
 #include "mongo/db/cursor.h"
-#include "mongo/db/db.h"
+#include "mongo/db/database.h"
+#include "mongo/db/databaseholder.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/json.h"
 #include "mongo/db/namespacestring.h"
@@ -42,33 +44,31 @@
 #include "mongo/platform/atomic_word.h"
 #include "mongo/scripting/engine.h"
 #include "mongo/db/oplog_helpers.h"
-#include "mongo/db/db_flags.h"
 #include "mongo/db/repl/rs_optime.h"
 #include "mongo/db/repl/rs.h"
 
 namespace mongo {
 
-    NamespaceIndex *nsindex(const char *ns) {
+    NamespaceIndex *nsindex(const StringData& ns) {
         Database *database = cc().database();
         verify( database );
         DEV {
-            char buf[256];
-            nsToDatabase(ns, buf);
-            if ( database->name != buf ) {
+            StringData db = nsToDatabaseSubstring(ns);
+            if ( db != database->name() ) {
                 out() << "ERROR: attempt to write to wrong database\n";
                 out() << " ns:" << ns << '\n';
-                out() << " database->name:" << database->name << endl;
-                verify( database->name == buf );
+                out() << " database->name:" << database->name() << endl;
+                verify( db == database->name() );
             }
         }
-        return &database->namespaceIndex;
+        return &database->_nsIndex;
     }
 
-    NamespaceDetails *nsdetails(const char *ns) {
+    NamespaceDetails *nsdetails(const StringData& ns) {
         return nsindex(ns)->details(ns);
     }
 
-    NamespaceDetails *nsdetails_maybe_create(const char *ns, BSONObj options) {
+    NamespaceDetails *nsdetails_maybe_create(const StringData& ns, BSONObj options) {
         NamespaceIndex *ni = nsindex(ns);
         if (!ni->allocated()) {
             // Must make sure we loaded any existing namespaces before checking, or we might create one that already exists.
@@ -81,7 +81,6 @@ namespace mongo {
                 throw RetryWithWriteLock();
             }
 
-            Namespace ns_s(ns);
             shared_ptr<NamespaceDetails> new_details( NamespaceDetails::make(ns, options) );
             ni->add_ns(ns, new_details);
 
@@ -137,7 +136,7 @@ namespace mongo {
 
     class IndexedCollection : public NamespaceDetails {
     public:
-        IndexedCollection(const string &ns, const BSONObj &options) :
+        IndexedCollection(const StringData &ns, const BSONObj &options) :
             NamespaceDetails(ns, fromjson("{\"_id\":1}"), options) {
         }
         IndexedCollection(const BSONObj &serialized) :
@@ -164,21 +163,15 @@ namespace mongo {
             insertIntoIndexes(pk, obj, flags);
         }
 
-        // deletes an object from this namespace, taking care of secondary indexes if they exist
-        void deleteObject(const BSONObj &pk, const BSONObj &obj) {
-            deleteFromIndexes(pk, obj);
-        }
-
-        void updateObject(const BSONObj &pk, const BSONObj &oldObj, const BSONObj &newObj) {
-            // if newObj has no _id field, it should inherit the existing value
-            BSONObj newObjWithId = inheritIdField(oldObj, newObj);
-            NamespaceDetails::updateObject(pk, oldObj, newObjWithId);
+        void updateObject(const BSONObj &pk, const BSONObj &oldObj, BSONObj &newObj, uint64_t flags) {
+            newObj = inheritIdField(oldObj, newObj);
+            NamespaceDetails::updateObject(pk, oldObj, newObj, flags);
         }
     };
 
     class OplogCollection : public IndexedCollection {
     public:
-        OplogCollection(const string &ns, const BSONObj &options) :
+        OplogCollection(const StringData &ns, const BSONObj &options) :
             IndexedCollection(ns, options) {
         } 
         OplogCollection(const BSONObj &serialized) :
@@ -198,24 +191,9 @@ namespace mongo {
         }
     };
 
-    struct getfExtra {
-        getfExtra(BSONObj &k) : key(k) {
-        }
-        BSONObj &key;
-    };
-
-    static int getfCallback(const DBT *key, const DBT *value, void *extra) {
-        struct getfExtra *info = reinterpret_cast<struct getfExtra *>(extra);
-        if (key) {
-            const storage::Key sKey(key);
-            info->key = sKey.key().getOwned();
-        }
-        return 0;
-    }
-
     class NaturalOrderCollection : public NamespaceDetails {
     public:
-        NaturalOrderCollection(const string &ns, const BSONObj &options) :
+        NaturalOrderCollection(const StringData &ns, const BSONObj &options) :
             NamespaceDetails(ns, fromjson("{\"$_\":1}"), options),
             _nextPK(0) {
         }
@@ -224,7 +202,6 @@ namespace mongo {
             _nextPK(0) {
 
             // the next PK, if it exists, is the last key + 1
-            int r;
             IndexDetails &pkIdx = getPKIndex();
             Client::Transaction txn(DB_TXN_SNAPSHOT | DB_TXN_READ_ONLY);
             {
@@ -232,8 +209,11 @@ namespace mongo {
                 DBC *cursor = c.dbc();
 
                 BSONObj key = BSONObj();
-                struct getfExtra extra(key);
-                r = cursor->c_getf_last(cursor, 0, getfCallback, &extra);
+                struct getfLastExtra extra(key);
+                const int r = cursor->c_getf_last(cursor, 0, getfLastCallback, &extra);
+                if (extra.ex != NULL) {
+                    throw *extra.ex;
+                }
                 if (r != 0 && r != DB_NOTFOUND) {
                     storage::handle_ydb_error(r);
                 }
@@ -252,17 +232,34 @@ namespace mongo {
             insertIntoIndexes(pk.obj(), obj, flags);
         }
 
-        void deleteObject(const BSONObj &pk, const BSONObj &obj) {
-            deleteFromIndexes(pk, obj);
-        }
-
     protected:
         AtomicWord<long long> _nextPK;
+
+    private:
+        struct getfLastExtra {
+            BSONObj &key;
+            std::exception *ex;
+            getfLastExtra(BSONObj &k) : key(k), ex(NULL) { }
+        };
+
+        static int getfLastCallback(const DBT *key, const DBT *value, void *extra) {
+            struct getfLastExtra *info = reinterpret_cast<struct getfLastExtra *>(extra);
+            try {
+                if (key != NULL) {
+                    const storage::Key sKey(key);
+                    info->key = sKey.key().getOwned();
+                }
+                return 0;
+            } catch (std::exception &e) {
+                info->ex = &e;
+            }
+            return -1;
+        }
     };
 
     class SystemCatalogCollection : public NaturalOrderCollection {
     public:
-        SystemCatalogCollection(const string &ns, const BSONObj &options) :
+        SystemCatalogCollection(const StringData &ns, const BSONObj &options) :
             NaturalOrderCollection(ns, options) {
         }
         SystemCatalogCollection(const BSONObj &serialized) :
@@ -276,7 +273,7 @@ namespace mongo {
         }
 
         void createIndex(const BSONObj &info) {
-            massert(16464, "bug: system collections should not be indexed.", false);
+            msgasserted(16464, "bug: system collections should not be indexed." );
         }
 
     private:
@@ -327,7 +324,8 @@ namespace mongo {
     // work is done under the _deleteMutex.
     class CappedCollection : public NaturalOrderCollection {
     public:
-        CappedCollection(const string &ns, const BSONObj &options) :
+        CappedCollection(const StringData &ns, const BSONObj &options,
+                         const bool mayIndexId = true) :
             NaturalOrderCollection(ns, options),
             _maxSize(options["size"].numberLong()),
             _maxObjects(options["max"].numberLong()),
@@ -337,10 +335,12 @@ namespace mongo {
             _deleteMutex("cappedDeleteMutex") {
 
             // Create an _id index if "autoIndexId" is missing or it exists as true.
-            const BSONElement e = options["autoIndexId"];
-            if (!e.ok() || e.trueValue()) {
-                BSONObj info = indexInfo(fromjson("{\"_id\":1}"), true, false);
-                createIndex(info);
+            if (mayIndexId) {
+                const BSONElement e = options["autoIndexId"];
+                if (!e.ok() || e.trueValue()) {
+                    BSONObj info = indexInfo(fromjson("{\"_id\":1}"), true, false);
+                    createIndex(info);
+                }
             }
         }
         CappedCollection(const BSONObj &serialized) :
@@ -361,7 +361,7 @@ namespace mongo {
             long long n = 0;
             long long size = 0;
             Client::Transaction txn(DB_TXN_SNAPSHOT | DB_TXN_READ_ONLY);
-            for (scoped_ptr<Cursor> c( BasicCursor::make(this) ); c->ok(); n++, c->advance()) {
+            for (shared_ptr<Cursor> c( BasicCursor::make(this) ); c->ok(); n++, c->advance()) {
                 size += c->current().objsize();
             }
             txn.commit();
@@ -390,13 +390,145 @@ namespace mongo {
         BSONObj minUnsafeKey() {
             SimpleMutex::scoped_lock lk(_mutex);
 
-            const long long minUncommitted = _uncommittedPKs.size() > 0 ?
-                                             _uncommittedPKs.begin()->firstElement().Long() :
+            const long long minUncommitted = _uncommittedMinPKs.size() > 0 ?
+                                             _uncommittedMinPKs.begin()->firstElement().Long() :
                                              _nextPK.load();
             TOKULOG(2) << "minUnsafeKey: minUncommitted " << minUncommitted << endl;
             BSONObjBuilder b;
             b.append("", minUncommitted);
             return b.obj();
+        }
+
+        // run an insertion where the PK is specified
+        // Can come from the applier thread on a slave or a cloner 
+        void insertObjectIntoCappedWithPK(BSONObj& pk, BSONObj& obj, uint64_t flags) {
+            SimpleMutex::scoped_lock lk(_mutex);
+            long long pkVal = pk[""].Long();
+            if (pkVal >= _nextPK.load()) {
+                _nextPK = AtomicWord<long long>(pkVal + 1);
+            }
+
+            // Must note the uncommitted PK before we do the actual insert,
+            // since we check the capped rollback data structure to see if
+            // any inserts have happened yet for this transaction (and that
+            // would erroneously be true if we did the insert here first).
+            noteUncommittedPK(pk);
+            checkUniqueAndInsert(pk, obj, flags, true);
+
+        }
+
+        void insertObjectIntoCappedAndLogOps(BSONObj &obj, uint64_t flags) {
+            obj = addIdField(obj);
+            uassert( 16774 , str::stream() << "document is larger than capped size "
+                     << obj.objsize() << " > " << _maxSize, obj.objsize() <= _maxSize );
+
+            const BSONObj pk = getNextPK();
+            checkUniqueAndInsert(pk, obj, flags | NamespaceDetails::NO_UNIQUE_CHECKS | NamespaceDetails::NO_LOCKTREE, false);
+            OpLogHelpers::logInsertForCapped(_ns.c_str(), pk, obj, &cc().txn());
+            checkGorged(obj, true);
+        }
+
+        void insertObject(BSONObj &obj, uint64_t flags) {
+            obj = addIdField(obj);
+            _insertObject(obj, flags);
+        }
+
+        void deleteObject(const BSONObj &pk, const BSONObj &obj, uint64_t flags) {
+            msgasserted(16460, "bug: cannot remove from a capped collection, "
+                               " should have been enforced higher in the stack" );
+        }
+
+        // run a deletion where the PK is specified
+        // Can come from the applier thread on a slave
+        void deleteObjectFromCappedWithPK(BSONObj& pk, BSONObj& obj, uint64_t flags) {
+            _deleteObject(pk, obj, flags);
+            // just make it easy and invalidate this
+            _lastDeletedPK = BSONObj();
+        }
+
+        void updateObject(const BSONObj &pk, const BSONObj &oldObj, BSONObj &newObj, uint64_t flags) {
+            newObj = inheritIdField(oldObj, newObj);
+            long long diff = newObj.objsize() - oldObj.objsize();
+            uassert( 10003 , "failing update: objects in a capped ns cannot grow", diff <= 0 );
+
+            NamespaceDetails::updateObject(pk, oldObj, newObj, flags);
+            if (diff < 0) {
+                _currentSize.addAndFetch(diff);
+            }
+        }
+
+    protected:
+        void _insertObject(const BSONObj &obj, uint64_t flags) {
+            uassert( 16328 , str::stream() << "document is larger than capped size "
+                     << obj.objsize() << " > " << _maxSize, obj.objsize() <= _maxSize );
+
+            const BSONObj pk = getNextPK();
+            checkUniqueAndInsert(pk, obj, flags | NamespaceDetails::NO_UNIQUE_CHECKS | NamespaceDetails::NO_LOCKTREE, false);
+            checkGorged(obj, false);
+        }
+
+        // Note the commit of a transaction, which simple notes completion under the lock.
+        // We don't need to do anything with nDelta and sizeDelta because those changes
+        // are already applied to in-memory stats, and this transaction has committed.
+        void noteCommit(const BSONObj &minPK, long long nDelta, long long sizeDelta) {
+            noteComplete(minPK);
+        }
+
+        // Note the abort of a transaction, noting completion and updating in-memory stats.
+        //
+        // The given deltas are signed values that represent changes to the collection.
+        // We need to roll back those changes. Therefore, we subtract from the current value.
+        void noteAbort(const BSONObj &minPK, long long nDelta, long long sizeDelta) {
+            noteComplete(minPK);
+            _currentObjects.fetchAndSubtract(nDelta);
+            _currentSize.fetchAndSubtract(sizeDelta);
+
+            // If this transaction did inserts, it probably did deletes to make room
+            // for the new objects. Invalidate the last key deleted so that new
+            // trimming work properly recognizes that our deletes have been aborted.
+            SimpleMutex::scoped_lock lk(_deleteMutex);
+            _lastDeletedPK = BSONObj();
+        }
+
+    private:
+        // requires: _mutex is held
+        void noteUncommittedPK(const BSONObj &pk) {
+            CappedCollectionRollback &rollback = cc().txn().cappedRollback();
+            if (!rollback.hasNotedInsert(_ns)) {
+                // This transaction has not noted an insert yet, so we save this
+                // as a minimum uncommitted PK. The next insert by this txn won't be
+                // the minimum, and rollback.hasNotedInsert() will be true, so
+                // we won't save it.
+                _uncommittedMinPKs.insert(pk.getOwned());
+            }
+        }
+
+        BSONObj getNextPK() {
+            SimpleMutex::scoped_lock lk(_mutex);
+            BSONObjBuilder b(32);
+            b.append("", _nextPK.fetchAndAdd(1));
+            BSONObj pk = b.obj();
+            noteUncommittedPK(pk);
+            return pk;
+        }
+
+        // Note the completion of a transaction by removing its
+        // minimum-PK-inserted (if there is one) from the set.
+        void noteComplete(const BSONObj &minPK) {
+            if (!minPK.isEmpty()) {
+                SimpleMutex::scoped_lock lk(_mutex);
+                const int n = _uncommittedMinPKs.erase(minPK);
+                verify(n == 1);
+            }
+        }
+
+        void checkGorged(const BSONObj &obj, bool logop) {
+            // If the collection is gorged, we need to do some trimming work.
+            long long n = _currentObjects.load();
+            long long size = _currentSize.load();
+            if (isGorged(n, size)) {
+                trim(obj.objsize(), logop);
+            }
         }
 
         void checkUniqueIndexes(const BSONObj &pk, const BSONObj &obj, bool checkPk) {
@@ -408,23 +540,19 @@ namespace mongo {
             int start = checkPk ? 0 : 1;
             for (int i = start; i < nIndexes(); i++) {
                 IndexDetails &idx = *_indexes[i];
-                BSONObjSet keys;
-                idx.getKeysFromObject(obj, keys);
-                for (BSONObjSet::const_iterator ki = keys.begin(); ki != keys.end(); ++ki) {
-                    idx.uniqueCheck(*ki, &pk);
+                if (idx.unique()) {
+                    BSONObjSet keys;
+                    idx.getKeysFromObject(obj, keys);
+                    for (BSONObjSet::const_iterator ki = keys.begin(); ki != keys.end(); ++ki) {
+                        idx.uniqueCheck(*ki, &pk);
+                    }
                 }
             }
         }
 
-        void getPkForCapped(BSONObj &pk) {
-            SimpleMutex::scoped_lock lk(_mutex);
-            BSONObjBuilder b(32);
-            b.append("", _nextPK.fetchAndAdd(1));
-            pk = b.obj();
-            _uncommittedPKs.insert(pk);
-        }
-
-        void insertObjectIntoCapped(BSONObj &pk, BSONObj &obj, uint64_t flags, bool checkPk) {
+        // Checks unique indexes and does the actual inserts.
+        // Does not check if the collection became gorged.
+        void checkUniqueAndInsert(const BSONObj &pk, const BSONObj &obj, uint64_t flags, bool checkPk) {
             // Note the insert we're about to do.
             CappedCollectionRollback &rollback = cc().txn().cappedRollback();
             rollback.noteInsert(_ns, pk, obj.objsize());
@@ -439,124 +567,11 @@ namespace mongo {
             insertIntoIndexes(pk, obj, flags);
         }
 
-        void noteInsertedObjectIntoCapped(const BSONObj &obj, bool logop) {
-            // If the collection is gorged, we need to do some trimming work.
-            long long n = _currentObjects.load();
-            long long size = _currentSize.load();
-            if (isGorged(n, size)) {
-                trim(obj.objsize(), logop);
-            }
-        }
-
-        // run an insertion where the PK is specified
-        // Can come from the applier thread on a slave or a cloner 
-        virtual void insertObjectIntoCappedWithPK(BSONObj& pk, BSONObj& obj, uint64_t flags) {
-            // note that checkpk is on
-            insertObjectIntoCapped(pk, obj, flags, true);
-
-            SimpleMutex::scoped_lock lk(_mutex);
-            long long pkVal = pk[""].Long();
-            if (pkVal >= _nextPK.load()) {
-                _nextPK = AtomicWord<long long>(pkVal + 1);
-            }
-            _uncommittedPKs.insert(pk.copy());
-        }
-
-        virtual void insertObjectIntoCappedAndLogOps(BSONObj &obj, uint64_t flags) {
-            obj = addIdField(obj);
-            uassert( 16774 , str::stream() << "document is larger than capped size "
-                     << obj.objsize() << " > " << _maxSize, obj.objsize() <= _maxSize );
-
-            // Generate the next pk and insert it into the set, under the lock
-            BSONObj pk;
-            getPkForCapped(pk);
-
-            insertObjectIntoCapped(pk, obj, flags | ND_UNIQUE_CHECKS_OFF | ND_LOCK_TREE_OFF, false);
-            OpLogHelpers::logInsertForCapped(_ns.c_str(), pk, obj, &cc().txn());
-
-            // If the collection is gorged, we need to do some trimming work.
-            noteInsertedObjectIntoCapped(obj, true);
-        }
-
-        void insertObject(BSONObj &obj, uint64_t flags) {
-            obj = addIdField(obj);
-            uassert( 16328 , str::stream() << "document is larger than capped size "
-                     << obj.objsize() << " > " << _maxSize, obj.objsize() <= _maxSize );
-
-            // Generate the next pk and insert it into the set, under the lock
-            BSONObj pk;
-            getPkForCapped(pk);
-
-            insertObjectIntoCapped(pk, obj, flags | ND_UNIQUE_CHECKS_OFF | ND_LOCK_TREE_OFF, false);
-
-            // If the collection is gorged, we need to do some trimming work.
-            noteInsertedObjectIntoCapped(obj, false);
-        }
-
-        void deleteObject(const BSONObj &pk, const BSONObj &obj) {
-            massert(16460, "bug: cannot remove from a capped collection, "
-                    " should have been enforced higher in the stack", false);
-        }
-
-        // run a deletion where the PK is specified
-        // Can come from the applier thread on a slave
-        virtual void deleteObjectIntoCappedWithPK(BSONObj& pk, BSONObj& obj) {
-            _deleteObject(pk, obj);
-            // just make it easy and invalidate this
-            _lastDeletedPK = BSONObj();
-        }
-
-        void updateObject(const BSONObj &pk, const BSONObj &oldObj, const BSONObj &newObj) {
-            // if newObj has no _id field, it should inherit the existing value
-            BSONObj newObjWithId = inheritIdField(oldObj, newObj);
-            long long diff = newObjWithId.objsize() - oldObj.objsize();
-            uassert( 10003 , "failing update: objects in a capped ns cannot grow", diff <= 0 );
-
-            NamespaceDetails::updateObject(pk, oldObj, newObjWithId);
-            if (diff < 0) {
-                _currentSize.addAndFetch(diff);
-            }
-        }
-
-    protected:
-        // Note the commit of a transaction, which simple notes completion under the lock.
-        // We don't need to do anything with nDelta and sizeDelta because those changes
-        // are already applied to in-memory stats, and this transaction has committed.
-        void noteCommit(const vector <BSONObj> &pks, long long nDelta, long long sizeDelta) {
-            noteComplete(pks);
-        }
-
-        // Note the abort of a transaction, noting completion and updating in-memory stats.
-        //
-        // The given deltas are signed values that represent changes to the collection.
-        // We need to roll back those changes. Therefore, we subtract from the current value.
-        void noteAbort(const vector<BSONObj> &pks, long long nDelta, long long sizeDelta) {
-            noteComplete(pks);
-            _currentObjects.fetchAndSubtract(nDelta);
-            _currentSize.fetchAndSubtract(sizeDelta);
-
-            // If this transaction did inserts, it probably did deletes to make room
-            // for the new objects. Invalidate the last key deleted so that new
-            // trimming work properly recognizes that our deletes have been aborted.
-            SimpleMutex::scoped_lock lk(_deleteMutex);
-            _lastDeletedPK = BSONObj();
-        }
-
-    private:
-        // Note the completion of a transaction by removing its inserted PKs from the set.
-        void noteComplete(const vector<BSONObj> &pks) {
-            SimpleMutex::scoped_lock lk(_mutex);
-            for (vector<BSONObj>::const_iterator it = pks.begin(); it != pks.end(); it++) {
-                const int n = _uncommittedPKs.erase(*it);
-                verify(n == 1);
-            }
-        }
-
         bool isGorged(long long n, long long size) const {
             return (_maxObjects > 0 && n > _maxObjects) || (_maxSize > 0 && size > _maxSize);
         }
 
-        void _deleteObject(const BSONObj &pk, const BSONObj &obj) {
+        void _deleteObject(const BSONObj &pk, const BSONObj &obj, uint64_t flags) {
             // Note the delete we're about to do.
             size_t size = obj.objsize();
             CappedCollectionRollback &rollback = cc().txn().cappedRollback();
@@ -564,11 +579,10 @@ namespace mongo {
             _currentObjects.subtractAndFetch(1);
             _currentSize.subtractAndFetch(size);
 
-            NaturalOrderCollection::deleteObject(pk, obj);
+            NaturalOrderCollection::deleteObject(pk, obj, flags);
         }
 
-        void trim(int objsize, bool logop) 
-        {
+        void trim(int objsize, bool logop) {
             SimpleMutex::scoped_lock lk(_deleteMutex);
             long long n = _currentObjects.load();
             long long size = _currentSize.load();
@@ -584,10 +598,11 @@ namespace mongo {
                                            _lastDeletedPK.firstElement().Long() : 0;
                 // TODO: Disable prelocking on this cursor, or somehow prevent waiting 
                 //       on row locks we can't get immediately.
-                for ( IndexCursor c(this, getPKIndex(), BSON("" << startKey), maxKey, true, 1);
-                      c.ok(); c.advance() ) {
-                    BSONObj oldestPK = c.currPK();
-                    BSONObj oldestObj = c.current();
+                for ( shared_ptr<Cursor> c(IndexCursor::make(this, getPKIndex(),
+                                           BSON("" << startKey), maxKey, true, 1) );
+                      c->ok(); c->advance() ) {
+                    BSONObj oldestPK = c->currPK();
+                    BSONObj oldestObj = c->current();
                     trimmedBytes += oldestPK.objsize();
                     
                     if (logop) {
@@ -595,7 +610,7 @@ namespace mongo {
                     }
                     
                     // Delete the object, reload the current objects/size
-                    _deleteObject(oldestPK, oldestObj);
+                    _deleteObject(oldestPK, oldestObj, 0);
                     _lastDeletedPK = oldestPK.getOwned();
                     n = _currentObjects.load();
                     size = _currentSize.load();
@@ -609,11 +624,11 @@ namespace mongo {
         }
 
         // Remove everything from this capped collection
-        virtual void empty() {
+        void empty() {
             SimpleMutex::scoped_lock lk(_deleteMutex);
-            scoped_ptr<Cursor> c( BasicCursor::make(this) );
+            shared_ptr<Cursor> c( BasicCursor::make(this) );
             for ( ; c->ok() ; c->advance() ) {
-                _deleteObject(c->currPK(), c->current());
+                _deleteObject(c->currPK(), c->current(), 0);
             }
             _lastDeletedPK = BSONObj();
         }
@@ -623,29 +638,52 @@ namespace mongo {
         AtomicWord<long long> _currentObjects;
         AtomicWord<long long> _currentSize;
         BSONObj _lastDeletedPK;
-        // The set of uncommited primary keys for this capped collection.
-        // Tailable cursors must not read passed the minimum of this set.
-        BSONObjSet _uncommittedPKs;
+        // The set of minimum-uncommitted-PKs for this capped collection.
+        // Each transaction that has done inserts has the minimum PK it
+        // inserted in this set.
+        //
+        // Tailable cursors must not read at or past the smallest value in this set.
+        BSONObjSet _uncommittedMinPKs;
         SimpleMutex _mutex;
         SimpleMutex _deleteMutex;
-
-        friend class CappedCollectionRollback;
     };
 
-    // On startup, we install this hook for txn completion. In a perfect world
-    // we don't need a functoin pointer and we have a better idea of what
-    // object files get linked where, but for now we do this.
-    void noteTxnCompleted(const string &ns, const vector<BSONObj> &insertedPKs,
-                          long long nDelta, long long sizeDelta, bool committed) {
-        NamespaceDetails *d = nsdetails(ns.c_str());
-        if (d != NULL) {
-            if (committed) {
-                d->noteCommit(insertedPKs, nDelta, sizeDelta);
-            } else {
-                d->noteAbort(insertedPKs, nDelta, sizeDelta);
-            }
+    // Profile collections are non-replicated capped collections that
+    // cannot be updated and do not add the _id field on insert.
+    class ProfileCollection : public CappedCollection {
+    public:
+        ProfileCollection(const StringData &ns, const BSONObj &options) :
+            // Never automatically index the _id field
+            CappedCollection(ns, options, false) {
         }
-    }
+        ProfileCollection(const BSONObj &serialized) :
+            CappedCollection(serialized) {
+        }
+
+        void insertObjectIntoCappedWithPK(BSONObj& pk, BSONObj& obj, uint64_t flags) {
+            msgasserted( 16847, "bug: The profile collection should not have replicated inserts." );
+        }
+
+        void insertObjectIntoCappedAndLogOps(BSONObj &obj, uint64_t flags) {
+            msgasserted( 16848, "bug: The profile collection should not not log inserts." );
+        }
+
+        void insertObject(BSONObj &obj, uint64_t flags) {
+            _insertObject(obj, flags);
+        }
+
+        void deleteObjectFromCappedWithPK(BSONObj& pk, BSONObj& obj, uint64_t flags) {
+            msgasserted( 16849, "bug: The profile collection should not have replicated deletes." );
+        }
+
+        void updateObject(const BSONObj &pk, const BSONObj &oldObj, BSONObj &newObj, uint64_t flags) {
+            msgasserted( 16850, "bug: The profile collection should not be updated." );
+        }
+
+        void createIndex(const BSONObj &idx_info) {
+            uassert(16851, "Cannot have an _id index on the system profile collection", !idx_info["key"]["_id"].ok());
+        }
+    };
 
     /* ------------------------------------------------------------------------- */
 
@@ -681,24 +719,26 @@ namespace mongo {
         return b.obj();
     }
 
-    static bool isSystemCatalog(const string &ns) {
-        return str::contains(ns, ".system.indexes") || str::contains(ns, ".system.namespaces");
+    static bool isSystemCatalog(const StringData &ns) {
+        return ns.find(".system.indexes") != string::npos || ns.find(".system.namespaces") != string::npos;
     }
-
-    static bool isOplog(const string &ns) {
-        return str::equals(ns.c_str(), rsoplog);
+    static bool isProfileCollection(const StringData &ns) {
+        return ns.find(".system.profile") != string::npos;
+    }
+    static bool isOplogCollection(const StringData &ns) {
+        return ns == rsoplog;
     }
 
     // Construct a brand new NamespaceDetails with a certain primary key and set of options.
-    NamespaceDetails::NamespaceDetails(const string &ns, const BSONObj &pkIndexPattern, const BSONObj &options) :
-        _ns(ns),
+    NamespaceDetails::NamespaceDetails(const StringData &ns, const BSONObj &pkIndexPattern, const BSONObj &options) :
+        _ns(ns.toString()),
         _options(options.copy()),
         _pk(pkIndexPattern.copy()),
         _indexBuildInProgress(false),
         _nIndexes(0),
         _multiKeyIndexBits(0) {
 
-        massert( 10356 ,  str::stream() << "invalid ns: " << ns , NamespaceString::validCollectionName(ns.c_str()));
+        massert( 10356 ,  str::stream() << "invalid ns: " << ns , NamespaceString::validCollectionName(ns.rawData()));
 
         TOKULOG(1) << "Creating NamespaceDetails " << ns << endl;
 
@@ -706,15 +746,31 @@ namespace mongo {
         BSONObj info = indexInfo(pkIndexPattern, true, true);
         createIndex(info);
 
-        addNewNamespaceToCatalog(ns, !options.isEmpty() ? &options : NULL);
+        try {
+            // If this throws, it's safe to call close() because we just created the index.
+            // Therefore we have a write lock, and nobody else could have any uncommitted
+            // modifications to this index, so close() should succeed, and #29 is irrelevant.
+            addNewNamespaceToCatalog(ns, !options.isEmpty() ? &options : NULL);
+        }
+        catch (...) {
+            close();
+            throw;
+        }
     }
-    shared_ptr<NamespaceDetails> NamespaceDetails::make(const string &ns, const BSONObj &options) {
-        if (isOplog(ns)) {
+    shared_ptr<NamespaceDetails> NamespaceDetails::make(const StringData &ns, const BSONObj &options) {
+        if (isOplogCollection(ns)) {
             return shared_ptr<NamespaceDetails>(new OplogCollection(ns, options));
         } else if (isSystemCatalog(ns)) {
             return shared_ptr<NamespaceDetails>(new SystemCatalogCollection(ns, options));
+        } else if (isProfileCollection(ns)) {
+            // TokuMX doesn't _necessarily_ need the profile to be capped, but vanilla does.
+            // We enforce the restriction because it's easier to implement. See SERVER-6937.
+            uassert( 16852, "System profile must be a capped collection.", options["capped"].trueValue() );
+            return shared_ptr<NamespaceDetails>(new ProfileCollection(ns, options));
         } else if (options["capped"].trueValue()) {
             return shared_ptr<NamespaceDetails>(new CappedCollection(ns, options));
+        } else if (options["natural"].trueValue()) {
+            return shared_ptr<NamespaceDetails>(new NaturalOrderCollection(ns, options));
         } else {
             return shared_ptr<NamespaceDetails>(new IndexedCollection(ns, options));
         }
@@ -736,19 +792,31 @@ namespace mongo {
         }
     }
     shared_ptr<NamespaceDetails> NamespaceDetails::make(const BSONObj &serialized) {
-        if (isOplog(serialized["ns"])) {
+        const string ns = serialized["ns"].String();
+        if (isOplogCollection(ns)) {
             return shared_ptr<NamespaceDetails>(new OplogCollection(serialized));
-        } else if (isSystemCatalog(serialized["ns"])) {
+        } else if (isSystemCatalog(ns)) {
             return shared_ptr<NamespaceDetails>(new SystemCatalogCollection(serialized));
+        } else if (isProfileCollection(ns)) {
+            return shared_ptr<NamespaceDetails>(new ProfileCollection(serialized));
         } else if (serialized["options"]["capped"].trueValue()) {
             return shared_ptr<NamespaceDetails>(new CappedCollection(serialized));
+        } else if (serialized["options"]["natural"].trueValue()) {
+            return shared_ptr<NamespaceDetails>(new NaturalOrderCollection(serialized));
         } else {
             return shared_ptr<NamespaceDetails>(new IndexedCollection(serialized));
         }
     }
 
+    void NamespaceDetails::close() {
+        for (IndexVector::iterator it = _indexes.begin(); it != _indexes.end(); ++it) {
+            IndexDetails *idx = it->get();
+            idx->close();
+        }
+    }
+
     // Serialize the information necessary to re-open this NamespaceDetails later.
-    BSONObj NamespaceDetails::serialize(const char *ns, const BSONObj &options, const BSONObj &pk,
+    BSONObj NamespaceDetails::serialize(const StringData& ns, const BSONObj &options, const BSONObj &pk,
             unsigned long long multiKeyIndexBits, const BSONArray &indexes_array) {
         return BSON("ns" << ns <<
                     "options" << options <<
@@ -762,26 +830,38 @@ namespace mongo {
             IndexDetails *index = it->get();
             indexes_array.append(index->info());
         }
-        return serialize(_ns.c_str(), _options, _pk, _multiKeyIndexBits, indexes_array.arr());
+        return serialize(_ns, _options, _pk, _multiKeyIndexBits, indexes_array.arr());
     }
 
-    struct findByPKCallbackExtra {
-        BSONObj &obj;
-
-        findByPKCallbackExtra(BSONObj &o) : obj(o) { }
-    };
-
-    static int findByPKCallback(const DBT *key, const DBT *value, void *extra) {
-        if (key != NULL) {
-            struct findByPKCallbackExtra *info = reinterpret_cast<findByPKCallbackExtra *>(extra);
-            BSONObj obj(reinterpret_cast<char *>(value->data));
-            info->obj = obj.getOwned();
+    int NamespaceDetails::findByPKCallback(const DBT *key, const DBT *value, void *extra) {
+        struct findByPKCallbackExtra *info = reinterpret_cast<findByPKCallbackExtra *>(extra);
+        try {
+            if (key != NULL) {
+                struct findByPKCallbackExtra *info = reinterpret_cast<findByPKCallbackExtra *>(extra);
+                BSONObj obj(reinterpret_cast<char *>(value->data));
+                info->obj = obj.getOwned();
+            }
+            return 0;
+        } catch (std::exception &e) {
+            info->ex = &e;
         }
-        return 0;
+        return -1;
+    }
+
+    bool NamespaceDetails::findOne(const BSONObj &query, BSONObj &result, const bool requireIndex) const {
+        for (shared_ptr<Cursor> c( NamespaceDetailsTransient::getCursor(_ns, query, BSONObj(),
+                                       requireIndex ? QueryPlanSelectionPolicy::indexOnly() :
+                                                      QueryPlanSelectionPolicy::any() ) );
+             c->ok(); c->advance()) {
+            if ( c->currentMatches() && !c->getsetdup( c->currPK() ) ) {
+                result = c->current().copy();
+                return true;
+            }
+        }
+        return false;
     }
 
     bool NamespaceDetails::findByPK(const BSONObj &key, BSONObj &result) const {
-        int r;
 
         // get a cursor over the primary key index
         IndexDetails &pkIdx = getPKIndex();
@@ -798,7 +878,10 @@ namespace mongo {
         // Try to find it.
         BSONObj obj = BSONObj();
         struct findByPKCallbackExtra extra(obj);
-        r = cursor->c_getf_set(cursor, 0, &key_dbt, findByPKCallback, &extra);
+        const int r = cursor->c_getf_set(cursor, 0, &key_dbt, findByPKCallback, &extra);
+        if (extra.ex != NULL) {
+            throw *extra.ex;
+        }
         if (r != 0 && r != DB_NOTFOUND) {
             storage::handle_ydb_error(r);
         }
@@ -811,44 +894,39 @@ namespace mongo {
         }
     }
 
-    // Temporarily factored out of insertIntoIndexes() for trickle-loaded index builds.
-    void NamespaceDetails::insertIntoOneIndex(const int i, const BSONObj &pk, const BSONObj &obj, uint64_t flags) {
-        IndexDetails &idx = *_indexes[i];
-        if (i == 0) {
-            dassert(isPKIndex(idx));
-            idx.insertPair(pk, NULL, obj, flags);
-        } else {
-            BSONObjSet keys;
-            idx.getKeysFromObject(obj, keys);
-            if (keys.size() > 1) {
-                setIndexIsMultikey(_ns.c_str(), i);
-            }
-            for (BSONObjSet::const_iterator ki = keys.begin(); ki != keys.end(); ++ki) {
-                idx.insertPair(*ki, &pk, obj, flags);
-            }
-        }
-    }
-
     void NamespaceDetails::insertIntoIndexes(const BSONObj &pk, const BSONObj &obj, uint64_t flags) {
         dassert(!pk.isEmpty());
         dassert(!obj.isEmpty());
-        if ((flags & ND_UNIQUE_CHECKS_OFF) && _indexes.size() > 1) {
+        if ((flags & NamespaceDetails::NO_UNIQUE_CHECKS) && _indexes.size() > 1) {
             //wunimplemented("overwrite inserts on secondary keys right now don't work");
             //uassert(16432, "can't do overwrite inserts when there are secondary keys yet", !overwrite || _indexes.size() == 1);
         }
         for (int i = 0; i < nIndexes(); i++) {
-            insertIntoOneIndex(i, pk, obj, flags);
+            IndexDetails &idx = *_indexes[i];
+            if (i == 0) {
+                dassert(isPKIndex(idx));
+                idx.insertPair(pk, NULL, obj, flags);
+            } else {
+                BSONObjSet keys;
+                idx.getKeysFromObject(obj, keys);
+                if (keys.size() > 1) {
+                    setIndexIsMultikey(_ns.c_str(), i);
+                }
+                for (BSONObjSet::const_iterator ki = keys.begin(); ki != keys.end(); ++ki) {
+                    idx.insertPair(*ki, &pk, obj, flags);
+                }
+            }
         }
     }
 
-    void NamespaceDetails::deleteFromIndexes(const BSONObj &pk, const BSONObj &obj) {
+    void NamespaceDetails::deleteFromIndexes(const BSONObj &pk, const BSONObj &obj, uint64_t flags) {
         dassert(!pk.isEmpty());
         dassert(!obj.isEmpty());
         for (int i = 0; i < nIndexes(); i++) {
             IndexDetails &idx = *_indexes[i];
 
             if (i == 0) {
-                idx.deletePair(pk, NULL);
+                idx.deletePair(pk, NULL, flags);
             } else {
                 BSONObjSet keys;
                 idx.getKeysFromObject(obj, keys);
@@ -856,7 +934,7 @@ namespace mongo {
                     dassert(isMultikey(i)); // some prior insert should have marked it as multikey
                 }
                 for (BSONObjSet::const_iterator ki = keys.begin(); ki != keys.end(); ++ki) {
-                    idx.deletePair(*ki, &pk);
+                    idx.deletePair(*ki, &pk, flags);
                 }
             }
         }
@@ -875,7 +953,12 @@ namespace mongo {
         return contains;
     }
 
-    void NamespaceDetails::updateObject(const BSONObj &pk, const BSONObj &oldObj, const BSONObj &newObj) {
+    // deletes an object from this namespace, taking care of secondary indexes if they exist
+    void NamespaceDetails::deleteObject(const BSONObj &pk, const BSONObj &obj, uint64_t flags) {
+        deleteFromIndexes(pk, obj, flags);
+    }
+
+    void NamespaceDetails::updateObject(const BSONObj &pk, const BSONObj &oldObj, BSONObj &newObj, uint64_t flags) {
         TOKULOG(4) << "NamespaceDetails::updateObject pk "
             << pk << ", old " << oldObj << ", new " << newObj << endl;
 
@@ -888,7 +971,7 @@ namespace mongo {
 
             if (i == 0) {
                 // Overwrite oldObj with newObj using the given pk.
-                idx.insertPair(pk, NULL, newObj, ND_UNIQUE_CHECKS_OFF);
+                idx.insertPair(pk, NULL, newObj, flags | NamespaceDetails::NO_UNIQUE_CHECKS);
             } else {
                 // Determine what keys need to be removed/added.
                 BSONObjSet oldKeys;
@@ -903,22 +986,26 @@ namespace mongo {
                 for (BSONObjSet::iterator o = oldKeys.begin(); o != oldKeys.end(); o++) {
                     const BSONObj &k = *o;
                     if (!orderedSetContains(newKeys, k)) {
-                        idx.deletePair(k, &pk);
+                        idx.deletePair(k, &pk, flags);
                     }
                 }
                 // Insert the keys that exist in newKeys but do not exist in oldKeys
                 for (BSONObjSet::iterator n = newKeys.begin(); n != newKeys.end(); n++) {
                     const BSONObj &k = *n;
                     if (!orderedSetContains(oldKeys, k)) {
-                        idx.insertPair(k, &pk, newObj, 0);
+                        idx.insertPair(k, &pk, newObj, flags);
+                    }
+                    else if (idx.clustering()) {
+                        // if clustering, overwrite every key with the new data
+                        idx.insertPair(k, &pk, newObj, flags | NamespaceDetails::NO_UNIQUE_CHECKS);
                     }
                 }
             }
         }
     }
 
-    void NamespaceDetails::setIndexIsMultikey(const char *thisns, int i) {
-        dassert(string(thisns) == _ns);
+    void NamespaceDetails::setIndexIsMultikey(const StringData& thisns, int i) {
+        dassert(thisns == _ns);
         dassert(i < NIndexesMax);
         unsigned long long x = ((unsigned long long) 1) << i;
         if (_multiKeyIndexBits & x) {
@@ -935,14 +1022,60 @@ namespace mongo {
         NamespaceDetailsTransient::get(thisns).clearQueryCache();
     }
 
+    void NamespaceDetails::buildIndex(shared_ptr<IndexDetails> &index) {
+        _indexBuildInProgress = true;
+
+        IndexDetails::Builder builder(*index);
+
+        const int indexNum = idxNo(*index);
+        for ( shared_ptr<Cursor> cursor(BasicCursor::make(this));
+              cursor->ok(); cursor->advance()) {
+            BSONObj pk = cursor->currPK();
+            BSONObj obj = cursor->current();
+            BSONObjSet keys;
+            index->getKeysFromObject(obj, keys);
+            if (keys.size() > 1) {
+                setIndexIsMultikey(_ns, indexNum);
+            }
+            for (BSONObjSet::const_iterator ki = keys.begin(); ki != keys.end(); ++ki) {
+                builder.insertPair(*ki, &pk, obj);
+            }
+            killCurrentOp.checkForInterrupt(false); // uasserts if we should stop
+        }
+
+        builder.done();
+
+        // If the index is unique, check all adjacent keys for a duplicate.
+        if (index->unique()) {
+            IndexScanCursor c(this, *index, 1);
+            BSONObj prevKey = c.currKey().getOwned();
+            c.advance();
+            for ( ; c.ok(); c.advance()) {
+                BSONObj currKey = c.currKey(); 
+                if (currKey == prevKey) {
+                    index->uassertedDupKey(currKey);
+                }
+                prevKey = currKey.getOwned();
+            }
+        }
+
+        _indexBuildInProgress = false;
+    }
+
+    void NamespaceDetails::empty() {
+        for ( shared_ptr<Cursor> c( BasicCursor::make(this) ); c->ok() ; c->advance() ) {
+            deleteObject(c->currPK(), c->current(), 0);
+        }
+    }
+
     void NamespaceDetails::createIndex(const BSONObj &idx_info) {
         uassert(16449, "dropDups is not supported and is likely to remain unsupported for some time because it deletes arbitrary data",
                 !idx_info["dropDups"].trueValue());
         uassert(12588, "cannot add index with a background operation in progress", !_indexBuildInProgress);
         uassert(12523, "no index name specified", idx_info["name"].ok());
 
-        const string &name = idx_info["name"].String();
-        if (findIndexByName(name.c_str()) >= 0) {
+        const StringData &name = idx_info["name"].Stringdata();
+        if (findIndexByName(name) >= 0) {
             // index already exists.
             uasserted(16753, mongoutils::str::stream() << "index with name " << name << " already exists");
         }
@@ -967,57 +1100,68 @@ namespace mongo {
             throw RetryWithWriteLock();
         }
 
+        // Note this ns in the rollback so if this transaction aborts, we'll
+        // close this ns, forcing the next user to reload in-memory metadata.
+        NamespaceIndexRollback &rollback = cc().txn().nsIndexRollback();
+        rollback.noteNs(_ns);
+
         shared_ptr<IndexDetails> index(new IndexDetails(idx_info));
         // Ensure we initialize the spec in case the collection is empty.
         // This also causes an error to be thrown if we're trying to create an invalid index on an empty collection.
-        index->getSpec();
-        _indexBuildInProgress = true;
-        _indexes.push_back(index);
+        const bool isSecondaryIndex = _nIndexes > 0;
         try {
-            string thisns(index->parentNS());
-            uint64_t iter = 0;
-            const int i = idxNo(*index);
-            for (shared_ptr<Cursor> cursor(Helpers::findTableScan(thisns.c_str(), BSONObj())); cursor->ok(); cursor->advance(), iter++) {
-                if (iter % 1000 == 0) {
-                    killCurrentOp.checkForInterrupt(false); // uasserts if we should stop
+            index->getSpec();
+            _indexes.push_back(index);
+
+            // Only secondary indexes need to be built.
+            if (isSecondaryIndex) {
+                try {
+                    buildIndex(index);
                 }
-                insertIntoOneIndex(i, cursor->currPK(), cursor->current(), 0);
+                catch (DBException) {
+                    _indexes.pop_back();
+                    throw;
+                }
             }
-        } catch (DBException &e) {
-            _indexes.pop_back();
-            _indexBuildInProgress = false;
+        }
+        catch (DBException &) {
+            // Can't let the IndexDetails destructor get called on its own any more, see IndexDetails::close for why.
+            index->close();
             throw;
         }
         _nIndexes++;
-        _indexBuildInProgress = false;
 
-        string idx_ns = idx_info["ns"].String();
-        const char *ns = idx_ns.c_str();
+        const StringData &idx_ns = idx_info["ns"].Stringdata();
 
         // The first index we create should be the pk index, when we first create the collection.
-        // Therefore the collection's NamespaceDetails should not already exist in the NamespaceIndex.
-        const bool may_overwrite = _nIndexes > 1;
+        // Therefore the collection's NamespaceDetails should not already exist in the NamespaceIndex
+        // unless we are building a secondary index (and therefore the collection already exists)
+        const bool may_overwrite = isSecondaryIndex;
         if (!may_overwrite) {
             massert(16435, "first index should be pk index", index->keyPattern() == _pk);
         }
-        nsindex(ns)->update_ns(ns, serialize(), may_overwrite);
+        nsindex(idx_ns)->update_ns(idx_ns, serialize(), isSecondaryIndex);
 
-        NamespaceDetailsTransient::get(ns).addedIndex();
+        NamespaceDetailsTransient::get(idx_ns).addedIndex();
     }
 
     // Normally, we cannot drop the _id_ index.
     // The parameters mayDeleteIdIndex is here for the case where we call dropIndexes
     // through dropCollection, in which case we are dropping an entire collection,
     // hence the _id_ index will have to go.
-    bool NamespaceDetails::dropIndexes(const char *ns, const char *name, string &errmsg, BSONObjBuilder &result, bool mayDeleteIdIndex) {
+    bool NamespaceDetails::dropIndexes(const StringData& ns, const StringData& name, string &errmsg, BSONObjBuilder &result, bool mayDeleteIdIndex) {
+        Lock::assertWriteLocked(ns);
         TOKULOG(1) << "dropIndexes " << name << endl;
 
-        //BackgroundOperation::assertNoBgOpInProgForNs(ns);
+        // Note this ns in the rollback so if this transaction aborts, we'll
+        // close this ns, forcing the next user to reload in-memory metadata.
+        NamespaceIndexRollback &rollback = cc().txn().nsIndexRollback();
+        rollback.noteNs(_ns);
 
         NamespaceDetails *d = nsdetails(ns);
         ClientCursor::invalidate(ns);
 
-        if (mongoutils::str::equals(name, "*")) {
+        if (name == "*") {
             result.append("nIndexesWas", (double) _nIndexes);
             // This is O(n^2), not great, but you can have at most 64 indexes anyway.
             for (IndexVector::iterator it = _indexes.begin(); it != _indexes.end(); ) {
@@ -1131,20 +1275,18 @@ namespace mongo {
     }
 
     static void addIndexToCatalog(const BSONObj &info) {
-        string indexns = info["ns"].String();
-        if (mongoutils::str::contains(indexns, ".system.indexes")) {
+        const StringData &indexns = info["ns"].Stringdata();
+        if (indexns.find(".system.indexes") != string::npos) {
             // system.indexes holds all the others, so it is not explicitly listed in the catalog.
             return;
         }
 
-        char database[256];
-        nsToDatabase(indexns.c_str(), database);
-        string s = string(database) + ".system.indexes";
-        const char *ns = s.c_str();
+        StringData database = nsToDatabaseSubstring(indexns);
+        string ns = database.toString() + ".system.indexes";
         NamespaceDetails *d = nsdetails_maybe_create(ns);
         NamespaceDetailsTransient *nsdt = &NamespaceDetailsTransient::get(ns);
         BSONObj objMod = info;
-        insertOneObject(d, nsdt, objMod, 0);
+        insertOneObject(d, nsdt, objMod);
     }
 
     void NamespaceDetails::addDefaultIndexesToCatalog() {
@@ -1159,8 +1301,8 @@ namespace mongo {
 
     SimpleMutex NamespaceDetailsTransient::_qcMutex("qc");
     SimpleMutex NamespaceDetailsTransient::_isMutex("is");
-    map< string, shared_ptr< NamespaceDetailsTransient > > NamespaceDetailsTransient::_nsdMap;
-    typedef map< string, shared_ptr< NamespaceDetailsTransient > >::iterator ouriter;
+    StringMap<shared_ptr<NamespaceDetailsTransient> > NamespaceDetailsTransient::_nsdMap;
+    typedef StringMap<shared_ptr<NamespaceDetailsTransient> >::const_iterator ouriter;
 
     void NamespaceDetailsTransient::reset() {
         // TODO(leif): why is this here?
@@ -1170,7 +1312,7 @@ namespace mongo {
         _indexSpecs.clear();
     }
 
-    /*static*/ NOINLINE_DECL NamespaceDetailsTransient& NamespaceDetailsTransient::make_inlock(const char *ns) {
+    /*static*/ NOINLINE_DECL NamespaceDetailsTransient& NamespaceDetailsTransient::make_inlock(const StringData& ns) {
         shared_ptr< NamespaceDetailsTransient > &t = _nsdMap[ ns ];
         verify( t.get() == 0 );
         if( _nsdMap.size() % 20000 == 10000 ) { 
@@ -1182,19 +1324,19 @@ namespace mongo {
         return *t;
     }
 
-    NamespaceDetailsTransient::NamespaceDetailsTransient(const char *ns) : 
-        _ns(ns), _keysComputed(false), _qcWriteCount() {
+    NamespaceDetailsTransient::NamespaceDetailsTransient(const StringData& ns) : 
+            _ns(ns.toString()), _keysComputed(false), _qcWriteCount() {
     }
 
     NamespaceDetailsTransient::~NamespaceDetailsTransient() { 
     }
 
-    void NamespaceDetailsTransient::clearForPrefix(const char *prefix) {
+    void NamespaceDetailsTransient::clearForPrefix(const StringData& prefix) {
         SimpleMutex::scoped_lock lk(_qcMutex);
         vector< string > found;
         for( ouriter i = _nsdMap.begin(); i != _nsdMap.end(); ++i ) {
-            if ( strncmp( i->first.c_str(), prefix, strlen( prefix ) ) == 0 ) {
-                found.push_back( i->first );
+            if (StringData(i->first).startsWith(prefix)) {
+                found.push_back(i->first);
                 Lock::assertWriteLocked(i->first);
             }
         }
@@ -1203,11 +1345,11 @@ namespace mongo {
         }
     }
 
-    void NamespaceDetailsTransient::eraseForPrefix(const char *prefix) {
+    void NamespaceDetailsTransient::eraseForPrefix(const StringData& prefix) {
         SimpleMutex::scoped_lock lk(_qcMutex);
         vector< string > found;
         for( ouriter i = _nsdMap.begin(); i != _nsdMap.end(); ++i ) {
-            if ( strncmp( i->first.c_str(), prefix, strlen( prefix ) ) == 0 ) {
+            if (StringData(i->first).startsWith(prefix)) {
                 found.push_back( i->first );
                 Lock::assertWriteLocked(i->first);
             }
@@ -1219,7 +1361,7 @@ namespace mongo {
 
     void NamespaceDetailsTransient::computeIndexKeys() {
         _indexKeys.clear();
-        NamespaceDetails *d = nsdetails(_ns.c_str());
+        NamespaceDetails *d = nsdetails(_ns);
         if ( ! d )
             return;
         NamespaceDetails::IndexIterator i = d->ii();
@@ -1230,113 +1372,121 @@ namespace mongo {
 
     // TODO: All global functions manipulating namespaces should be static in NamespaceDetails
 
-    bool userCreateNS(const char *ns, BSONObj options, string& err, bool logForReplication) {
-        const char *coll = strchr( ns, '.' ) + 1;
-        massert( 16451 ,  str::stream() << "invalid ns: " << ns , NamespaceString::validCollectionName(ns));
-        char cl[ 256 ];
-        nsToDatabase( ns, cl );
-        if (nsdetails(ns) != NULL) {
-            // Namespace already exists
-            return false;
-        } else {
-            // This creates the namespace as well as its _id index
-            nsdetails_maybe_create(ns, options);
-            if ( logForReplication ) {
-                if ( options.getField( "create" ).eoo() ) {
-                    BSONObjBuilder b;
-                    b << "create" << coll;
-                    b.appendElements( options );
-                    options = b.obj();
-                }
-                string logNs = string( cl ) + ".$cmd";
-                OpLogHelpers::logCommand(logNs.c_str(), options, &cc().txn());
-            }
-            // TODO: Identify error paths for this function
-            return true;
+    static void checkConfigNS(const StringData& ns) {
+        if ( cmdLine.configsvr &&
+             !( ns.startsWith( "config." ) ||
+                ns.startsWith( "local." ) ||
+                ns.startsWith( "admin." ) ) ) {
+            uasserted(14037, "can't create user databases on a --configsvr instance");
         }
     }
 
-    NamespaceDetails* getAndMaybeCreateNS(const char *ns, bool logop) {
+    bool userCreateNS(const StringData& ns, BSONObj options, string& err, bool logForReplication) {
+        StringData coll = ns.substr(ns.find('.') + 1);
+        massert( 16451 ,  str::stream() << "invalid ns: " << ns , NamespaceString::validCollectionName(ns.rawData()));
+        StringData cl = nsToDatabaseSubstring( ns );
+        if (nsdetails(ns) != NULL) {
+            // Namespace already exists
+            err = "collection already exists";
+            return false;
+        }
+
+        checkConfigNS(ns);
+
+        {
+            BSONElement e = options.getField("size");
+            if (e.isNumber()) {
+                long long size = e.numberLong();
+                uassert(10083, "create collection invalid size spec", size > 0);
+            }
+        }
+
+        // This creates the namespace as well as its _id index
+        nsdetails_maybe_create(ns, options);
+        if ( logForReplication ) {
+            if ( options.getField( "create" ).eoo() ) {
+                BSONObjBuilder b;
+                b << "create" << coll;
+                b.appendElements( options );
+                options = b.obj();
+            }
+            string logNs = cl.toString() + ".$cmd";
+            OpLogHelpers::logCommand(logNs.c_str(), options, &cc().txn());
+        }
+        // TODO: Identify error paths for this function
+        return true;
+    }
+
+    NamespaceDetails* getAndMaybeCreateNS(const StringData& ns, bool logop) {
         NamespaceDetails* details = nsdetails(ns);
         if (details == NULL) {
-            // if the txn stack size is greater than 1, we cannot be doing
-            // fileops. Fileops must happen in the context of a single
-            // transaction.
-            if (cc().txnStackSize() > 1) {
-                uasserted(16744, "Cannot insert into a non-existent collection when running a multi-statement transaction");
-            }
-            else {
-                string err;
-                BSONObj options;
-                bool created = userCreateNS(ns, options, err, logop);
-                uassert(16745, "failed to create collection", created);
-                details = nsdetails(ns);
-                uassert(16746, "failed to get collection after creating", details);
-            }
+            string err;
+            BSONObj options;
+            bool created = userCreateNS(ns, options, err, logop);
+            uassert(16745, "failed to create collection", created);
+            details = nsdetails(ns);
+            uassert(16746, "failed to get collection after creating", details);
         }
         return details;
     }
 
-    void dropDatabase(const string &name) {
+    void dropDatabase(const StringData& name) {
         TOKULOG(1) << "dropDatabase " << name << endl;
         Lock::assertWriteLocked(name);
         Database *d = cc().database();
         verify(d != NULL);
-        verify(d->name == name);
+        verify(d->name() == name);
 
-        //BackgroundOperation::assertNoBgOpInProgForNs(name.c_str());
+        // Disable dropDatabase in a multi-statement transaction until
+        // we have the time/patience to test/debug it.
+        if (cc().txnStackSize() > 1) {
+            uasserted(16777, "Cannot dropDatabase in a multi-statement transaction.");
+        }
 
-        // Not sure we need this here, so removed.  If we do, we need to move it down 
-        // within other calls both (1) as they could be called from elsewhere and 
-        // (2) to keep the lock order right - groupcommitmutex must be locked before 
-        // mmmutex (if both are locked).
-        //
-        //  RWLockRecursive::Exclusive lk(MongoFile::mmmutex);
-
-        d->namespaceIndex.drop();
-        Database::closeDatabase(d->name.c_str(), d->path);
+        nsindex(name)->drop();
+        Database::closeDatabase(d->name().c_str(), d->path());
     }
 
-    void dropCollection(const string &name, string &errmsg, BSONObjBuilder &result, bool can_drop_system) {
+    void dropCollection(const StringData& name, string &errmsg, BSONObjBuilder &result, bool can_drop_system) {
         TOKULOG(1) << "dropCollection " << name << endl;
-        const char *ns = name.c_str();
-        NamespaceDetails *d = nsdetails(ns);
+        NamespaceDetails *d = nsdetails(name);
         if (d == NULL) {
             return;
         }
 
         // Check that we are allowed to drop the namespace.
-        NamespaceString s(name);
-        verify(s.db == cc().database()->name);
-        if (s.isSystem()) {
-            if (s.coll == "system.profile") {
-                uassert(10087, "turn off profiling before dropping system.profile collection", cc().database()->profile == 0);
+        StringData database = nsToDatabaseSubstring(name);
+        verify(database == cc().database()->name());
+        StringData coll = name.substr(name.find('.') + 1);
+        if (coll.startsWith("system.")) {
+            if (coll == "system.profile") {
+                uassert(10087, "turn off profiling before dropping system.profile collection", cc().database()->profile() == 0);
             } else if (!can_drop_system) {
                 uasserted(12502, "can't drop system ns");
             }
         }
 
         // Invalidate cursors and query cache, then drop all of the indexes.
-        ClientCursor::invalidate(ns);
-        NamespaceDetailsTransient::eraseForPrefix(ns);
+        ClientCursor::invalidate(name.rawData());
+        NamespaceDetailsTransient::eraseForPrefix(name);
 
         LOG(1) << "\t dropIndexes done" << endl;
-        d->dropIndexes(ns, "*", errmsg, result, true);
+        d->dropIndexes(name, "*", errmsg, result, true);
         verify(d->nIndexes() == 0);
         removeNamespaceFromCatalog(name);
 
         // If everything succeeds, kill the namespace from the nsindex.
         Top::global.collectionDropped(name);
-        nsindex(ns)->kill_ns(ns);
+        nsindex(name)->kill_ns(name);
         result.append("ns", name);
     }
 
     /* add a new namespace to the system catalog (<dbname>.system.namespaces).
        options: { capped : ..., size : ... }
     */
-    void addNewNamespaceToCatalog(const string &ns, const BSONObj *options) {
+    void addNewNamespaceToCatalog(const StringData& ns, const BSONObj *options) {
         LOG(1) << "New namespace: " << ns << endl;
-        if (mongoutils::str::contains(ns, ".system.namespaces") ) {
+        if (ns.find(".system.namespaces") != string::npos) {
             // system.namespaces holds all the others, so it is not explicitly listed in the catalog.
             return;
         }
@@ -1348,30 +1498,28 @@ namespace mongo {
         }
         BSONObj info = b.done();
 
-        char database[256];
-        nsToDatabase(ns.c_str(), database);
-        string s = string(database) + ".system.namespaces";
-        const char *system_ns = s.c_str();
+        StringData database = nsToDatabaseSubstring(ns);
+        string system_ns = database.toString() + ".system.namespaces";
         NamespaceDetails *d = nsdetails_maybe_create(system_ns);
         NamespaceDetailsTransient *nsdt = &NamespaceDetailsTransient::get(system_ns);
-        insertOneObject(d, nsdt, info, 0);
+        insertOneObject(d, nsdt, info);
     }
 
-    void removeNamespaceFromCatalog(const string &ns) {
-        if (!mongoutils::str::contains(ns, ".system.namespaces")) {
-            string system_namespaces = cc().database()->name + ".system.namespaces";
+    void removeNamespaceFromCatalog(const StringData& ns) {
+        if (ns.find(".system.namespaces") == string::npos) {
+            string system_namespaces = cc().database()->name() + ".system.namespaces";
             _deleteObjects(system_namespaces.c_str(), BSON("name" << ns), false, false);
         }
     }
 
-    int removeFromSysIndexes(const char *ns, const char *name) {
-        string system_indexes = cc().database()->name + ".system.indexes";
+    int removeFromSysIndexes(const StringData& ns, const StringData& name) {
+        string system_indexes = cc().database()->name() + ".system.indexes";
         BSONObj obj = BSON("ns" << ns << "name" << name);
         TOKULOG(2) << "removeFromSysIndexes removing " << obj << endl;
         return (int) _deleteObjects(system_indexes.c_str(), obj, false, false);
     }
 
-    static BSONObj replaceNSField(const BSONObj &obj, const char *to) {
+    static BSONObj replaceNSField(const BSONObj &obj, const StringData &to) {
         BSONObjBuilder b;
         BSONObjIterator i( obj );
         while ( i.more() ) {
@@ -1385,25 +1533,7 @@ namespace mongo {
         return b.obj();
     }
 
-    void renameNamespace(const char *from, const char *to, bool stayTemp) {
-        class Rollback {
-        public:
-            Rollback(const char *to) :
-                _to(to), _success(false) {
-            }
-            ~Rollback() {
-                if (!_success && nsdetails(_to) != NULL) {
-                    nsindex(_to)->kill_ns(_to);
-                }
-            }
-            void success() {
-                _success = true;
-            }
-        private:
-            const char *_to;
-            bool _success;
-        };
-
+    void renameNamespace(const StringData& from, const StringData& to, bool stayTemp) {
         Lock::assertWriteLocked(from);
         verify( nsdetails(from) != NULL );
         verify( nsdetails(to) == NULL );
@@ -1413,23 +1543,32 @@ namespace mongo {
         ClientCursor::invalidate( from );
         NamespaceDetailsTransient::eraseForPrefix( from );
 
-        char database[MaxDatabaseNameLen];
-        nsToDatabase(from, database);
-        string sysIndexes = string(database) + ".system.indexes";
-        string sysNamespaces = string(database) + ".system.namespaces";
+        StringData database = nsToDatabaseSubstring(from);
+        string sysIndexes = database.toString() + ".system.indexes";
+        string sysNamespaces = database.toString() + ".system.namespaces";
 
-        Rollback rollback(to);
-
-        // Grab the serialized form of the namespace, and then close it.
+        // Generate the serialized form of the namespace, and then close it.
         // This will close the underlying dictionaries and allow us to
         // rename them in the environment.
         BSONObj serialized = nsdetails(from)->serialize();
-        nsindex(from)->close_ns(from);
+        bool closed = nsindex(from)->close_ns(from);
+        verify(closed);
 
         // Rename each index in system.indexes and system.namespaces
         {
             BSONObj nsQuery = BSON( "ns" << from );
-            vector<BSONObj> indexSpecs = Helpers::findAll( sysIndexes.c_str(), nsQuery );
+            vector<BSONObj> indexSpecs;
+            {
+                // TODO: find method in namespace details?
+                // Find all entries in sysIndexes for the from ns
+                Client::Context ctx( sysIndexes );
+                for ( shared_ptr<Cursor> c( NamespaceDetailsTransient::getCursor( sysIndexes, nsQuery ) );
+                      c->ok(); c->advance() ) {
+                    if (c->currentMatches()) {
+                        indexSpecs.push_back( c->current().copy() );
+                    }
+                }
+            }
             for ( vector<BSONObj>::const_iterator it = indexSpecs.begin() ; it != indexSpecs.end(); it++) {
                 BSONObj oldIndexSpec = *it;
                 string idxName = oldIndexSpec["name"].String();
@@ -1453,7 +1592,8 @@ namespace mongo {
         BSONObj newSpec;
         {
             BSONObj oldSpec;
-            verify( Helpers::findOne( sysNamespaces.c_str(), BSON( "name" << from ), oldSpec ) );
+            NamespaceDetails *d = nsdetails( sysNamespaces.c_str() );
+            verify( d != NULL && d->findOne( BSON( "name" << from ), oldSpec ) );
             BSONObjBuilder b;
             BSONObjIterator i( oldSpec.getObjectField( "options" ) );
             while ( i.more() ) {
@@ -1474,11 +1614,6 @@ namespace mongo {
 
         // Update the namespace index
         {
-            NamespaceIndex *ni = nsindex( from );
-            // Kill the old entry. Create a new serialized form of this namespace
-            // using the new name, modified spec, and modified indexes array. This
-            // will let us make a NamespaceDetails object and put it in the nsindex.
-            ni->kill_ns( from );
             BSONArrayBuilder newIndexesArray;
             vector<BSONElement> indexes = serialized["indexes"].Array();
             for (vector<BSONElement>::const_iterator it = indexes.begin(); it != indexes.end(); it++) {
@@ -1487,15 +1622,17 @@ namespace mongo {
             BSONObj newSerialized = NamespaceDetails::serialize( to, newSpec, serialized["pk"].Obj(),
                                                                  serialized["multiKeyIndexBits"].Long(),
                                                                  newIndexesArray.arr());
+            // Kill the old entry and replace it with the new name and modified spec.
+            // The next user of the newly-named namespace will need to open it.
+            NamespaceIndex *ni = nsindex( from );
+            ni->kill_ns( from );
             ni->update_ns( to, newSerialized, false );
-            ni->add_ns( to, shared_ptr<NamespaceDetails>() );
+            verify( nsdetails(to) != NULL );
             verify( nsdetails(from) == NULL );
         }
-
-        rollback.success();
     }
 
-    bool legalClientSystemNS( const string& ns , bool write ) {
+    bool legalClientSystemNS( const StringData& ns , bool write ) {
         if( ns == "local.system.replset" ) return true;
 
         if ( ns.find( ".system.users" ) != string::npos )

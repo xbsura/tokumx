@@ -2,6 +2,7 @@
 
 /**
 *    Copyright (C) 2008 10gen Inc.
+*    Copyright (C) 2013 Tokutek Inc.
 *
 *    This program is free software: you can redistribute it and/or  modify
 *    it under the terms of the GNU Affero General Public License, version 3,
@@ -16,14 +17,13 @@
 *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 
-#include "pch.h"
-#include "namespace.h"
-#include "index.h"
-#include "background.h"
-#include "../util/stringutils.h"
-#include "../util/mongoutils/str.h"
-#include "../util/text.h"
+#include "mongo/pch.h"
+#include "mongo/db/index.h"
+#include "mongo/db/background.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/util/stringutils.h"
+#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/text.h"
 
 namespace mongo {
 
@@ -129,7 +129,7 @@ namespace mongo {
     void assertParallelArrays( const char *first, const char *second ) {
         stringstream ss;
         ss << "cannot index parallel arrays [" << first << "] [" << second << "]";
-        uasserted( 16771 ,  ss.str() );
+        uasserted( ParallelArraysCode ,  ss.str() );
     }
 
     class KeyGenerator {
@@ -263,7 +263,6 @@ namespace mongo {
     };
     
     void IndexSpec::getKeys( const BSONObj &obj, BSONObjSet &keys ) const {
-        // TokuDB: Steal the btree key format
         KeyGenerator g( *this );
         g.getKeys( obj, keys );
     }

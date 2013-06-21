@@ -15,7 +15,20 @@ Import("usesm usev8")
 Import("installSetup")
 Import("darwin windows solaris linux nix")
 
-env.SConscript(['platform/SConscript',
+tokupath = os.getenv('TOKUKV_PATH', '$BUILD_DIR/third_party/tokukv')
+tokusrc = env.Dir('#%s' % env['TOKUKV_PATH'])
+tokuinc = tokusrc.Dir('include')
+tokulib = tokusrc.Dir('lib')
+for e in [env, testEnv]:
+    e.Append(CPPPATH=[tokuinc])
+    e.Append(RPATH=[tokulib.get_abspath()])
+
+ltokufractaltree = os.getenv('LIBTOKUFRACTALTREE_NAME', 'tokufractaltree')
+ltokuportability = os.getenv('LIBTOKUPORTABILITY_NAME', 'tokuportability')
+tokulibs = [ltokufractaltree, ltokuportability, 'm', 'dl', 'z']
+
+env.SConscript(['base/SConscript',
+                'platform/SConscript',
                 'unittest/SConscript'])
 
 def add_exe( v ):
@@ -31,8 +44,11 @@ env.StaticLibrary('foundation',
                     'util/signal_handlers.cpp',
                     'util/text.cpp',
                     'util/time_support.cpp',
+                    'util/timer.cpp'
                     ],
                   LIBDEPS=['stacktrace',
+                           '$BUILD_DIR/mongo/base/base',
+                           '$BUILD_DIR/mongo/platform/platform',
                            '$BUILD_DIR/third_party/shim_boost'])
 
 env.StaticLibrary('stringutils', ['util/stringutils.cpp', 'util/base64.cpp',])
@@ -42,27 +58,32 @@ env.StaticLibrary('md5', [
         'util/md5main.cpp',
         ])
 
+env.CppUnitTest( "stringutils_test", [ "util/stringutils_test.cpp" ],
+                 LIBDEPS=["stringutils"] )
+
 env.StaticLibrary('bson', [
         'bson/oid.cpp',
         'db/nonce.cpp',
         'db/jsobj.cpp',
         'db/json.cpp',
         ], LIBDEPS=[
+        'base/base',
         'md5',
         'stringutils',
         ])
+
+env.CppUnitTest('string_map_test', ['util/string_map_test.cpp'],
+                LIBDEPS=['bson','foundation'])
+
 
 commonFiles = [ "pch.cpp",
                 "buildinfo.cpp",
                 "db/hasher.cpp",
                 "db/lasterror.cpp",
-                #"db/namespace.cpp",
                 "shell/mongo.cpp",
                 "util/background.cpp",
                 "util/intrusive_counter.cpp",
-                "util/timer.cpp",
                 "util/util.cpp",
-                "util/file_allocator.cpp",
                 "util/trace.cpp",
                 "util/ramlog.cpp",
                 "util/progress_meter.cpp",
@@ -106,7 +127,7 @@ env.StaticLibrary("coredb", [
         "client/authentication_table_server.cpp",
         "client/parallel.cpp",
         "db/client_transaction.cpp",
-        "db/toku_command_settings.cpp",
+        "db/opsettings.cpp",
         "db/commands.cpp",
         "db/commands/hashcmd.cpp",
         "db/commands/isself.cpp",
@@ -219,34 +240,17 @@ coreServerFiles.append( systemInfoPlatformFile )
 if has_option( "asio" ):
     coreServerFiles += [ "util/net/message_server_asio.cpp" ]
 
-# TokuDB: Commented out files have been deleted - they were used to implement the old storage/durability layer.
+# TokuMX: Commented out files have been deleted - they were used to implement the old storage/durability layer.
 # mongod files - also files used in tools. present in dbtests, but not in mongos and not in client libs.
 serverOnlyFiles = [ "db/curop.cpp",
-                    #"db/memconcept.cpp",
                     "db/interrupt_status_mongod.cpp",
                     "db/d_globals.cpp",
-                    #"db/pagefault.cpp",
-                    #"util/compress.cpp",
                     "db/ttl.cpp",
                     "db/d_concurrency.cpp",
                     "db/lockstat.cpp",
                     "db/lockstate.cpp",
-                    #"db/key.cpp",
-                    #"db/btreebuilder.cpp",
-                    #"util/logfile.cpp",
-                    #"util/alignedbuilder.cpp",
-                    #"db/mongommf.cpp",
-                    #"db/dur.cpp",
-                    #"db/durop.cpp",
-                    #"db/dur_writetodatafiles.cpp",
-                    #"db/dur_preplogbuffer.cpp",
-                    #"db/dur_commitjob.cpp",
-                    #"db/dur_recover.cpp",
-                    #"db/dur_journal.cpp",
                     "db/introspect.cpp",
-                    #"db/btree.cpp",
                     "db/clientcursor.cpp",
-                    #"db/tests.cpp",
                     "db/repl.cpp",
                     "db/oplogreader.cpp",
                     "db/repl/rs.cpp",
@@ -257,43 +261,31 @@ serverOnlyFiles = [ "db/curop.cpp",
                     "db/repl/health.cpp",
                     "db/repl/heartbeat.cpp",
                     "db/repl/rs_config.cpp",
-                    #"db/repl/rs_rollback.cpp",
                     "db/repl/rs_sync.cpp",
                     "db/repl/rs_initialsync.cpp",
                     "db/repl/bgsync.cpp",
                     "db/oplog.cpp",
                     "db/oplog_helpers.cpp",
-                    #"db/prefetch.cpp",
                     "db/repl_block.cpp",
                     "db/indexcursor.cpp",
                     "db/cloner.cpp",
                     "db/namespace_details.cpp",
                     "db/namespace_index.cpp",
-                    #"db/cap.cpp",
+                    "db/txn_complete_hooks.cpp",
                     "db/matcher_covered.cpp",
                     "db/dbeval.cpp",
                     "db/restapi.cpp",
                     "db/dbhelpers.cpp",
                     "db/instance.cpp",
                     "db/client.cpp",
-                    #"db/txn_context.cpp",
                     "db/database.cpp",
-                    #"db/pdfile.cpp",
-                    #"db/record.cpp",
                     "db/cursor.cpp",
                     "db/security.cpp",
                     "db/queryoptimizer.cpp",
                     "db/queryoptimizercursorimpl.cpp",
-                    #"db/extsort.cpp",
                     "db/index.cpp",
-                    #"db/index_update.cpp",
                     "db/scanandorder.cpp",
                     "db/explain.cpp",
-
-                    # Geospacial indexes were written using low-level btree APIs.
-                    # TokuDB Will need to rewrite this entirely.
-                    #"db/geo/2d.cpp",
-                    #"db/geo/haystack.cpp",
                     "db/hashindex.cpp",
                     "db/ops/count.cpp",
                     "db/ops/delete.cpp",
@@ -314,14 +306,18 @@ serverOnlyFiles = [ "db/curop.cpp",
                     "db/pipeline/pipeline_d.cpp",
                     "db/pipeline/document_source_cursor.cpp",
                     "db/commands/txn_commands.cpp",
-                    "db/driverHelpers.cpp" ]
+                    "db/driverHelpers.cpp",
+
+                    # Most storage/ files are in coredb, but this is server-only.
+                    "db/storage/loader.cpp" ]
 
 env.Library( "dbcmdline", "db/cmdline.cpp" )
 
 env.Library('stacktrace', 'util/stacktrace.cpp')
 
 env.Program('lame_stacktrace_test', 'util/lame_stacktrace_test.cpp',
-            LIBDEPS=['stacktrace'])
+            LIBDEPS=['stacktrace',
+                     '$BUILD_DIR/mongo/base/base'])
 
 serverOnlyFiles += [ "db/stats/snapshots.cpp" ]
 
@@ -338,6 +334,7 @@ mongosLibraryFiles = [
     "s/strategy_single.cpp",
     "s/commands_admin.cpp",
     "s/commands_public.cpp",
+    "s/commands_deprecated.cpp",
     "s/request.cpp",
     "s/client_info.cpp",
     "s/cursors.cpp",
@@ -353,11 +350,11 @@ mongosLibraryFiles = [
 
 env.Library( "mongoscore" , mongosLibraryFiles )
 
-env.CppUnitTest( "balancer_policy_test" , [ "s/balancer_policy_tests.cpp" ] ,
+env.CppUnitTest( "balancer_policy_test" , [ "s/balancer_policy_tests.cpp" ] , LIBS=tokulibs,
                  LIBDEPS=["mongoscore", "coreshard","mongocommon","coreserver","coredb","dbcmdline","mongodandmongos"] ,
                  NO_CRUTCH=True)
 
-env.CppUnitTest("shard_test", [ "s/shard_test.cpp" ],
+env.CppUnitTest("shard_test", [ "s/shard_test.cpp" ], LIBS=tokulibs,
                 LIBDEPS=[ "mongoscore",
                           "coreshard",
                           "mongocommon",
@@ -397,7 +394,7 @@ everythingButMongodAndMongosFiles = [
     ]
 env.StaticLibrary("notmongodormongos", everythingButMongodAndMongosFiles)
 
-mongodOnlyFiles = [ "db/db.cpp", "db/compact.cpp", "db/commands/touch.cpp" ]
+mongodOnlyFiles = [ "db/db.cpp", "db/commands/touch.cpp" ]
 
 # create a library per module, and add it as a dependency
 # for the mongod target; as of now, modules are only included
@@ -420,7 +417,7 @@ env.StaticLibrary("coreserver", coreServerFiles, LIBDEPS=["mongocommon", "script
 
 # main db target
 mongod = env.Install(
-    '#/', env.Program( "mongod", mongodOnlyFiles,
+    '#/', env.Program( "mongod", mongodOnlyFiles, LIBS=tokulibs,
                        LIBDEPS=["coreserver", "serveronly", "coredb", "ntservice",
                                 "mongodandmongos"] + modules ) )
 Default( mongod )
@@ -430,28 +427,28 @@ allToolFiles = [ "tools/tool.cpp", "tools/stat_util.cpp" ]
 env.StaticLibrary("alltools", allToolFiles, LIBDEPS=["serveronly", "coreserver", "coredb",
                                                      "notmongodormongos"])
 
-normalTools = [ "dump", "restore", "export", "import", "stat", "top", "oplog" ]
+normalTools = [ "dump", "restore", "export", "import", "stat", "top"]
 env.Alias( "tools", [ "#/${PROGPREFIX}mongo" + x + "${PROGSUFFIX}" for x in normalTools ] )
 for x in normalTools:
     env.Install( '#/', env.Program( "mongo" + x, [ "tools/" + x + ".cpp" ],
+                                    LIBS=tokulibs,
                                     LIBDEPS=["alltools"]) )
 
 env.StaticLibrary("docgenerator", "tools/docgenerator.cpp")
 
 #some special tools
 env.Install( '#/', [
-        env.Program( "mongofiles", "tools/files.cpp", LIBDEPS=["alltools", "gridfs"] ),
-        env.Program( "docgen", "tools/docgeneratormain.cpp", LIBDEPS=["alltools", "docgenerator"] ),
-        env.Program( "loadgen", "tools/loadgenerator.cpp", LIBDEPS=["alltools", "docgenerator"] ),
-        env.Program( "bsondump", "tools/bsondump.cpp", LIBDEPS=["alltools"]),
-        env.Program( "mongobridge", "tools/bridge.cpp", LIBDEPS=["alltools"]),
-        env.Program( "mongoperf", "client/examples/mongoperf.cpp", LIBDEPS=["alltools"] ),
+        env.Program( "mongofiles", "tools/files.cpp", LIBS=tokulibs, LIBDEPS=["alltools", "gridfs"] ),
+        env.Program( "docgen", "tools/docgeneratormain.cpp", LIBS=tokulibs, LIBDEPS=["alltools", "docgenerator"] ),
+        env.Program( "loadgen", "tools/loadgenerator.cpp", LIBS=tokulibs, LIBDEPS=["alltools", "docgenerator"] ),
+        env.Program( "bsondump", "tools/bsondump.cpp", LIBS=tokulibs, LIBDEPS=["alltools"]),
+        env.Program( "mongobridge", "tools/bridge.cpp", LIBS=tokulibs, LIBDEPS=["alltools"]),
         ] )
 
 # mongos
 mongos = env.Program(
     "mongos", [ "s/server.cpp"] ,
-    LIBDEPS=["mongoscore", "coreserver", "coredb", "mongocommon", "coreshard", "dbcmdline", "ntservice",
+    LIBS=tokulibs, LIBDEPS=["mongoscore", "coreserver", "coredb", "mongocommon", "coreshard", "dbcmdline", "ntservice",
              "mongodandmongos"])
 env.Install( '#/', mongos )
 
@@ -472,6 +469,7 @@ env.StaticLibrary('testframework', ['dbtests/framework.cpp'], LIBDEPS=['unittest
 test = testEnv.Install(
     '#/',
     testEnv.Program( "test", [ f for f in Glob( "dbtests/*.cpp" ) if not str( f ).endswith( 'framework.cpp' ) ],
+                     LIBS=tokulibs,
                      LIBDEPS=["mongocommon", "serveronly", "coreserver", "coredb", "testframework", "gridfs", "notmongodormongos" ] ) )
 
 if len(testEnv.subst('$PROGSUFFIX')):
@@ -488,6 +486,8 @@ if darwin or env["_HAVEPCAP"]:
         sniffEnv.Append( LIBS=[ "pcap" ] )
     else:
         sniffEnv.Append( LIBS=[ "wpcap" ] )
+
+    sniffEnv.Append(LIBS=tokulibs)
 
     sniffEnv.Install( '#/', sniffEnv.Program( "mongosniff", "tools/sniffer.cpp",
                                               LIBDEPS=["gridfs", "serveronly", "coreserver", "coredb", "notmongodormongos"] ) )
@@ -538,7 +538,7 @@ debuginfoBinaries = []
 if windows:
     distBinaries.extend(['mongod.pdb', 'mongos.pdb'])
 
-def installBinary( e, name ):
+def installBinary( e, name, fix_rpath=True ):
     global distBinaries
     global debuginfoBinaries
 
@@ -547,12 +547,17 @@ def installBinary( e, name ):
     if (not has_option( "no-glibc-check" ) and linux and "s3dist" in COMMAND_LINE_TARGETS):
         e.AddPostAction( name, checkGlibc )
 
+    if fix_rpath:
+        name = e.Command('install_rpath/%s' % name, name, Copy('$TARGET', '$SOURCE'))[0]
+        e.AddPostAction(name, "chrpath -r '$$ORIGIN/../lib64:$$ORIGIN/../lib' $TARGET")
+
     if (solaris or linux) and (not has_option("nostrip")):
-        dbgname = e.Command('stripped/%s.dbg' % name, name, Copy('$TARGET', '$SOURCE'))[0]
+        basename = str(name).replace('install_rpath/', '')
+        dbgname = e.Command('stripped/%s.dbg' % basename, name, Copy('$TARGET', '$SOURCE'))[0]
         e.AddPostAction(dbgname, 'objcopy --only-keep-debug $TARGET')
         debuginfoBinaries.append(dbgname)
 
-        name = e.Command('stripped/%s' % name, [name, dbgname], Copy('$TARGET', '$SOURCE'))[0]
+        name = e.Command('stripped/%s' % basename, [name, dbgname], Copy('$TARGET', '$SOURCE'))[0]
         e.AddPostAction(name, 'strip $TARGET')
         e.AddPostAction(name, 'objcopy --add-gnu-debuglink=${TARGET}.dbg $TARGET')
 
@@ -566,7 +571,7 @@ def installBinary( e, name ):
     if nix:
         e.AddPostAction( inst, 'chmod 755 $TARGET' )
 
-for t in ["mongo" + x for x in normalTools] + ["mongofiles", "bsondump", "mongoperf" ]:
+for t in ["mongo" + x for x in normalTools] + ["mongofiles", "bsondump"]:
     installBinary( env, t )
     env.Alias("tools", '#/' + add_exe(t))
 
@@ -580,13 +585,16 @@ installBinary( env, "mongod" )
 installBinary( env, "mongos" )
 
 if shellEnv is not None:
-    installBinary( env, "mongo" )
+    # mongo doesn't have any toku components, it doesn't need its rpath changed
+    installBinary( env, "mongo", False )
 
 env.Alias( "core", [ '#/%s' % b for b in [ add_exe( "mongo" ), add_exe( "mongod" ), add_exe( "mongos" ) ] ] )
 
 #headers
 if installSetup.headers:
-    for id in [ "", "util/", "util/net/", "util/mongoutils/", "util/concurrency/", "db/", "db/stats/", "db/repl/", "db/ops/", "client/", "bson/", "bson/util/", "s/", "scripting/" ]:
+    for id in [ "", "util/", "util/net/", "util/mongoutils/", "util/concurrency/", "db/",
+                "db/stats/", "db/repl/", "db/ops/", "client/", "bson/", "bson/util/", "s/",
+                "scripting/", "base/", "platform/" ]:
         env.Install( "$INSTALL_DIR/include/" + id, Glob( id + "*.h" ) )
         env.Install( "$INSTALL_DIR/include/" + id, Glob( id + "*.hpp" ) )
 
@@ -596,13 +604,16 @@ if installSetup.libraries:
     if has_option( "sharedclient" ):
         env.Install( "$INSTALL_DIR/$NIX_LIB_DIR",  '#${SHLIBPREFIX}mongoclient${SHLIBSUFFIX}')
 
+toku_readme_cmd = env.Command('distsrc/README-TOKUKV', tokusrc.File('README-TOKUDB'), 'sed -e s/TokuDB/TokuKV/g $SOURCE > $TARGET')
+toku_readme = env.File('distsrc/README-TOKUKV')
+
 # Stage the top-level mongodb banners
 distsrc = env.Dir('#distsrc')
-tokusrc = env.Dir('#%s' % env['TOKUDB_PATH'])
 env.Append(MODULE_BANNERS = [distsrc.File('README'),
                              distsrc.File('THIRD-PARTY-NOTICES'),
                              distsrc.File('NEWS'),
-                             tokusrc.File('README-TOKUDB')])
+                             toku_readme])
+env.Append(TOKULIBS = [tokulib.File('lib%s.so' % libname) for libname in [ltokufractaltree, ltokuportability]])
 
 # If no module has introduced a file named LICENSE.txt, then inject the AGPL.
 if sum(itertools.imap(lambda x: x.name == "LICENSE.txt", env['MODULE_BANNERS'])) == 0:
@@ -622,28 +633,35 @@ if not len(module_banner_filenames) == len(env['MODULE_BANNERS']):
 module_banner_dirs = set([Dir('#').rel_path(f.get_dir()) for f in env['MODULE_BANNERS']])
 module_banner_transforms = ["--transform %s=$SERVER_DIST_BASENAME" % d for d in module_banner_dirs]
 
+toku_lib_dirs = set([Dir('#').rel_path(f.get_dir()) for f in env['TOKULIBS']])
+toku_lib_transforms = ["--transform %s=$SERVER_DIST_BASENAME/lib64" % d for d in toku_lib_dirs]
+
 env.Command(
     '#/${SERVER_ARCHIVE}',
-    ['#buildscripts/make_archive.py'] + env["MODULE_BANNERS"] + distBinaries +
+    ['#buildscripts/make_archive.py'] + env["MODULE_BANNERS"] + env['TOKULIBS'] + distBinaries +
     ['/lib64/libgcc_s.so.1',
      '/usr/lib64/libstdc++.so.6',
      os.path.realpath('/lib64/libgcc_s.so.1'),
      os.path.realpath('/usr/lib64/libstdc++.so.6')],
-    ' '.join(['$PYTHON ${SOURCES[0]} -o $TARGET'] + module_banner_transforms + [
+    ' '.join(['$PYTHON ${SOURCES[0]} -o $TARGET'] + toku_lib_transforms + module_banner_transforms + [
             '--transform ${str(Dir(BUILD_DIR))}/mongo/stripped=$SERVER_DIST_BASENAME/bin',
+            '--transform ${str(Dir(BUILD_DIR))}/mongo/install_rpath=$SERVER_DIST_BASENAME/bin',
             '--transform ${str(Dir(BUILD_DIR))}/mongo=$SERVER_DIST_BASENAME/bin',
             '--transform /lib64=$SERVER_DIST_BASENAME/lib64',
             '--transform /usr/lib64=$SERVER_DIST_BASENAME/lib64',
+            '--transform /lib=$SERVER_DIST_BASENAME/lib',
+            '--transform /usr/lib=$SERVER_DIST_BASENAME/lib',
             '${TEMPFILE(SOURCES[1:])}']))
 
 if (solaris or linux) and (not has_option("nostrip")):
-    debugtgt = env.Command(
+    env.Command(
         '#/${SERVER_DEBUGINFO_ARCHIVE}',
         ['#buildscripts/make_archive.py',
          debuginfoBinaries],
         '$PYTHON ${SOURCES[0]} -o $TARGET '
         '--transform distsrc=${SERVER_DIST_BASENAME}-debuginfo '
         '--transform ${str(Dir(BUILD_DIR))}/mongo/stripped=${SERVER_DIST_BASENAME}-debuginfo/bin '
+        '--transform ${str(Dir(BUILD_DIR))}/mongo/install_rpath=${SERVER_DIST_BASENAME}-debuginfo/bin '
         '${TEMPFILE(SOURCES[1:])}')
 
 #final alias

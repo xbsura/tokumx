@@ -25,6 +25,7 @@
 #include "mongo/pch.h"
 #include "mongo/server.h"
 #include "mongo/bson/util/builder.h"
+#include "mongo/db/databaseholder.h"
 #include "mongo/db/background.h"
 #include "mongo/db/client.h"
 #include "mongo/db/jsobj.h"
@@ -35,11 +36,11 @@
 #include "mongo/db/repl_block.h"
 #include "mongo/db/replutil.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/db.h"
 #include "mongo/db/instance.h"
 #include "mongo/db/lasterror.h"
 #include "mongo/db/security.h"
 #include "mongo/db/queryoptimizer.h"
+#include "mongo/db/namespace_details.h"
 #include "mongo/db/ops/count.h"
 #include "mongo/db/ops/insert.h"
 #include "mongo/db/repl/bgsync.h"
@@ -64,25 +65,8 @@ namespace mongo {
             return true;
         }
         if( cmdObj.hasElement( "replIndexPrefetch" ) ) {
-            if (!theReplSet) {
-                errmsg = "replication is not enabled";
-                return false;
-            }
-            std::string prefetch = cmdObj["replIndexPrefetch"].valuestrsafe();
-            log() << "changing replication index prefetch behavior to " << prefetch << endl;
-            // default:
-            ReplSetImpl::IndexPrefetchConfig prefetchConfig = ReplSetImpl::PREFETCH_ALL;
-            if (prefetch == "none")
-                prefetchConfig = ReplSetImpl::PREFETCH_NONE;
-            else if (prefetch == "_id_only")
-                prefetchConfig = ReplSetImpl::PREFETCH_ID_ONLY;
-            else if (prefetch == "all")
-                prefetchConfig = ReplSetImpl::PREFETCH_ALL;
-            else {
-                warning() << "unrecognized indexPrefetch setting: " << prefetch << endl;
-            }
-            theReplSet->setIndexPrefetchConfig(prefetchConfig);
-            return true;
+            errmsg = "replIndexPrefetch is deprecated";
+            return false;
         }
 
         return false;
@@ -90,17 +74,7 @@ namespace mongo {
 
     const char* fetchReplIndexPrefetchParam() {
         if (!theReplSet) return "uninitialized";
-        ReplSetImpl::IndexPrefetchConfig ip = theReplSet->getIndexPrefetchConfig();
-        switch (ip) {
-        case ReplSetImpl::PREFETCH_NONE:
-            return "none";
-        case ReplSetImpl::PREFETCH_ID_ONLY:
-            return "_id_only";
-        case ReplSetImpl::PREFETCH_ALL:
-            return "all";
-        default:
-            return "invalid";
-        }
+        return "none";
     }
 
     /* reset any errors so that getlasterror comes back clean.
@@ -109,21 +83,12 @@ namespace mongo {
        see if any of the operations triggered an error, but don't want to check
        after each op as that woudl be a client/server turnaround.
     */
-    class CmdResetError : public Command {
+    class CmdResetError : public InformationCommand {
     public:
-        virtual LockType locktype() const { return NONE; }
-        virtual bool needsTxn() const { return false; }
-        virtual bool canRunInMultiStmtTxn() const { return true; }
-        virtual bool logTheOp() {
-            return false;
-        }
-        virtual bool slaveOk() const {
-            return true;
-        }
+        CmdResetError() : InformationCommand("resetError", false, "reseterror") {}
         virtual void help( stringstream& help ) const {
             help << "reset error state (used with getpreverror)";
         }
-        CmdResetError() : Command("resetError", false, "reseterror") {}
         bool run(const string& db, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
             LastError *le = lastError.get();
             verify( le );
@@ -140,14 +105,9 @@ namespace mongo {
     */
     BSONObj *getLastErrorDefault = 0;
 
-    class CmdGetLastError : public Command {
+    class CmdGetLastError : public InformationCommand {
     public:
-        CmdGetLastError() : Command("getLastError", false, "getlasterror") { }
-        virtual LockType locktype() const { return NONE;  }
-        virtual bool logTheOp()           { return false; }
-        virtual bool needsTxn() const { return false; }
-        virtual bool canRunInMultiStmtTxn() const { return true; }
-        virtual bool slaveOk() const      { return true;  }
+        CmdGetLastError() : InformationCommand("getLastError", false, "getlasterror") { }
         virtual void help( stringstream& help ) const {
             help << "return error status of the last operation on this connection\n"
                  << "options:\n"
@@ -170,7 +130,7 @@ namespace mongo {
             }
 
             Client& c = cc();
-            c.appendLastOp( result );
+            c.appendLastGTID( result );
 
             result.appendNumber( "connectionId" , c.getConnectionId() ); // for sharding; also useful in general for debugging
 
@@ -205,15 +165,106 @@ namespace mongo {
                     if (!cmdLine.logFlushPeriod != 0) {
                         storage::log_flush();
                     }
-                    // This is part of the protocol used by SyncClusterConnection.
-                    // We just fake it and say we synced one.
-                    result.append( "fsyncFiles" , 1 );
                 }
 
                 BSONElement e = cmdObj["w"];
                 if ( e.ok() ) {
-                    problem() << "replication not supported yet, ignoring!" << endl;
+
+                    if ( cmdLine.configsvr && (!e.isNumber() || e.numberInt() > 1) ) {
+                        // w:1 on config servers should still work, but anything greater than that
+                        // should not.
+                        result.append( "wnote", "can't use w on config servers" );
+                        result.append( "err", "norepl" );
+                        return true;
+                    }
+
+                    int timeout = cmdObj["wtimeout"].numberInt();
+                    Timer t;
+
+                    long long passes = 0;
+                    char buf[32];
+                    GTID gtid = c.getLastOp();
+
+                    if ( gtid.isInitial() ) {
+                        if ( anyReplEnabled() ) {
+                            result.append( "wnote" , "no write has been done on this connection" );
+                        }
+                        else if ( e.isNumber() && e.numberInt() <= 1 ) {
+                            // don't do anything
+                            // w=1 and no repl, so this is fine
+                        }
+                        else {
+                            // w=2 and no repl
+                            stringstream errmsg;
+                            errmsg << "no replication has been enabled, so w=" <<
+                                      e.toString(false) << " won't work";
+                            result.append( "wnote" , errmsg.str() );
+                            result.append( "err", "norepl" );
+                            return true;
+                        }
+
+                        result.appendNull( "err" );
+                        return true;
+                    }
+
+                    if ( !theReplSet && !e.isNumber() ) {
+                        result.append( "wnote", "cannot use non integer w values for non-replica sets" );
+                        result.append( "err", "noreplset" );
+                        return true;
+                    }
+
+                    while ( 1 ) {
+                        if ( !_isMaster() ) {
+                            // this should be in the while loop in case we step down
+                            errmsg = "not master";
+                            result.append( "wnote", "no longer primary" );
+                            return false;
+                        }
+
+                        // check this first for w=0 or w=1
+                        if ( opReplicatedEnough( gtid, e ) ) {
+                            // before breaking, let's check that we are not master
+                            // originally done outside of if-clause in vanilla by
+                            // SERVER-9417. Moved here so that we don't have
+                            // race condition machine stepping down after the check
+                            // but before the call to opReplicatedEnough
+                            if ( !_isMaster() ) {
+                                errmsg = "not master";
+                                result.append( "wnote", "no longer primary" );
+                                return false;
+                            }
+                            break;
+                        }
+
+                        // if replication isn't enabled (e.g., config servers)
+                        if ( ! anyReplEnabled() ) {
+                            result.append( "err", "norepl" );
+                            return true;
+                        }
+
+                        if ( timeout > 0 && t.millis() >= timeout ) {
+                            result.append( "wtimeout" , true );
+                            errmsg = "timed out waiting for slaves";
+                            result.append( "waited" , t.millis() );
+                            result.append( "err" , "timeout" );
+                            return true;
+                        }
+
+                        verify( sprintf( buf , "w block pass: %lld" , ++passes ) < 30 );
+                        c.curop()->setMessage( buf );
+                        sleepmillis(1);
+                        killCurrentOp.checkForInterrupt();
+                    }
+
+                    int myMillis = t.millis();
+                    result.appendNumber( "wtime" , myMillis );
                 }
+            }
+
+            if (cmdObj["fsync"].trueValue()) {
+                // This is part of the protocol used by SyncClusterConnection.
+                // We just fake it and say we synced a file to get it to stop complaining.
+                result.append( "fsyncFiles" , 1 );
             }
 
             result.appendNull( "err" );
@@ -221,21 +272,12 @@ namespace mongo {
         }
     } cmdGetLastError;
 
-    class CmdGetPrevError : public Command {
+    class CmdGetPrevError : public InformationCommand {
     public:
-        virtual LockType locktype() const { return NONE; }
-        virtual bool needsTxn() const { return false; }
-        virtual bool canRunInMultiStmtTxn() const { return true; }
-        virtual bool logTheOp() {
-            return false;
-        }
+        CmdGetPrevError() : InformationCommand("getPrevError", false, "getpreverror") {}
         virtual void help( stringstream& help ) const {
             help << "check for errors since last reseterror commandcal";
         }
-        virtual bool slaveOk() const {
-            return true;
-        }
-        CmdGetPrevError() : Command("getPrevError", false, "getpreverror") {}
         bool run(const string& dbname, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
             LastError *le = lastError.disableForCommand();
             le->appendSelf( result );
@@ -273,7 +315,7 @@ namespace mongo {
             GTID lastGTID = theReplSet->gtidManager->getLiveState();
             GTID closestGTID = theReplSet->lastOtherGTID();
             uint64_t diff = (lastOp > closest) ? lastOp - closest : 0;
-            while (now <= timeout && (diff < 0 || diff > 10000)) {
+            while (now <= timeout && diff > 10000) {
                 sleepsecs(1);
                 now++;
 
@@ -282,7 +324,7 @@ namespace mongo {
                 diff = (lastOp > closest) ? lastOp - closest : 0;
             }
 
-            if (diff < 0 || diff > 10000) {
+            if (diff > 10000) {
                 errmsg = "no secondaries within 10 seconds of my optime";
                 result.appendNumber("closest", closest/1000);
                 result.appendNumber("difference", diff/1000);
@@ -305,33 +347,35 @@ namespace mongo {
             // regardless of whether they caught up, we'll shut down
         }
 
+        if (theReplSet) {
+            theReplSet->shutdown();
+        }
+
         writelocktry wlt( 2 * 60 * 1000 );
         uassert( 13455 , "dbexit timed out getting lock" , wlt.got() );
         return shutdownHelper();
     }
 
-    class CmdDropDatabase : public Command {
+    class CmdDropDatabase : public FileopsCommand {
     public:
-        virtual bool logTheOp() {
-            return true;
-        }
+        CmdDropDatabase() : FileopsCommand("dropDatabase") {}
+        virtual bool slaveOk() const { return false; }
+        virtual bool logTheOp() { return true; }
         virtual void help( stringstream& help ) const {
             help << "drop (delete) this database";
         }
-        virtual bool slaveOk() const {
-            return false;
-        }
-
-        // this is suboptimal but syncDataAndTruncateJournal is called from dropDatabase, and that 
+        // this is suboptimal but oplogCheckCloseDatabase is called from dropDatabase, and that 
         // may need a global lock.
         virtual bool lockGlobally() const { return true; }
 
-        virtual LockType locktype() const { return WRITE; }
-        CmdDropDatabase() : Command("dropDatabase") {}
         bool run(const string& dbname, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
             // disallow dropping the config database
             if ( cmdLine.configsvr && ( dbname == "config" ) ) {
                 errmsg = "Cannot drop 'config' database if mongod started with --configsvr";
+                return false;
+            }
+            if ( replSet && (dbname == "local")) {
+                errmsg = "Cannot drop 'local' database if mongod started --replSet";
                 return false;
             }
             BSONElement e = cmdObj.firstElement();
@@ -351,9 +395,7 @@ namespace mongo {
     */
     class CmdProfile : public Command {
     public:
-        virtual bool slaveOk() const {
-            return true;
-        }
+        CmdProfile() : Command("profile", false) {}
         virtual void help( stringstream& help ) const {
             help << "enable or disable performance profiling\n";
             help << "{ profile : <n> }\n";
@@ -361,11 +403,17 @@ namespace mongo {
             help << "-1 to get current values\n";
             help << "http://dochub.mongodb.org/core/databaseprofiler";
         }
+        // Need access to the database to enable profiling on it
+        virtual bool slaveOk() const { return true; }
         virtual LockType locktype() const { return WRITE; }
-        CmdProfile() : Command("profile") {}
+        virtual bool requiresSync() const { return false; }
+        virtual bool needsTxn() const { return true; }
+        virtual int txnFlags() const { return DB_SERIALIZABLE; }
+        virtual bool canRunInMultiStmtTxn() const { return false; }
+        virtual OpSettings getOpSettings() const { return OpSettings(); }
         bool run(const string& dbname, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
             BSONElement e = cmdObj.firstElement();
-            result.append("was", cc().database()->profile);
+            result.append("was", cc().database()->profile());
             result.append("slowms", cmdLine.slowMS );
 
             int p = (int) e.number();
@@ -387,17 +435,12 @@ namespace mongo {
 
     void reportLockStats(BSONObjBuilder& result);
     
-    class CmdServerStatus : public Command {
+    class CmdServerStatus : public InformationCommand {
         unsigned long long _started;
     public:
-        virtual bool slaveOk() const {
-            return true;
-        }
-        CmdServerStatus() : Command("serverStatus", true) {
+        CmdServerStatus() : InformationCommand("serverStatus") {
             _started = curTimeMillis64();
         }
-
-        virtual LockType locktype() const { return NONE; }
 
         virtual void help( stringstream& help ) const {
             help << "returns lots of administrative server statistics";
@@ -411,8 +454,8 @@ namespace mongo {
             bool authed = cc().getAuthenticationInfo()->isAuthorizedReads("admin");
 
             result.append("host", prettyHostName() );
-            result.append("version", versionString);
-            result.append("tokutekPatchVersion", tokutekPatchVersionString);
+            result.append("version", mongodbVersionString);
+            result.append("tokumxVersion", tokumxVersionString);
             result.append("process","mongod");
             result.append("pid", (int)getpid());
             result.append("uptime",(double) (time(0)-cmdLine.started));
@@ -431,7 +474,7 @@ namespace mongo {
                 {
                     BSONObjBuilder ttt( t.subobjStart( "currentQueue" ) );
                     int w=0, r=0;
-                    Client::recommendedYieldMicros( &w , &r, true );
+                    Client::getReaderWriterClientCount( &r , &w );
                     ttt.append( "total" , w + r );
                     ttt.append( "readers" , r );
                     ttt.append( "writers" , w );
@@ -455,38 +498,6 @@ namespace mongo {
             timeBuilder.appendNumber( "after basic" , Listener::getElapsedTimeMillis() - start );
 
             {
-                BSONObjBuilder t( result.subobjStart( "mem" ) );
-
-                t.append("bits",  ( sizeof(int*) == 4 ? 32 : 64 ) );
-
-                ProcessInfo p;
-                int v = 0;
-                if ( p.supported() ) {
-                    t.appendNumber( "resident" , p.getResidentSize() );
-                    v = p.getVirtualMemorySize();
-                    t.appendNumber( "virtual" , v );
-                    //t.appendBool( "supported" , true );
-                }
-                else {
-                    result.append( "note" , "not all mem info support on this platform" );
-                    //t.appendBool( "supported" , false );
-                }
-                // TOKUDB: can't trust the number for mapped because it doesn't mean anything
-                t.appendBool( "supported" , false );
-                TOKULOG(1) << "TODO: report something about tokudb memory status in serverStatus" << endl;
-
-                timeBuilder.appendNumber( "middle of mem" , Listener::getElapsedTimeMillis() - start );
-
-                // TODO: What do we do here?
-                int m = 0; //(int) (MemoryMappedFile::totalMappedLength() / ( 1024 * 1024 ));
-                t.appendNumber( "mapped" , m );
-                
-                t.done();
-
-            }
-            timeBuilder.appendNumber( "after mem" , Listener::getElapsedTimeMillis() - start );
-
-            {
                 BSONObjBuilder bb( result.subobjStart( "connections" ) );
                 bb.append( "current" , connTicketHolder.used() );
                 bb.append( "available" , connTicketHolder.available() );
@@ -502,18 +513,6 @@ namespace mongo {
                 bb.done();
                 timeBuilder.appendNumber( "after extra info" , Listener::getElapsedTimeMillis() - start );
 
-            }
-
-            {
-                BSONObjBuilder bb( result.subobjStart( "indexCounters" ) );
-                globalIndexCounters.append( bb );
-                bb.done();
-            }
-
-            {
-                BSONObjBuilder bb( result.subobjStart( "backgroundFlushing" ) );
-                globalFlushCounters.append( bb );
-                bb.done();
             }
 
             {
@@ -563,44 +562,16 @@ namespace mongo {
 
             result.append( "writeBacksQueued" , ! writeBackManager.queuesEmpty() );
 
-            // TODO: TokuDB durability stats?
-#if 0
-            if( cmdLine.dur ) {
-                result.append("dur", dur::stats.asObj());
-            }
-#endif
-            
-            {
-                BSONObjBuilder record( result.subobjStart( "recordStats" ) );
-                //Record::appendStats( record );
-
-                set<string> dbs;
-                {
-                    Lock::DBRead read( "local" );
-                    dbHolder().getAllShortNames( dbs );
-                }
-
-                for ( set<string>::iterator i = dbs.begin(); i != dbs.end(); ++i ) {
-                    string db = *i;
-                    Client::ReadContext ctx( db );
-                    BSONObjBuilder temp( record.subobjStart( db ) );
-                    //ctx.ctx().db()->recordStats().record( temp );
-                    temp.done();
-                }
-
-                record.done();
-            }
-
             timeBuilder.appendNumber( "after dur" , Listener::getElapsedTimeMillis() - start );
 
             {
                 RamLog* rl = RamLog::get( "warnings" );
                 massert(15880, "no ram log for warnings?" , rl);
-                
+
                 if (rl->lastWrite() >= time(0)-(10*60)){ // only show warnings from last 10 minutes
                     vector<const char*> lines;
                     rl->get( lines );
-                    
+
                     BSONArrayBuilder arr( result.subarrayStart( "warnings" ) );
                     for ( unsigned i=std::max(0,(int)lines.size()-10); i<lines.size(); i++ )
                         arr.append( lines[i] );
@@ -610,7 +581,7 @@ namespace mongo {
 
             if ( ! authed )
                 result.append( "note" , "run against admin for more info" );
-            
+
             timeBuilder.appendNumber( "at end" , Listener::getElapsedTimeMillis() - start );
             if ( Listener::getElapsedTimeMillis() - start > 1000 ) {
                 BSONObj t = timeBuilder.obj();
@@ -622,24 +593,16 @@ namespace mongo {
         }
     } cmdServerStatus;
 
-    class CmdEngineStatus : public Command {
+    class CmdEngineStatus : public InformationCommand {
     public:
-        virtual bool slaveOk() const {
-            return true;
-        }
-        CmdEngineStatus() : Command("engineStatus") {
-        }
-
-        virtual bool needsTxn() const { return false; }
-        virtual bool canRunInMultiStmtTxn() const { return true; }
-        virtual LockType locktype() const { return NONE; }
+        CmdEngineStatus() : InformationCommand("engineStatus") {}
 
         virtual void help( stringstream& help ) const {
-            help << "returns TokuDB engine statistics";
+            help << "returns TokuMX engine statistics";
         }
 
         bool run(const string& dbname, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
-            // Get engine status from TokuDB.
+            // Get engine status from TokuMX.
             // Status is system-wide, so we ignore the dbname and fromRepl bit.
             storage::get_status(result);
             return true;
@@ -648,37 +611,30 @@ namespace mongo {
 
     class CmdCheckpoint : public Command {
     public:
-        virtual bool slaveOk() const {
-            return true;
-        }
-        CmdCheckpoint() : Command("checkpoint") {
-        }
-
-        virtual bool needsTxn() const { return false; }
-        virtual bool canRunInMultiStmtTxn() const { return false; }
+        CmdCheckpoint() : Command("checkpoint") {}
+        virtual bool slaveOk() const { return true; }
         virtual LockType locktype() const { return NONE; }
-
+        virtual bool requiresSync() const { return true; }
+        virtual bool needsTxn() const { return false; }
+        virtual int txnFlags() const { return noTxnFlags(); }
+        virtual bool canRunInMultiStmtTxn() const { return false; }
+        virtual OpSettings getOpSettings() const { return OpSettings(); }
         virtual void help( stringstream& help ) const {
-            help << "performs a checkpoint of all TokuDB dictionaries." << endl;
+            help << "performs a checkpoint of all TokuMX dictionaries." << endl;
         }
-
         bool run(const string& dbname, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
             storage::checkpoint();
             return true;
         }
     } cmdCheckpoint;
 
-    class CmdDiagLogging : public Command {
+    class CmdDiagLogging : public InformationCommand {
     public:
-        virtual bool slaveOk() const {
-            return true;
-        }
-        CmdDiagLogging() : Command("diagLogging") { }
-        bool adminOnly() const {
-            return true;
-        }
-        void help(stringstream& h) const { h << "http://dochub.mongodb.org/core/monitoring#MonitoringandDiagnostics-DatabaseRecord%2FReplay%28diagLoggingcommand%29"; }
+        CmdDiagLogging() : InformationCommand("diagLogging", false) { }
+        // Vanilla mongo had this, I don't know why.  Seems like if they need a write lock it should be global?
         virtual LockType locktype() const { return WRITE; }
+        bool adminOnly() const { return true; }
+        void help(stringstream& h) const { h << "http://dochub.mongodb.org/core/monitoring#MonitoringandDiagnostics-DatabaseRecord%2FReplay%28diagLoggingcommand%29"; }
         bool run(const string& dbname , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
             int was = _diaglog.setLevel( cmdObj.firstElement().numberInt() );
             _diaglog.flush();
@@ -691,26 +647,19 @@ namespace mongo {
 
 
     /* drop collection */
-    class CmdDrop : public Command {
+    class CmdDrop : public FileopsCommand {
     public:
-        CmdDrop() : Command("drop") { }
-        virtual bool logTheOp() {
-            return true;
-        }
-        virtual bool slaveOk() const {
-            return false;
-        }
-        virtual bool adminOnly() const {
-            return false;
-        }
+        CmdDrop() : FileopsCommand("drop") { }
+        virtual bool logTheOp() { return true; }
+        virtual bool slaveOk() const { return false; }
+        virtual bool adminOnly() const { return false; }
         virtual void help( stringstream& help ) const { help << "drop a collection\n{drop : <collectionName>}"; }
-        virtual LockType locktype() const { return WRITE; }
         virtual bool run(const string& dbname , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
             string nsToDrop = dbname + '.' + cmdObj.firstElement().valuestr();
             if ( !cmdLine.quiet )
                 tlog() << "CMD: drop " << nsToDrop << endl;
             uassert( 10039 ,  "can't drop collection with reserved $ character in name", strchr(nsToDrop.c_str(), '$') == 0 );
-            NamespaceDetails *d = nsdetails(nsToDrop.c_str());
+            NamespaceDetails *d = nsdetails(nsToDrop);
             if ( d == 0 ) {
                 errmsg = "ns not found";
                 return false;
@@ -721,16 +670,10 @@ namespace mongo {
     } cmdDrop;
 
     /* select count(*) */
-    class CmdCount : public Command {
+    class CmdCount : public QueryCommand {
     public:
-        virtual LockType locktype() const { return READ; }
-        virtual bool canRunInMultiStmtTxn() const { return true; }
-        virtual bool needsTxn() const { return false; }
-        CmdCount() : Command("count") { }
-        virtual bool logTheOp() { return false; }
-        virtual bool slaveOk() const {
-            return false;
-        }
+        CmdCount() : QueryCommand("count") { }
+        virtual bool slaveOk() const { return false; }
         virtual bool slaveOverrideOk() const { return true; }
         virtual bool maintenanceOk() const { return false; }
         virtual bool adminOnly() const { return false; }
@@ -760,19 +703,12 @@ namespace mongo {
     } cmdCount;
 
     /* create collection */
-    class CmdCreate : public Command {
+    class CmdCreate : public FileopsCommand {
     public:
-        CmdCreate() : Command("create") { }
-        virtual bool logTheOp() {
-            return false;
-        }
-        virtual bool slaveOk() const {
-            return false;
-        }
-        virtual bool adminOnly() const {
-            return false;
-        }
-        virtual LockType locktype() const { return WRITE; }
+        CmdCreate() : FileopsCommand("create") { }
+        virtual bool logTheOp() { return false; }
+        virtual bool slaveOk() const { return false; }
+        virtual bool adminOnly() const { return false; }
         virtual void help( stringstream& help ) const {
             help << "create a collection explicitly\n"
                 "{ create: <ns>[, capped: <bool>, size: <collSizeInBytes>, max: <nDocs>] }";
@@ -790,19 +726,15 @@ namespace mongo {
     } cmdCreate;
 
     /* "dropIndexes" is now the preferred form - "deleteIndexes" deprecated */
-    class CmdDropIndexes : public Command {
+    class CmdDropIndexes : public FileopsCommand {
     public:
-        virtual bool logTheOp() {
-            return true;
-        }
-        virtual bool slaveOk() const {
-            return false;
-        }
-        virtual LockType locktype() const { return WRITE; }
+        CmdDropIndexes() : FileopsCommand("dropIndexes", false, "deleteIndexes") { }
+        virtual bool logTheOp() { return true; }
+        // TODO: maybe slaveOk should be true?
+        virtual bool slaveOk() const { return false; }
         virtual void help( stringstream& help ) const {
             help << "drop indexes for a collection";
         }
-        CmdDropIndexes() : Command("dropIndexes", false, "deleteIndexes") { }
         bool run(const string& dbname, BSONObj& jsobj, int, string& errmsg, BSONObjBuilder& anObjBuilder, bool /*fromRepl*/) {
             BSONElement e = jsobj.firstElement();
             string toDeleteNs = dbname + '.' + e.valuestr();
@@ -839,15 +771,15 @@ namespace mongo {
         }
     } cmdDropIndexes;
 
-    class CmdReIndex : public Command {
+    class CmdReIndex : public ModifyCommand {
     public:
+        CmdReIndex() : ModifyCommand("reIndex") { }
         virtual bool logTheOp() { return false; } // only reindexes on the one node
         virtual bool slaveOk() const { return true; }    // can reindex on a secondary
-        virtual LockType locktype() const { return READ; }
+        virtual bool requiresSync() const { return false; }
         virtual void help( stringstream& help ) const {
             help << "re-index a collection";
         }
-        CmdReIndex() : Command("reIndex") { }
         bool run(const string& dbname , BSONObj& jsobj, int, string& errmsg, BSONObjBuilder& result, bool /*fromRepl*/) {
             static DBDirectClient db;
 
@@ -855,7 +787,7 @@ namespace mongo {
             string toDeleteNs = dbname + '.' + e.valuestr();
             NamespaceDetails *d = nsdetails(toDeleteNs.c_str());
             tlog() << "CMD: reIndex " << toDeleteNs << endl;
-            // Tokudb: Do we care?
+            // TokuMX: Do we care?
             //BackgroundOperation::assertNoBgOpInProgForNs(toDeleteNs.c_str());
 
             if ( ! d ) {
@@ -884,18 +816,14 @@ namespace mongo {
         }
     } cmdReIndex;
 
-    class CmdRenameCollection : public Command {
+    class CmdRenameCollection : public FileopsCommand {
     public:
-        CmdRenameCollection() : Command( "renameCollection" ) {}
-        virtual bool adminOnly() const {
-            return true;
-        }
+        CmdRenameCollection() : FileopsCommand( "renameCollection" ) {}
+        virtual bool adminOnly() const { return true; }
         virtual bool requiresAuth() { return false; } // do our own auth
-        virtual bool slaveOk() const {
-            return false;
-        }
-        virtual LockType locktype() const { return WRITE; }
         virtual bool lockGlobally() const { return true; }
+        virtual LockType locktype() const { return WRITE; }
+        virtual bool slaveOk() const { return false; }
         virtual bool logTheOp() {
             return true; // can't log steps when doing fast rename within a db, so always log the op rather than individual steps comprising it.
         }
@@ -915,7 +843,7 @@ namespace mongo {
             long long size = 0;
             {
                 Client::Context ctx( source ); // auths against source
-                NamespaceDetails *nsd = nsdetails( source.c_str() );
+                NamespaceDetails *nsd = nsdetails( source );
                 uassert( 10026 ,  "source namespace does not exist", nsd );
                 capped = nsd->isCapped();
                 // TODO: Get the capped size
@@ -936,12 +864,10 @@ namespace mongo {
             // if we are renaming in the same database, just
             // rename the namespace and we're done.
             {
-                char from[256];
-                nsToDatabase( source.c_str(), from );
-                char to[256];
-                nsToDatabase( target.c_str(), to );
-                if ( strcmp( from, to ) == 0 ) {
-                    renameNamespace( source.c_str(), target.c_str(), cmdObj["stayTemp"].trueValue() );
+                StringData from = nsToDatabaseSubstring(source);
+                StringData to = nsToDatabaseSubstring(target);
+                if ( from == to ) {
+                    renameNamespace( source, target, cmdObj["stayTemp"].trueValue() );
                     // make sure we drop counters etc
                     Top::global.collectionDropped( source );
                     return true;
@@ -955,7 +881,7 @@ namespace mongo {
                 spec.appendBool( "capped", true );
                 spec.append( "size", double( size ) );
             }
-            if ( !userCreateNS( target.c_str(), spec.done(), errmsg , false) )
+            if ( !userCreateNS( target, spec.done(), errmsg , false) )
                 return false;
 
             auto_ptr< DBClientCursor > c;
@@ -974,11 +900,8 @@ namespace mongo {
                 insertObject( target.c_str(), o, 0, false );
             }
 
-            char cl[256];
-            nsToDatabase( source.c_str(), cl );
-            string sourceIndexes = string( cl ) + ".system.indexes";
-            nsToDatabase( target.c_str(), cl );
-            string targetIndexes = string( cl ) + ".system.indexes";
+            string sourceIndexes = nsToDatabaseSubstring(source).toString() + ".system.indexes";
+            string targetIndexes = nsToDatabaseSubstring(target).toString() + ".system.indexes";
             {
                 c = bridge.query( sourceIndexes, QUERY( "ns" << source ), 0, 0, 0, fromRepl ? QueryOption_SlaveOk : 0 );
             }
@@ -1016,21 +939,18 @@ namespace mongo {
 
     class CmdListDatabases : public Command {
     public:
-        virtual bool slaveOk() const {
-            return true;
-        }
-
+        virtual bool slaveOk() const { return true; }
+        virtual bool slaveOverrideOk() const { return true; }
+        virtual bool adminOnly() const { return true; }
+        virtual LockType locktype() const { return READ; }
+        virtual bool lockGlobally() const { return true; }
+        virtual bool requiresSync() const { return false; }
+        virtual bool needsTxn() const { return true; }
+        virtual int txnFlags() const { return DB_TXN_READ_ONLY | DB_TXN_SNAPSHOT; }
         virtual bool canRunInMultiStmtTxn() const { return true; }
+        virtual OpSettings getOpSettings() const { return OpSettings(); }
 
-        virtual bool slaveOverrideOk() const {
-            return true;
-        }
-        virtual bool adminOnly() const {
-            return true;
-        }
-        virtual LockType locktype() const { return NONE; }
         virtual void help( stringstream& help ) const { help << "list databases on this server"; }
-        virtual bool needsTxn() const { return false; }
         CmdListDatabases() : Command("listDatabases" , true ) {}
         bool run(const string& dbname , BSONObj& jsobj, int, string& errmsg, BSONObjBuilder& result, bool /*fromRepl*/) {
             vector< string > dbNames;
@@ -1043,12 +963,12 @@ namespace mongo {
                 BSONObjBuilder b;
                 b.append( "name", *i );
 
-                problem() << "don't know how to calculate the sizeOnDisk of a databse yet!" << endl;
+                problem() << "don't know how to calculate the sizeOnDisk of a database yet!" << endl;
                 boost::intmax_t size = 0;
                 b.append( "sizeOnDisk", (double) size );
                 totalSize += size;
                 
-                {
+                if (1) {
                     Client::ReadContext rc( *i + ".system.namespaces" );
                     b.appendBool( "empty", rc.ctx().db()->isEmpty() );
                 }
@@ -1060,7 +980,7 @@ namespace mongo {
 
             // TODO: erh 1/1/2010 I think this is broken where path != dbpath ??
             set<string> allShortNames;
-            {
+            if (1) {
                 Lock::GlobalRead lk;
                 dbHolder().getAllShortNames( allShortNames );
             }
@@ -1075,7 +995,7 @@ namespace mongo {
                 b.append( "name" , name );
                 b.append( "sizeOnDisk" , (double)1.0 );
 
-                {
+                if (1) {
                     Client::ReadContext ctx( name );
                     b.appendBool( "empty", ctx.ctx().db()->isEmpty() );
                 }
@@ -1089,45 +1009,12 @@ namespace mongo {
         }
     } cmdListDatabases;
 
-    /* note an access to a database right after this will open it back up - so this is mainly
-       for diagnostic purposes.
-       */
-    class CmdCloseAllDatabases : public Command {
+    class CmdFileMD5 : public QueryCommand {
     public:
-        virtual void help( stringstream& help ) const { help << "Close all database files.\nA new request will cause an immediate reopening; thus, this is mostly for testing purposes."; }
-        virtual bool adminOnly() const { return true; }
-        virtual bool slaveOk() const { return false; }
-        virtual LockType locktype() const { return WRITE; }
-        virtual bool lockGlobally() const { return true; }
-
-        CmdCloseAllDatabases() : Command( "closeAllDatabases" ) {}
-        bool run(const string& dbname , BSONObj& jsobj, int, string& errmsg, BSONObjBuilder& result, bool /*fromRepl*/) {
-            bool ok;
-            try {
-                ok = dbHolderW().closeAll( dbpath , result, false );
-            }
-            catch(DBException&) { 
-                throw;
-            }
-            catch(...) { 
-                log() << "ERROR uncaught exception in command closeAllDatabases" << endl;
-                errmsg = "unexpected uncaught exception";
-                return false;
-            }
-            return ok;
-        }
-    } cmdCloseAllDatabases;
-
-    class CmdFileMD5 : public Command {
-    public:
-        CmdFileMD5() : Command( "filemd5" ) {}
-        virtual bool slaveOk() const {
-            return true;
-        }
+        CmdFileMD5() : QueryCommand( "filemd5" ) {}
         virtual void help( stringstream& help ) const {
             help << " example: { filemd5 : ObjectId(aaaaaaa) , root : \"fs\" }";
         }
-        virtual LockType locktype() const { return READ; }
         bool run(const string& dbname, BSONObj& jsobj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl ) {
             string ns = dbname;
             ns += ".";
@@ -1225,14 +1112,12 @@ namespace mongo {
         }
     } cmdFileMD5;
 
-    class CmdDatasize : public Command {
+    class CmdDatasize : public QueryCommand {
         virtual string parseNs(const string& dbname, const BSONObj& cmdObj) const { 
             return parseNsFullyQualified(dbname, cmdObj);
         }
     public:
-        CmdDatasize() : Command( "dataSize", false, "datasize" ) {}
-        virtual bool slaveOk() const { return true; }
-        virtual LockType locktype() const { return READ; }
+        CmdDatasize() : QueryCommand( "dataSize", false, "datasize" ) {}
         virtual void help( stringstream &help ) const {
             help <<
                  "determine data size for a set of data in a certain range"
@@ -1274,7 +1159,8 @@ namespace mongo {
                     return 1;
                 }
 #endif
-                c = Helpers::findTableScan( ns.c_str() , BSONObj() );
+                NamespaceDetails *d = nsdetails( ns.c_str() );
+                c =  BasicCursor::make( d );
             }
             else if ( min.isEmpty() || max.isEmpty() ) {
                 errmsg = "only one of min or max specified";
@@ -1296,7 +1182,7 @@ namespace mongo {
                 min = Helpers::modifiedRangeBound( min , idx->keyPattern() , -1 );
                 max = Helpers::modifiedRangeBound( max , idx->keyPattern() , -1 );
 
-                c.reset( new IndexCursor( d, *idx, min, max, false, 1 ) );
+                c = IndexCursor::make( d, *idx, min, max, false, 1 );
             }
 
             //long long avgObjSize = d->stats.datasize / d->stats.nrecords;
@@ -1336,52 +1222,9 @@ namespace mongo {
         }
     } cmdDatasize;
 
-#if 0
-    namespace {
-        long long getIndexSizeForCollection(string db, string ns, BSONObjBuilder* details=NULL, int scale = 1 ) {
-            Lock::assertAtLeastReadLocked(ns);
-
-            NamespaceDetails * nsd = nsdetails( ns.c_str() );
-            if ( ! nsd )
-                return 0;
-
-            long long totalSize = 0;
-
-            NamespaceDetails::IndexIterator ii = nsd->ii();
-            while ( ii.more() ) {
-                IndexDetails& d = ii.next();
-                string collNS = d.indexNamespace();
-                NamespaceDetails * mine = nsdetails( collNS.c_str() );
-                long long datasize;
-                if ( ! mine ) {
-                    uint64_t size;
-                    if (!toku::env_get_db_data_size(d, &size)) {
-                        // neither mongo nor toku recognize the index
-                        log() << "error: have index ["  << collNS << "] but no NamespaceDetails" << endl;
-                        continue;
-                    } else {
-                        // mongo didn't recognize the index, but toku did
-                        datasize = size;
-                    }
-                } else {
-                    // valid mongo index, capture its size from the namespace details
-                    datasize = mine->stats.datasize;
-                }
-                totalSize += datasize;
-                if ( details )
-                    details->appendNumber( d.indexName() , datasize / scale );
-            }
-            return totalSize;
-        }
-    }
-#endif
-
-
-    class CollectionStats : public Command {
+    class CollectionStats : public QueryCommand {
     public:
-        CollectionStats() : Command( "collStats", false, "collstats" ) {}
-        virtual bool slaveOk() const { return true; }
-        virtual LockType locktype() const { return READ; }
+        CollectionStats() : QueryCommand( "collStats", false, "collstats" ) {}
         virtual void help( stringstream &help ) const {
             help << "{ collStats:\"blog.posts\" , scale : 1 } scale divides sizes e.g. for KB use 1024\n"
                     "    avgObjSize - in bytes";
@@ -1426,11 +1269,9 @@ namespace mongo {
         }
     } cmdCollectionStats;
 
-    class DBStats : public Command {
+    class DBStats : public QueryCommand {
     public:
-        DBStats() : Command( "dbStats", false, "dbstats" ) {}
-        virtual bool slaveOk() const { return true; }
-        virtual LockType locktype() const { return READ; }
+        DBStats() : QueryCommand( "dbStats", false, "dbstats" ) {}
         virtual void help( stringstream &help ) const {
             help << 
                 "Get stats on a database. Not instantaneous. Slower for databases with large .ns files.\n" << 
@@ -1451,9 +1292,10 @@ namespace mongo {
             }
 
             list<string> collections;
-            Database* d = cc().database();
-            if ( d )
-                d->namespaceIndex.getNamespaces( collections );
+            NamespaceIndex *ni = nsindex(dbname.c_str());
+            if ( ni != NULL ) {
+                ni->getNamespaces( collections );
+            }
 
             uint64_t ncollections = 0;
             uint64_t objects = 0;
@@ -1499,14 +1341,9 @@ namespace mongo {
     } cmdDBStats;
 
     /* Returns client's uri */
-    class CmdWhatsMyUri : public Command {
+    class CmdWhatsMyUri : public InformationCommand {
     public:
-        CmdWhatsMyUri() : Command("whatsmyuri") { }
-        virtual bool slaveOk() const {
-            return true;
-        }
-        virtual bool needsTxn() const { return false; }
-        virtual LockType locktype() const { return NONE; }
+        CmdWhatsMyUri() : InformationCommand("whatsmyuri", false) { }
         virtual void help( stringstream &help ) const {
             help << "{whatsmyuri:1}";
         }
@@ -1518,16 +1355,14 @@ namespace mongo {
     } cmdWhatsMyUri;
 
     
-    class DBHashCmd : public Command {
+    class DBHashCmd : public QueryCommand {
     public:
-        DBHashCmd() : Command( "dbHash", false, "dbhash" ) {}
-        virtual bool slaveOk() const { return true; }
-        virtual LockType locktype() const { return READ; }
+        DBHashCmd() : QueryCommand( "dbHash", false, "dbhash" ) {}
         virtual bool run(const string& dbname , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
             list<string> colls;
-            Database* db = cc().database();
-            if ( db )
-                db->namespaceIndex.getNamespaces( colls );
+            NamespaceIndex *ni = nsindex(dbname.c_str());
+            if ( ni != NULL )
+                ni->getNamespaces( colls );
             colls.sort();
 
             result.appendNumber( "numCollections" , (long long)colls.size() );
@@ -1542,8 +1377,6 @@ namespace mongo {
                 if ( c.find( ".system.profile" ) != string::npos )
                     continue;
 
-                shared_ptr<Cursor> cursor;
-
                 NamespaceDetails * nsd = nsdetails( c.c_str() );
 
                 // debug SERVER-761
@@ -1556,24 +1389,16 @@ namespace mongo {
                     }
                 }
 
-                int idNum = nsd->findIdIndex();
                 if ( c.find( ".system." ) != string::npos ) {
                     continue;
-                }
-                else {
-                    verify(idNum >= 0);
-                    cursor.reset( new IndexCursor( nsd , nsd->idx( idNum ) , BSONObj() , BSONObj() , false , 1 ) );
                 }
 
                 md5_state_t st;
                 md5_init(&st);
 
-                long long n = 0;
-                while ( cursor->ok() ) {
-                    BSONObj c = cursor->current();
-                    md5_append( &st , (const md5_byte_t*)c.objdata() , c.objsize() );
-                    n++;
-                    cursor->advance();
+                for (shared_ptr<Cursor> cursor(BasicCursor::make(nsd)); cursor->ok(); cursor->advance()) {
+                    BSONObj curObj = cursor->current();
+                    md5_append( &st , (const md5_byte_t*)curObj.objdata() , curObj.objsize() );
                 }
                 md5digest d;
                 md5_finish(&st, d);
@@ -1597,17 +1422,14 @@ namespace mongo {
     } dbhashCmd;
 
     /* for diagnostic / testing purposes. */
-    class CmdSleep : public Command {
+    class CmdSleep : public InformationCommand {
     public:
-        virtual LockType locktype() const { return NONE; }
+        CmdSleep() : InformationCommand("sleep", false) { }
         virtual bool adminOnly() const { return true; }
-        virtual bool logTheOp() { return false; }
-        virtual bool slaveOk() const { return true; }
         virtual void help( stringstream& help ) const {
             help << "internal testing command.  Makes db block (in a read lock) for 100 seconds\n";
             help << "w:true write lock. secs:<seconds>";
         }
-        CmdSleep() : Command("sleep") { }
         bool run(const string& ns, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
             log() << "test only command sleep invoked" << endl;
             int secs = 100;
@@ -1625,11 +1447,9 @@ namespace mongo {
         }
     } cmdSleep;
 
-    class EmptyCapped : public Command {
+    class EmptyCapped : public ModifyCommand {
     public:
-        EmptyCapped() : Command( "emptycapped" ) {}
-        virtual bool slaveOk() const { return false; }
-        virtual LockType locktype() const { return WRITE; }
+        EmptyCapped() : ModifyCommand( "emptycapped" ) {}
         virtual bool requiresAuth() { return true; }
         virtual bool logTheOp() { return true; }
         virtual bool run(const string& dbname , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
@@ -1657,6 +1477,11 @@ namespace mongo {
             LOG(1) << "command failed because of stale config, can retry" << causedBy( e ) << endl;
             throw;
         }
+        catch (RetryWithWriteLock &e) {
+            uasserted(16796, str::stream() << 
+                             "bug: Unhandled RetryWithWriteLock exception thrown during cmd: " << causedBy(e)
+                             << ". Either a necessary collection was dropped manually, or you hit a bug. ");
+        }
         catch ( DBException& e ) {
 
             // TODO: Rethrown errors have issues here, should divorce SendStaleConfigException from the DBException tree
@@ -1669,6 +1494,75 @@ namespace mongo {
         }
 
         return true;
+    }
+
+    static bool canRunCommand(
+        Command * c,
+        string& dbname,
+        int queryOptions,
+        bool fromRepl,
+        BSONObjBuilder& result
+        )
+    {
+        bool canRunHere =
+            isMaster( dbname.c_str() ) ||
+            c->slaveOk() ||
+            ( c->slaveOverrideOk() && ( queryOptions & QueryOption_SlaveOk ) ) ||
+            fromRepl;
+
+        if ( ! canRunHere ) {
+            result.append( "errmsg" , "not master" );
+            result.append( "note" , "from execCommand" );
+            return false;
+        }
+
+        if ( ! c->maintenanceOk() && theReplSet && ! isMaster( dbname.c_str() ) && ! theReplSet->isSecondary() ) {
+            result.append( "errmsg" , "node is recovering" );
+            result.append( "note" , "from execCommand" );
+            return false;
+        }
+        return true;
+    }
+
+    static bool runCommandWithNoDBLock(
+        Command* c ,
+        Client& client , int queryOptions ,
+        BSONObj& cmdObj ,
+        BSONObjBuilder& result,
+        bool fromRepl,
+        string dbname
+        )
+    {
+        bool retval = false;
+        // not sure of the semantics of running this without having a lock held
+        if (!canRunCommand(c, dbname, queryOptions, fromRepl, result)) {
+            return false;
+        }
+        verify(!c->lockGlobally());
+
+        // This assert means your command has LockType NONE but thinks it needs a transaction.
+        // You shouldn't be making a transaction without a lock to protect metadata, so your
+        // command is probably broken.
+        dassert(!c->needsTxn());
+        // logging requires a transaction
+        verify(!c->logTheOp());
+        
+        // we also trust that this won't crash
+        retval = true;
+
+        if ( c->requiresAuth() ) {
+            // test that the user at least as read permissions
+            if ( ! client.getAuthenticationInfo()->isAuthorizedReads( dbname ) ) {
+                result.append( "errmsg" , "need to login" );
+                retval = false;
+            }
+        }
+
+        if (retval) {
+            client.curop()->ensureStarted();
+            retval = _execCommand(c, dbname , cmdObj , queryOptions, result , fromRepl );
+        }
+        return retval;
     }
 
     /**
@@ -1729,92 +1623,64 @@ namespace mongo {
             c->help( ss );
             result.append( "help" , ss.str() );
             result.append( "lockType" , c->locktype() );
+            result.appendBool("requiresSync", c->requiresSync());
             return true;
-        }
-
-        bool canRunHere =
-            isMaster( dbname.c_str() ) ||
-            c->slaveOk() ||
-            ( c->slaveOverrideOk() && ( queryOptions & QueryOption_SlaveOk ) ) ||
-            fromRepl;
-
-        if ( ! canRunHere ) {
-            result.append( "errmsg" , "not master" );
-            result.append( "note" , "from execCommand" );
-            return false;
-        }
-
-        if ( ! c->maintenanceOk() && theReplSet && ! isMaster( dbname.c_str() ) && ! theReplSet->isSecondary() ) {
-            result.append( "errmsg" , "node is recovering" );
-            result.append( "note" , "from execCommand" );
-            return false;
         }
 
         if ( c->adminOnly() )
             LOG( 2 ) << "command: " << cmdObj << endl;
 
-        if (c->maintenanceMode() && theReplSet && theReplSet->isSecondary()) {
-            theReplSet->setMaintenanceMode(true);
-        }
-
         // before we start this command, check if we can run in a multi statement transaction
         // If we cannot and are in a multi statement transaction, 
         // then we must automatically commit the multi statement transaction
         // before proceeding
-        if (!fromRepl && !c->canRunInMultiStmtTxn() && cc().hasTxn()) {
-            cc().commitTopTxn();
-            // after commiting the top transaction
-            // assert that there is no other transaction
-            // on the stack. There shouldn't be one
-            dassert(!cc().hasTxn());
+        if (!fromRepl && !c->canRunInMultiStmtTxn()) {
+            uassert(16786, "cannot run command inside of multi statement transaction", !cc().hasTxn());
         }
 
         bool retval = false;
-        TokuCommandSettings settings = c->getTokuCommandSettings();
-        cc().setTokuCommandSettings(settings);
-
+        OpSettings settings = c->getOpSettings();
+        cc().setOpSettings(settings);
         if ( c->locktype() == Command::NONE ) {
-            verify( !c->lockGlobally() );
-
-            // This assert means your command has LockType NONE but thinks it needs a transaction.
-            // You shouldn't be making a transaction without a lock to protect metadata, so your
-            // command is probably broken.
-            dassert(!c->needsTxn());
-
-            // we also trust that this won't crash
-            retval = true;
-
-            if ( c->requiresAuth() ) {
-                // test that the user at least as read permissions
-                if ( ! client.getAuthenticationInfo()->isAuthorizedReads( dbname ) ) {
-                    result.append( "errmsg" , "need to login" );
-                    retval = false;
-                }
-            }
-
-            if (retval) {
-                client.curop()->ensureStarted();
-                retval = _execCommand(c, dbname , cmdObj , queryOptions, result , fromRepl );
-            }
+            retval = runCommandWithNoDBLock(c, client, queryOptions, cmdObj, result, fromRepl, dbname);
         }
-        else if( c->locktype() != Command::WRITE ) { 
+        else if ( c->locktype() == Command::OPLOCK ) {
+            RWLockRecursive::Shared lk(operationLock);
+            retval = runCommandWithNoDBLock(c, client, queryOptions, cmdObj, result, fromRepl, dbname);            
+        }
+        else if( c->locktype() == Command::READ ) { 
             // read lock
-            verify( ! c->logTheOp() );
             string ns = c->parseNs(dbname, cmdObj);
+
+            // Establish a read context first, which will open the db if it is closed.
+            //
+            // If we end up needing a global read lock, then our ReadContext is not
+            // sufficient. Upgrade to a global read lock. Note that the db may close
+            // between lock acquisions, but that's okay - we'll uassert later in the
+            // Client::Context constructor and the user must retry the command.
+            scoped_ptr<Client::ReadContext> rctx(new Client::ReadContext(ns, dbpath, c->requiresAuth()));
             scoped_ptr<Lock::GlobalRead> lk;
-            if( c->lockGlobally() )
-                lk.reset( new Lock::GlobalRead() );
+            if (c->lockGlobally()) {
+                rctx.reset();
+                lk.reset(new Lock::GlobalRead());
+            }
+            Client::Context ctx(ns, dbpath, c->requiresAuth());
+            if (!canRunCommand(c, dbname, queryOptions, fromRepl, result)) {
+                return false;
+            }
 
-            // Read contexts use a snapshot transaction and are marked as read only.
-            Client::ReadContext ctx( ns , dbpath, c->requiresAuth() ); // read locks
-
-            scoped_ptr<Client::Transaction> transaction((!fromRepl && c->needsTxn()) ? new Client::Transaction(c->txnFlags()) : NULL);
-
+            scoped_ptr<Client::Transaction> txn((!fromRepl && c->needsTxn())
+                                                ? new Client::Transaction(c->txnFlags())
+                                                : NULL);
             client.curop()->ensureStarted();
             retval = _execCommand(c, dbname , cmdObj , queryOptions, result , fromRepl );
 
-            if (retval && transaction) {
-                transaction->commit();
+            if ( retval && c->logTheOp() && ! fromRepl ) {
+                OpLogHelpers::logCommand(cmdns, cmdObj, &cc().txn());
+            }
+
+            if (retval && txn) {
+                txn->commit();
             }
         }
         else {
@@ -1829,14 +1695,18 @@ namespace mongo {
                     log() << "need global W lock but already have w on command : " << cmdObj.toString() << endl;
                 }
             }
-            scoped_ptr<Lock::ScopedLock> lk( global ? 
-                                             static_cast<Lock::ScopedLock*>( new Lock::GlobalWrite() ) :
-                                             static_cast<Lock::ScopedLock*>( new Lock::DBWrite( dbname ) ) );
+            scoped_ptr<Lock::ScopedLock> lk(global
+                                            ? static_cast<Lock::ScopedLock*>(new Lock::GlobalWrite())
+                                            : static_cast<Lock::ScopedLock*>(new Lock::DBWrite(dbname)));
+            if (!canRunCommand(c, dbname, queryOptions, fromRepl, result)) {
+                return false;
+            }
 
-            scoped_ptr<Client::Transaction> transaction((!fromRepl && c->needsTxn()) ? new Client::Transaction(c->txnFlags()) : NULL);
-
+            Client::Context ctx(dbname, dbpath, c->requiresAuth());
+            scoped_ptr<Client::Transaction> transaction((!fromRepl && c->needsTxn())
+                                                        ? new Client::Transaction(c->txnFlags())
+                                                        : NULL);
             client.curop()->ensureStarted();
-            Client::Context tc(dbname, dbpath, c->requiresAuth());
             retval = _execCommand(c, dbname , cmdObj , queryOptions, result , fromRepl );
             if ( retval && c->logTheOp() && ! fromRepl ) {
                 OpLogHelpers::logCommand(cmdns, cmdObj, &cc().txn());
@@ -1845,10 +1715,6 @@ namespace mongo {
             if (retval && transaction) {
                 transaction->commit();
             }
-        }
-
-        if (c->maintenanceMode() && theReplSet) {
-            theReplSet->setMaintenanceMode(false);
         }
 
         return retval;

@@ -1,5 +1,6 @@
 /**
 *    Copyright (C) 2008 10gen Inc.
+*    Copyright (C) 2013 Tokutek Inc.
 *
 *    This program is free software: you can redistribute it and/or  modify
 *    it under the terms of the GNU Affero General Public License, version 3,
@@ -18,24 +19,24 @@
 
 #include <boost/thread/thread.hpp>
 
-#include "rs.h"
-#include "health.h"
-#include "../../util/background.h"
+#include "mongo/db/repl/health.h"
 
-#include "../commands.h"
-#include "../../util/concurrency/value.h"
-#include "../../util/concurrency/task.h"
-#include "../../util/concurrency/msg.h"
-#include "../../util/mongoutils/html.h"
-#include "../../util/goodies.h"
-#include "../../util/ramlog.h"
-#include "../helpers/dblogger.h"
-#include "connections.h"
-#include "../instance.h"
-#include "../repl.h"
-#include "mongo/db/repl/bgsync.h"
-#include "mongo/db/security.h"
+#include "mongo/db/commands.h"
 #include "mongo/db/gtid.h"
+#include "mongo/db/instance.h"
+#include "mongo/db/repl.h"
+#include "mongo/db/repl/bgsync.h"
+#include "mongo/db/repl/connections.h"
+#include "mongo/db/repl/rs.h"
+#include "mongo/db/repl/rs_config.h"
+#include "mongo/db/security.h"
+#include "mongo/util/background.h"
+#include "mongo/util/concurrency/msg.h"
+#include "mongo/util/concurrency/task.h"
+#include "mongo/util/concurrency/value.h"
+#include "mongo/util/goodies.h"
+#include "mongo/util/mongoutils/html.h"
+#include "mongo/util/ramlog.h"
 
 namespace mongo {
 
@@ -84,8 +85,11 @@ namespace mongo {
                     mp->tag |= 1;
             }
 
-            if( cmdObj["pv"].Int() != 1 ) {
-                errmsg = "incompatible replset protocol version";
+            if (!ReplSetConfig::checkProtocolVersion(cmdObj["pv"].Int(), errmsg)) {
+                // You and I are not allowed to talk to each other at all.  This doesn't reflect the
+                // protocol version of this replica set, this is just the version this particular
+                // mongod speaks.
+                result.append("protocolVersionMismatch", true);
                 return false;
             }
             {
@@ -133,20 +137,25 @@ namespace mongo {
             result.append("v", v);
             if( v > cmdObj["v"].Int() )
                 result << "config" << theReplSet->config().asBson();
+            result.append("pv", theReplSet->config().protocolVersion);
 
             return true;
         }
     } cmdReplSetHeartbeat;
 
-    bool requestHeartbeat(string setName, string from, string memberFullName, BSONObj& result,
-                          int myCfgVersion, int& theirCfgVersion, bool checkEmpty) {
+    bool requestHeartbeat(const std::string& setName,
+                          const std::string& from,
+                          const std::string& memberFullName,
+                          BSONObj& result,
+                          int myCfgVersion,
+                          bool checkEmpty) {
         if( replSetBlind ) {
             return false;
         }
 
         BSONObj cmd = BSON( "replSetHeartbeat" << setName <<
                             "v" << myCfgVersion <<
-                            "pv" << 1 <<
+                            "pv" << ReplSetConfig::CURRENT_PROTOCOL_VERSION <<
                             "checkEmpty" << checkEmpty <<
                             "from" << from );
 
@@ -347,10 +356,10 @@ namespace mongo {
             // add this server to the electable set if it is within 10
             // seconds of the latest optime we know of
             else if( info["e"].trueValue() &&
-                     mem.opTime >= theReplSet->gtidManager->getCurrTimestamp()- 10000) 
+                     mem.opTime + 10000 >= (theReplSet->gtidManager ? theReplSet->gtidManager->getCurrTimestamp() : 0)) 
             {
                 unsigned lastOp = theReplSet->lastOtherOpTime();
-                if (lastOp > 0 && mem.opTime >= lastOp - 10000) {
+                if (lastOp > 0 && mem.opTime + 10000 >= lastOp) {
                     theReplSet->addToElectable(mem.id());
                 }
             }
@@ -402,6 +411,7 @@ namespace mongo {
         boost::thread producer(boost::bind(&BackgroundSync::applierThread, sync));
         boost::thread applier(boost::bind(&BackgroundSync::producerThread, sync));
         boost::thread replInfoUpdater(boost::bind(&ReplSetImpl::updateReplInfoThread, this));
+        boost::thread replPurgeOplog(boost::bind(&ReplSetImpl::purgeOplogThread, this));
 
         task::fork(ghost);
 

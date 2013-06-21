@@ -1,5 +1,6 @@
 /**
 *    Copyright (C) 2009 10gen Inc.
+*    Copyright (C) 2013 Tokutek Inc.
 *
 *    This program is free software: you can redistribute it and/or  modify
 *    it under the terms of the GNU Affero General Public License, version 3,
@@ -32,10 +33,7 @@ namespace mongo {
         _active = false;
         _reset();
         _op = 0;
-        // These addresses should never be written to again.  The zeroes are
-        // placed here as a precaution because currentOp may be accessed
-        // without the db mutex.
-        memset(_ns, 0, sizeof(_ns));
+        _ns.clear();
     }
 
     void CurOp::_reset() {
@@ -54,7 +52,7 @@ namespace mongo {
         _reset();
         _start = 0;
         _opNum = _nextOpNum++;
-        _ns[0] = 0;
+        _ns.clear();
         _debug.reset();
         _query.reset();
         _active = true; // this should be last for ui clarity
@@ -109,11 +107,8 @@ namespace mongo {
 
     void CurOp::enter( Client::Context * context ) {
         ensureStarted();
-
-        strncpy( _ns, context->ns(), Namespace::MaxNsLen);
-        _ns[Namespace::MaxNsLen] = 0;
-
-        _dbprofile = std::max( context->_db ? context->_db->profile : 0 , _dbprofile );
+        _ns = context->ns();
+        _dbprofile = std::max( context->_db ? context->_db->profile() : 0 , _dbprofile );
     }
     
     void CurOp::leave( Client::Context * context ) {
@@ -180,9 +175,19 @@ namespace mongo {
     }
 
     void KillCurrentOp::checkForInterrupt( bool heedMutex ) {
-        Client& c = cc();
+        return _checkForInterrupt( cc(), heedMutex );
+    }
+
+    void KillCurrentOp::checkForInterrupt( Client &c ) {
+        return _checkForInterrupt( c, false );
+    }
+
+    void KillCurrentOp::_checkForInterrupt( Client &c, bool heedMutex ) {
         if ( heedMutex && Lock::somethingWriteLocked() && c.hasWrittenThisPass() )
             return;
+        if (_killForTransition > 0) {
+            uasserted(16809, "interrupted due to state transition");
+        }
         if( _globalKill )
             uasserted(11600,"interrupted at shutdown");
         if( c.curop()->killed() ) {
@@ -192,6 +197,9 @@ namespace mongo {
     
     const char * KillCurrentOp::checkForInterruptNoAssert() {
         Client& c = cc();
+        if (_killForTransition > 0) {
+            return "interrupted due to state transition";
+        }
         if( _globalKill )
             return "interrupted at shutdown";
         if( c.curop()->killed() )

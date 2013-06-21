@@ -2,6 +2,7 @@
 
 /**
 *    Copyright (C) 2008 10gen Inc.
+*    Copyright (C) 2013 Tokutek Inc.
 *
 *    This program is free software: you can redistribute it and/or  modify
 *    it under the terms of the GNU Affero General Public License, version 3,
@@ -32,7 +33,7 @@ namespace mongo {
     static void _profile(const Client& c, CurOp& currentOp, BufBuilder& profileBufBuilder) {
         Database *db = c.database();
         DEV verify( db );
-        const char *ns = db->profileName.c_str();
+        const char *ns = db->profileName().c_str();
         
         // build object
         BSONObjBuilder b(profileBufBuilder);
@@ -71,7 +72,7 @@ namespace mongo {
         NamespaceDetailsTransient *nsdt = &NamespaceDetailsTransient::get(ns);
         if (details) {
             // write: not replicated
-            insertOneObject(details, nsdt, p, 0);
+            insertOneObject(details, nsdt, p);
         }
     }
 
@@ -100,19 +101,19 @@ namespace mongo {
 
     NamespaceDetails* getOrCreateProfileCollection(Database *db, bool force) {
         fassert(16372, db);
-        const char* profileName = db->profileName.c_str();
-        NamespaceDetails* details = db->namespaceIndex.details(profileName);
+        const char* profileName = db->profileName().c_str();
+        NamespaceDetails* details = nsdetails(profileName);
         if (!details && (cmdLine.defaultProfile || force)) {
             // system.profile namespace doesn't exist; create it
             log() << "creating profile collection: " << profileName << endl;
             string errmsg;
-            if (!userCreateNS(db->profileName.c_str(),
+            if (!userCreateNS(profileName,
                               BSON("capped" << true << "size" << 1024 * 1024 << "autoIndexId" << false),
                               errmsg , false)) {
-                log() << "could not create ns " << db->profileName << ": " << errmsg << endl;
+                log() << "could not create ns " << profileName << ": " << errmsg << endl;
                 return NULL;
             }
-            details = db->namespaceIndex.details(profileName);
+            details = nsdetails(profileName);
         }
         if (!details) {
             // failed to get or create profile collection

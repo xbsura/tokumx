@@ -4,6 +4,7 @@
 
 /**
 *    Copyright (C) 2008 10gen Inc.
+*    Copyright (C) 2013 Tokutek Inc.
 *
 *    This program is free software: you can redistribute it and/or  modify
 *    it under the terms of the GNU Affero General Public License, version 3,
@@ -20,6 +21,7 @@
 
 #pragma once
 
+#include "mongo/db/gtid.h"
 #include "mongo/db/repl/health.h"
 #include "mongo/util/concurrency/list.h"
 #include "mongo/util/concurrency/race.h"
@@ -79,11 +81,11 @@ namespace mongo {
             void check() const;   /* check validity, assert if not. */
             BSONObj asBson() const;
             bool potentiallyHot() const { return !arbiterOnly && priority > 0; }
-            void updateGroups(const OpTime& last) {
+            void updateGroups(const GTID& lastGTID) {
                 RACECHECK
                 scoped_lock lk(ReplSetConfig::groupMx);
                 for (set<TagSubgroup*>::const_iterator it = groups().begin(); it != groups().end(); it++) {
-                    (*it)->updateLast(last);
+                    (*it)->updateLast(lastGTID);
                 }
             }
             bool operator==(const MemberCfg& r) const {
@@ -142,6 +144,13 @@ namespace mongo {
 
         BSONObj asBson() const;
 
+        static const int CURRENT_PROTOCOL_VERSION;
+        static const int MAX_SUPPORTED_PROTOCOL_VERSION;
+        static const int MIN_SUPPORTED_PROTOCOL_VERSION;
+        static bool checkProtocolVersion(int pv, string &errmsg);
+        static BSONObj addProtocolVersionIfMissing(const BSONObj &obj);
+        int protocolVersion;
+
         /**
          * Getter and setter for _majority. This is almost always
          * members.size()/2+1, but can be the number of non-arbiter members if
@@ -187,9 +196,9 @@ namespace mongo {
          */
         struct TagSubgroup : boost::noncopyable {
             ~TagSubgroup(); // never called; not defined
-            TagSubgroup(string nm) : name(nm) { }
+            TagSubgroup(const std::string& nm) : name(nm) { }
             const string name;
-            OpTime last;
+            GTID last;
             vector<TagClause*> clauses;
 
             // this probably won't actually point to valid members after the
@@ -197,7 +206,7 @@ namespace mongo {
             // config
             set<MemberCfg*> m;
 
-            void updateLast(const OpTime& op);
+            void updateLast(const GTID& gtid);
 
             //string toString() const;
 
@@ -218,7 +227,7 @@ namespace mongo {
          * we had "dc" : 2, our subgroups might be "nyc", "sf", and "hk".
          */
         struct TagClause {
-            OpTime last;
+            GTID last;
             map<string,TagSubgroup*> subgroups;
             TagRule *rule;
             string name;
@@ -231,7 +240,7 @@ namespace mongo {
             int target;
             int actualTarget;
 
-            void updateLast(const OpTime& op);
+            void updateLast(const GTID& gtid);
             string toString() const;
         };
 
@@ -261,9 +270,9 @@ namespace mongo {
     public:
         struct TagRule {
             vector<TagClause*> clauses;
-            OpTime last;
+            GTID last;
 
-            void updateLast(const OpTime& op);
+            void updateLast(const GTID& gtid);
             string toString() const;
         };
     };

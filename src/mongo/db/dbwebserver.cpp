@@ -5,6 +5,7 @@
 
 /**
 *    Copyright (C) 2008 10gen Inc.
+*    Copyright (C) 2013 Tokutek Inc.
 *
 *    This program is free software: you can redistribute it and/or  modify
 *    it under the terms of the GNU Affero General Public License, version 3,
@@ -19,21 +20,21 @@
 *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 
-#include "pch.h"
-#include "../util/net/miniwebserver.h"
-#include "../util/mongoutils/html.h"
-#include "../util/md5.hpp"
-#include "db.h"
-#include "instance.h"
-#include "security.h"
-#include "stats/snapshots.h"
-#include "background.h"
-#include "commands.h"
-#include "../util/version.h"
-#include "../util/ramlog.h"
+#include "mongo/pch.h"
+#include "mongo/util/net/miniwebserver.h"
+#include "mongo/util/mongoutils/html.h"
+#include "mongo/util/md5.hpp"
+#include "mongo/db/instance.h"
+#include "mongo/db/security.h"
+#include "mongo/db/stats/snapshots.h"
+#include "mongo/db/background.h"
+#include "mongo/db/commands.h"
+#include "mongo/util/version.h"
+#include "mongo/util/ramlog.h"
+#include "mongo/util/admin_access.h"
+#include "mongo/db/dbwebserver.h"
+
 #include "pcrecpp.h"
-#include "../util/admin_access.h"
-#include "dbwebserver.h"
 #include <boost/date_time/posix_time/posix_time.hpp>
 
 namespace mongo {
@@ -373,7 +374,7 @@ namespace mongo {
     public:
         FavIconHandler() : DbWebHandler( "favicon.ico" , 0 , false ) {}
 
-        virtual void handle( const char *rq, string url, BSONObj params,
+        virtual void handle( const char *rq, const std::string& url, BSONObj params,
                              string& responseMsg, int& responseCode,
                              vector<string>& headers,  const SockAddr &from ) {
             responseCode = 404;
@@ -387,7 +388,7 @@ namespace mongo {
     public:
         StatusHandler() : DbWebHandler( "_status" , 1 , false ) {}
 
-        virtual void handle( const char *rq, string url, BSONObj params,
+        virtual void handle( const char *rq, const std::string& url, BSONObj params,
                              string& responseMsg, int& responseCode,
                              vector<string>& headers,  const SockAddr &from ) {
             headers.push_back( "Content-Type: application/json;charset=utf-8" );
@@ -439,7 +440,7 @@ namespace mongo {
     public:
         CommandListHandler() : DbWebHandler( "_commands" , 1 , true ) {}
 
-        virtual void handle( const char *rq, string url, BSONObj params,
+        virtual void handle( const char *rq, const std::string& url, BSONObj params,
                              string& responseMsg, int& responseCode,
                              vector<string>& headers,  const SockAddr &from ) {
             headers.push_back( "Content-Type: text/html;charset=utf-8" );
@@ -491,7 +492,7 @@ namespace mongo {
             return _cmd(cmd) != 0;
         }
 
-        virtual void handle( const char *rq, string url, BSONObj params,
+        virtual void handle( const char *rq, const std::string& url, BSONObj params,
                              string& responseMsg, int& responseCode,
                              vector<string>& headers,  const SockAddr &from ) {
             string cmd;

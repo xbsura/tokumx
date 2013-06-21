@@ -2,6 +2,7 @@
 
 /**
 *    Copyright (C) 2008 10gen Inc.
+*    Copyright (C) 2013 Tokutek Inc.
 *
 *    This program is free software: you can redistribute it and/or  modify
 *    it under the terms of the GNU Affero General Public License, version 3,
@@ -65,14 +66,10 @@ namespace mongo {
      * Command to allow access to the sharded conn pool information in mongos.
      * TODO: Refactor with other connection pooling changes
      */
-    class ShardedPoolStats : public Command {
-    public:
-
-        ShardedPoolStats() : Command( "shardConnPoolStats" ) {}
+    class ShardedPoolStats : public InformationCommand {
+      public:
+        ShardedPoolStats() : InformationCommand("shardConnPoolStats", false) {}
         virtual void help( stringstream &help ) const { help << "stats about the shard connection pool"; }
-        virtual LockType locktype() const { return NONE; }
-        virtual bool slaveOk() const { return true; }
-
         virtual bool run ( const string&, mongo::BSONObj&, int, std::string&, mongo::BSONObjBuilder& result, bool ) {
             // Base pool info
             shardConnectionPool.appendInfo( result );
@@ -80,7 +77,6 @@ namespace mongo {
             activeClientConnections.appendInfo( result );
             return true;
         }
-
     } shardedPoolStatsCmd;
 
     /**

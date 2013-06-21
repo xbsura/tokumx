@@ -4,6 +4,7 @@
 */
 
 /*    Copyright 2009 10gen Inc.
+ *    Copyright (C) 2013 Tokutek Inc.
  *
  *    Licensed under the Apache License, Version 2.0 (the "License");
  *    you may not use this file except in compliance with the License.
@@ -84,7 +85,7 @@ namespace mongo {
 
         QueryOption_AllSupported = QueryOption_CursorTailable | QueryOption_SlaveOk | QueryOption_OplogReplay | QueryOption_NoCursorTimeout | QueryOption_AwaitData | QueryOption_Exhaust | QueryOption_PartialResults,
 
-        // TokuDB related options, starting at 24, so if MongoDB adds options in subsequent versions,
+        // TokuMX related options, starting at 24, so if MongoDB adds options in subsequent versions,
         // we (hopefully) don't have conflicts
 
         // Option to add the hidden primary key for system collections and capped collections
@@ -592,6 +593,31 @@ namespace mongo {
         virtual bool runCommand(const string &dbname, const BSONObj& cmd, BSONObj &info,
                                 int options=0, const AuthenticationTable* auth = NULL);
 
+        /** Begin a multi-statement transaction.
+            If you are using a SyncClusterConnection, you must use these wrappers (or a RemoteTransaction), not bare runCommand() calls.
+
+            @param isolation isolation level.  Options are "mvcc" (default), "serializable", and "readUncommitted".
+            @param res pointer to object to return the result of the begin.
+            @return true iff the begin was successful.
+         */
+        virtual bool beginTransaction(const string &isolation = "mvcc", BSONObj *res = NULL);
+
+        /** Commit a multi-statement transaction.
+            If you are using a SyncClusterConnection, you must use these wrappers (or a RemoteTransaction), not bare runCommand() calls.
+
+            @param res pointer to object to return the result of the commit.
+            @return true iff the commit was successful.
+         */
+        virtual bool commitTransaction(BSONObj *res = NULL);
+
+        /** Rollback a multi-statement transaction.
+            If you are using a SyncClusterConnection, you must use these wrappers (or a RemoteTransaction), not bare runCommand() calls.
+
+            @param res pointer to object to return the result of the rollback.
+            @return true iff the rollback was successful.
+         */
+        virtual bool rollbackTransaction(BSONObj *res = NULL);
+
         /** Authorize access to a particular database.
             Authentication is separate for each database on the server -- you may authenticate for any
             number of databases on a single connection.
@@ -868,6 +894,7 @@ namespace mongo {
            @param ns collection to be indexed
            @param keys the "key pattern" for the index.  e.g., { name : 1 }
            @param unique if true, indicates that key uniqueness should be enforced for this index
+           @param clustering if true, indicates that data should be clustered with this index
            @param name if not specified, it will be created from the keys automatically (which is recommended)
            @param cache if set to false, the index cache for the connection won't remember this call
            @param background build index in the background (see mongodb docs/wiki for details)
@@ -875,8 +902,8 @@ namespace mongo {
            @return whether or not sent message to db.
              should be true on first call, false on subsequent unless resetIndexCache was called
          */
-        virtual bool ensureIndex( const string &ns , BSONObj keys , bool unique = false, const string &name = "",
-                                  bool cache = true, bool background = false, int v = -1 );
+        virtual bool ensureIndex( const string &ns , BSONObj keys , bool unique = false, bool clustering = false,
+                                  const string &name = "", bool cache = true, bool background = false, int v = -1 );
 
         /**
            clears the index cache, so the subsequent call to ensureIndex for any index will go to the server

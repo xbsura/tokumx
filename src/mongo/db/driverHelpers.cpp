@@ -21,9 +21,8 @@
 */
 
 
-#include "pch.h"
+#include "mongo/pch.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/namespace.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/cmdline.h"
 #include "mongo/db/cursor.h"
@@ -33,13 +32,9 @@
 
 namespace mongo {
 
-    class BasicDriverHelper : public Command {
+    class BasicDriverHelper : public InformationCommand {
     public:
-        BasicDriverHelper( const char * name ) : Command( name ) {}
-
-        virtual LockType locktype() const { return NONE; }
-        virtual bool slaveOk() const { return true; }
-        virtual bool slaveOverrideOk() const { return true; }
+        BasicDriverHelper(const char *name) : InformationCommand(name, false) {}
     };
 
     class ObjectIdTest : public BasicDriverHelper {

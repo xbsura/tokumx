@@ -18,10 +18,19 @@
 
 #pragma once
 
+#include "pch.h"
+
+#include "mongo/db/jsobj.h"
+
 namespace mongo {
 
     /* throws */
-    bool requestHeartbeat(string setname, string fromHost, string memberFullName, BSONObj& result, int myConfigVersion, int& theirConfigVersion, bool checkEmpty = false);
+    bool requestHeartbeat(const std::string& setname,
+                          const std::string& fromHost,
+                          const std::string& memberFullName,
+                          BSONObj& result,
+                          int myConfigVersion,
+                          bool checkEmpty = false);
 
     struct HealthOptions {
         HealthOptions() :  

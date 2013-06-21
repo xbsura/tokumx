@@ -1,5 +1,6 @@
 /**
 *    Copyright (C) 2011 10gen Inc.
+*    Copyright (C) 2013 Tokutek Inc.
 *
 *    This program is free software: you can redistribute it and/or  modify
 *    it under the terms of the GNU Affero General Public License, version 3,
@@ -119,7 +120,7 @@ namespace mongo {
     }
 
     void DocumentSourceGroup::addAccumulator(
-        string fieldName,
+        const std::string& fieldName,
         intrusive_ptr<Accumulator> (*pAccumulatorFactory)(
             const intrusive_ptr<ExpressionContext> &),
         const intrusive_ptr<Expression> &pExpression) {

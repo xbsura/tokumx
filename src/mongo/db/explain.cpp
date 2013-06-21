@@ -1,6 +1,7 @@
 // @file explain.cpp - Helper classes for generating query explain output.
 
 /*    Copyright 2012 10gen Inc.
+ *    Copyright (C) 2013 Tokutek Inc.
  *
  *    Licensed under the Apache License, Version 2.0 (the "License");
  *    you may not use this file except in compliance with the License.
@@ -85,7 +86,6 @@ namespace mongo {
         bob.appendNumber( "nscannedAllPlans", clauseInfo.nscannedAllPlans() );
         bob.append( "scanAndOrder", _scanAndOrder );
         bob.append( "indexOnly", _indexOnly );
-        bob.appendNumber( "nYields", clauseInfo.nYields() );
         bob.appendNumber( "nChunkSkips", clauseInfo.nChunkSkips() );
         bob.appendNumber( "millis", clauseInfo.millis() );
         bob.append( "indexBounds", _indexBounds );
@@ -101,8 +101,7 @@ namespace mongo {
     ExplainClauseInfo::ExplainClauseInfo() :
     _n(),
     _nscannedObjects(),
-    _nChunkSkips(),
-    _nYields() {
+    _nChunkSkips() {
     }
     
     BSONObj ExplainClauseInfo::bson() const {

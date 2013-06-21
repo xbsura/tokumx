@@ -74,26 +74,6 @@ namespace mongo {
                         // note here that cc->primary == 0.
                         log() << "couldn't find database [" << database << "] in config db" << endl;
 
-                        {
-                            // lets check case
-                            scoped_ptr<ScopedDbConnection> conn(
-                                    ScopedDbConnection::getInternalScopedDbConnection(
-                                            configServer.modelServer() ));
-
-                            BSONObjBuilder b;
-                            b.appendRegex( "_id" , (string)"^" +
-                                           pcrecpp::RE::QuoteMeta( database ) + "$" , "i" );
-                            BSONObj d = conn->get()->findOne( ShardNS::database , b.obj() );
-                            conn->done();
-
-                            if ( ! d.isEmpty() ) {
-                                uasserted( DatabaseDifferCaseCode, str::stream()
-                                    <<  "can't have 2 databases that just differ on case "
-                                    << " have: " << d["_id"].String()
-                                    << " want to add: " << database );
-                            }
-                        }
-
                         Shard primary;
                         if ( database == "admin" ) {
                             primary = configServer.getPrimary();
@@ -134,7 +114,7 @@ namespace mongo {
         return dbConfig;
     }
 
-    void Grid::removeDB( string database ) {
+    void Grid::removeDB( const std::string& database ) {
         uassert( 10186 ,  "removeDB expects db name" , database.find( '.' ) == string::npos );
         scoped_lock l( _lock );
         _databases.erase( database );
@@ -554,7 +534,7 @@ namespace mongo {
         _databases.clear();
     }
 
-    BSONObj Grid::getConfigSetting( string name ) const {
+    BSONObj Grid::getConfigSetting( const std::string& name ) const {
         scoped_ptr<ScopedDbConnection> conn( ScopedDbConnection::getInternalScopedDbConnection(
                 configServer.getPrimary().getConnString() ) );
         BSONObj result = conn->get()->findOne( ShardNS::settings, BSON( "_id" << name ) );

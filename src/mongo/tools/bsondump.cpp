@@ -2,6 +2,7 @@
 
 /**
 *    Copyright (C) 2008 10gen Inc.
+*    Copyright (C) 2013 Tokutek Inc.
 *
 *    This program is free software: you can redistribute it and/or  modify
 *    it under the terms of the GNU Affero General Public License, version 3,
@@ -17,6 +18,7 @@
 */
 
 #include "../pch.h"
+#include "mongo/base/initializer.h"
 #include "mongo/client/dbclientcursor.h"
 #include "../util/text.h"
 #include "tool.h"
@@ -140,7 +142,8 @@ public:
     }
 };
 
-int main( int argc , char ** argv ) {
+int main( int argc , char ** argv, char **envp ) {
+    mongo::runGlobalInitializersOrDie(argc, argv, envp);
     BSONDump dump;
     return dump.main( argc , argv );
 }

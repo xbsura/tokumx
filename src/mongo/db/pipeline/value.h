@@ -1,5 +1,6 @@
 /**
  * Copyright (c) 2011 10gen Inc.
+ * Copyright (C) 2013 Tokutek Inc.
  *
  * This program is free software: you can redistribute it and/or  modify
  * it under the terms of the GNU Affero General Public License, version 3,
@@ -185,7 +186,7 @@ namespace mongo {
         /*
           Add this value to the BSON object under construction.
         */
-        void addToBsonObj(BSONObjBuilder *pBuilder, string fieldName) const;
+        void addToBsonObj(BSONObjBuilder *pBuilder, const std::string& fieldName) const;
 
         /*
           Add this field to the BSON array under construction.

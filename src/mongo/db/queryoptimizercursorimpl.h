@@ -2,6 +2,7 @@
 
 /**
  *    Copyright (C) 2011 10gen Inc.
+ *    Copyright (C) 2013 Tokutek Inc.
  *
  *    This program is free software: you can redistribute it and/or  modify
  *    it under the terms of the GNU Affero General Public License, version 3,
@@ -178,7 +179,7 @@ namespace mongo {
      */
     class CursorGenerator {
     public:
-        CursorGenerator( const char *ns,
+        CursorGenerator( const StringData& ns,
                         const BSONObj &query,
                         const BSONObj &order,
                         const QueryPlanSelectionPolicy &planPolicy,
@@ -209,7 +210,7 @@ namespace mongo {
         void setMultiPlanScanner();
         shared_ptr<Cursor> singlePlanCursor();
         
-        const char *_ns;
+        const StringData _ns;
         BSONObj _query;
         BSONObj _order;
         const QueryPlanSelectionPolicy &_planPolicy;

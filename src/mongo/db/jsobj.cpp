@@ -3,6 +3,7 @@
 */
 
 /*    Copyright 2009 10gen Inc.
+ *    Copyright (C) 2013 Tokutek Inc.
  *
  *    Licensed under the Apache License, Version 2.0 (the "License");
  *    you may not use this file except in compliance with the License.
@@ -243,7 +244,12 @@ namespace mongo {
             break;
 
         case Timestamp:
-            s << "{ \"t\" : " << timestampTime() << " , \"i\" : " << timestampInc() << " }";
+            if ( format == TenGen ) {
+                s << "Timestamp( " << ( timestampTime() / 1000 ) << ", " << timestampInc() << " )";
+            }
+            else {
+                s << "{ \"$timestamp\" : { \"t\" : " << ( timestampTime() / 1000 ) << ", \"i\" : " << timestampInc() << " } }";
+            }
             break;
 
         case MinKey:
@@ -601,22 +607,23 @@ namespace mongo {
         BSONElement e = obj->getField( name );
 
         if ( e.eoo() ) {
-            const char *p = strchr(name.data(), '.');
-            if ( p ) {
-                string left(name.data(), p-name.data());
-                const char* next = p+1;
-                BSONElement e = obj->getField( left.c_str() );
+            size_t idx = name.find( '.' );
+            if ( idx != string::npos ) {
+                StringData left = name.substr( 0, idx );
+                StringData next = name.substr( idx + 1, name.size() );
+
+                BSONElement e = obj->getField( left );
 
                 if (e.type() == Object) {
                     e.embeddedObject().getFieldsDotted(next, ret, expandLastArray );
                 }
                 else if (e.type() == Array) {
                     bool allDigits = false;
-                    if ( isdigit( *next ) ) {
-                        const char * temp = next + 1;
-                        while ( isdigit( *temp ) )
+                    if ( next.size() > 0 && isdigit( next[0] ) ) {
+                        unsigned temp = 1;
+                        while ( temp < next.size() && isdigit( next[temp] ) )
                             temp++;
-                        allDigits = (*temp == '.' || *temp == '\0');
+                        allDigits = temp == next.size() || next[temp] == '.';
                     }
                     if (allDigits) {
                         e.embeddedObject().getFieldsDotted(next, ret, expandLastArray );

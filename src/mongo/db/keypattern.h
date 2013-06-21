@@ -2,6 +2,7 @@
 
 /**
 *    Copyright (C) 2012 10gen Inc.
+*    Copyright (C) 2013 Tokutek Inc.
 *
 *    This program is free software: you can redistribute it and/or  modify
 *    it under the terms of the GNU Affero General Public License, version 3,
@@ -104,6 +105,22 @@ namespace mongo {
          *   { a: 1 } --> returns { a : NumberLong("5902408780260971510")  }
          */
         BSONObj extractSingleKey( const BSONObj& doc ) const;
+
+        /* Given a key without field names, extractSingleKey extracts the prefix of that key this
+         * KeyPattern cares about, and adds back the field names.  Useful for sharding, which uses
+         * prefixes of keys.
+         *
+         * Examples:
+         *  If 'this' KeyPattern is {a:1, b:1}
+         *   {"": "hi", "": 4} --> returns {a: "hi", b: 4}
+         *   {"": 4, "": 2} --> returns {a: 4, b: 2}
+         *   {"": 1, "": 2, "": 3} --> returns {a: 1, b: 2}
+         *
+         * In short, don't call this unless you know the schema is what you expect.  If 'this'
+         * KeyPattern is {a: "hashed"}, we DO NOT perform the hash on the key, because we expect it
+         * is a key coming out of the db, so it has already been hashed.
+         */
+        BSONObj prettyKey(const BSONObj &key) const;
 
         /**@param queryConstraints a FieldRangeSet, usually formed from parsing a query
          * @return an ordered list of bounds generated using this KeyPattern and the

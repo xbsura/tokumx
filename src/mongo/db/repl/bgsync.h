@@ -1,5 +1,6 @@
 /**
  *    Copyright (C) 2012 10gen Inc.
+ *    Copyright (C) 2013 Tokutek Inc.
  *
  *    This program is free software: you can redistribute it and/or  modify
  *    it under the terms of the GNU Affero General Public License, version 3,
@@ -70,6 +71,23 @@ namespace mongo {
         // to _queueCounter.numElems
         std::deque<BSONObj> _deque;
 
+        // these variables are relevant to shutdown
+
+        // states if opSync should exit, because we are shutting down
+        // this variable can be racy. It only ever transitions from false
+        // to true.
+        bool _opSyncShouldExit;
+        // this variable is true if producerThread is running
+        // at all. This is different than _opSyncRunning
+        // in that _opSyncRunning tells us if we are actively
+        // trying to sync from another machine, whereas this
+        // just tells us that the opsync thread is doing SOMETHING
+        bool _opSyncInProgress;
+        // variable that tells the applier thread if it should be running
+        bool _applierShouldExit;
+        // variable that states if the applier thread is alive doing anything
+        bool _applierInProgress;
+
         struct QueueCounter {
             QueueCounter();
             unsigned long long waitTime;
@@ -82,8 +100,16 @@ namespace mongo {
 
         // Production thread
         uint32_t produce();
+        // for an operation with timestamp of opTimestamp,
+        // function will sleep in a loop until the appropriate time
+        // where it is ok to apply the operation to the oplog.
+        // Called in produce()
+        void handleSlaveDelay(uint64_t opTimestamp);
         // Check if rollback is necessary
         bool isRollbackRequired(OplogReader& r);
+        // tries to perform a rollback. If the rollback is impossible,
+        // throws a RollbackOplogException
+        void runRollback(OplogReader& r, uint64_t oplogTS);
         void getOplogReader(OplogReader& r);
         // check latest GTID against the remote's earliest GTID, filling in remoteOldestOp.
         bool isStale(OplogReader& r, BSONObj& remoteOldestOp);
@@ -92,7 +118,7 @@ namespace mongo {
         void verifySettled();
     public:
         static BackgroundSync* get();
-        static void shutdown();
+        void shutdown();
         virtual ~BackgroundSync() {}
 
         void applierThread();

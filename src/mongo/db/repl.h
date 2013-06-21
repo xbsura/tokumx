@@ -2,6 +2,7 @@
 
 /**
 *    Copyright (C) 2008 10gen Inc.
+*    Copyright (C) 2013 Tokutek Inc.
 *
 *    This program is free software: you can redistribute it and/or  modify
 *    it under the terms of the GNU Affero General Public License, version 3,
@@ -27,13 +28,12 @@
 
 #pragma once
 
-#include "db.h"
-#include "dbhelpers.h"
-#include "../util/optime.h"
-#include "oplog.h"
-#include "../util/concurrency/thread_pool.h"
-#include "oplogreader.h"
-#include "cloner.h"
+#include "mongo/db/dbhelpers.h"
+#include "mongo/util/optime.h"
+#include "mongo/db/oplog.h"
+#include "mongo/util/concurrency/thread_pool.h"
+#include "mongo/db/oplogreader.h"
+#include "mongo/db/cloner.h"
 
 namespace mongo {
 

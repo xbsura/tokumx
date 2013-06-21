@@ -2,6 +2,7 @@
 
 /**
 *    Copyright (C) 2008 10gen Inc.
+*    Copyright (C) 2013 Tokutek Inc.
 *
 *    This program is free software: you can redistribute it and/or  modify
 *    it under the terms of the GNU Affero General Public License, version 3,
@@ -149,51 +150,58 @@ namespace mongo {
 
     /* ---------------------------------------------------------------------- */
 
-    struct cursor_getf_extra {
-        RowBuffer *buffer;
-        int rows_fetched;
-        int rows_to_fetch;
-        cursor_getf_extra(RowBuffer *buf, int n_to_fetch) :
-            buffer(buf), rows_fetched(0), rows_to_fetch(n_to_fetch) {
+    // Cursor for findOne queries, justOne deletes, !multi updates, etc.
+    // Skip prelocking, get row locks on getf if necessary, and don't prefetch.
+    class FindOneCursor : public IndexCursor {
+    public:
+        FindOneCursor( NamespaceDetails *d, const IndexDetails &idx,
+                       const BSONObj &startKey, const BSONObj &endKey,
+                       bool endKeyInclusive, int direction ) :
+            IndexCursor( d, idx, startKey, endKey, endKeyInclusive, direction, 1 ) {
+        }
+        FindOneCursor( NamespaceDetails *d, const IndexDetails &idx,
+                       const shared_ptr< FieldRangeVector > &bounds,
+                       int singleIntervalLimit, int direction ) :
+            IndexCursor( d, idx, bounds, singleIntervalLimit, direction, 1 ) {
+        }
+        void prelock() {
+        }
+        int cursor_flags() {
+            return 0;
+        }
+        int getf_flags() {
+            const int idxCursorFlags = IndexCursor::cursor_flags();
+            return idxCursorFlags | DBC_DISABLE_PREFETCHING;
         }
     };
 
-    // ydb layer cursor callback
-    static int cursor_getf(const DBT *key, const DBT *val, void *extra) {
-        int r = 0;
+    /* ---------------------------------------------------------------------- */
 
-        // the cursor callback is called even if the desired
-        // key is not found. in that case, key == NULL
-        if (key) {
-            struct cursor_getf_extra *info = static_cast<struct cursor_getf_extra *>(extra);
-            RowBuffer *buffer = info->buffer;
-            storage::Key sKey(key);
-            buffer->append(sKey, val->size > 0 ?
-                    BSONObj(static_cast<const char *>(val->data)) : BSONObj());
-
-            // request more bulk fetching if we are allowed to fetch more rows
-            // and the row buffer is not too full.
-            if (++info->rows_fetched < info->rows_to_fetch && !buffer->isGorged()) {
-                r = TOKUDB_CURSOR_CONTINUE;
-            }
+    shared_ptr<IndexCursor> IndexCursor::make( NamespaceDetails *d, const IndexDetails &idx,
+                                               const BSONObj &startKey, const BSONObj &endKey,
+                                               bool endKeyInclusive, int direction,
+                                               int numWanted ) {
+        if (cc().opSettings().getJustOne() || numWanted == 1) {
+            return shared_ptr<IndexCursor>( new FindOneCursor( d, idx, startKey, endKey,
+                                                               endKeyInclusive, direction ) );
+        } else {
+            return shared_ptr<IndexCursor>( new IndexCursor( d, idx, startKey, endKey,
+                                                             endKeyInclusive, direction,
+                                                             numWanted ) );
         }
-
-        return r;
     }
 
-    static int idx_cursor_flags() {
-        QueryCursorMode mode = cc().tokuCommandSettings().getQueryCursorMode();
-        switch ( mode ) {
-            // All locks are grabbed up front, during initializeDBC().
-            // These flags determine the type of lock. Serializable
-            // gets you a read lock. Both serializable and rmw gets
-            // you a write lock.
-            case WRITE_LOCK_CURSOR:
-                return DB_SERIALIZABLE | DB_RMW;
-            case READ_LOCK_CURSOR:
-                return DB_SERIALIZABLE;
-            default:
-                return 0;
+    shared_ptr<IndexCursor> IndexCursor::make( NamespaceDetails *d, const IndexDetails &idx,
+                                               const shared_ptr< FieldRangeVector > &bounds,
+                                               int singleIntervalLimit, int direction,
+                                               int numWanted ) {
+        if (cc().opSettings().getJustOne() || numWanted == 1) {
+            return shared_ptr<IndexCursor>( new FindOneCursor( d, idx, bounds,
+                                                               singleIntervalLimit, direction ) );
+        } else {
+            return shared_ptr<IndexCursor>( new IndexCursor( d, idx, bounds,
+                                                             singleIntervalLimit, direction,
+                                                             numWanted ) );
         }
     }
 
@@ -213,7 +221,7 @@ namespace mongo {
         _bounds(),
         _nscanned(0),
         _numWanted(numWanted),
-        _cursor(_idx, idx_cursor_flags()),
+        _cursor(_idx, cursor_flags()),
         _tailable(false),
         _ok(false),
         _getf_iteration(0)
@@ -237,7 +245,7 @@ namespace mongo {
         _bounds(bounds),
         _nscanned(0),
         _numWanted(numWanted),
-        _cursor(_idx, idx_cursor_flags()),
+        _cursor(_idx, cursor_flags()),
         _tailable(false),
         _ok(false),
         _getf_iteration(0)
@@ -254,25 +262,72 @@ namespace mongo {
     IndexCursor::~IndexCursor() {
     }
 
+    int IndexCursor::cursor_getf(const DBT *key, const DBT *val, void *extra) {
+        struct cursor_getf_extra *info = static_cast<struct cursor_getf_extra *>(extra);
+        try {
+            if (key != NULL) {
+                RowBuffer *buffer = info->buffer;
+                storage::Key sKey(key);
+                buffer->append(sKey, val->size > 0 ?
+                        BSONObj(static_cast<const char *>(val->data)) : BSONObj());
+
+                // request more bulk fetching if we are allowed to fetch more rows
+                // and the row buffer is not too full.
+                if (++info->rows_fetched < info->rows_to_fetch && !buffer->isGorged()) {
+                    return TOKUDB_CURSOR_CONTINUE;
+                }
+            }
+            return 0;
+        } catch (std::exception &e) {
+            info->ex = &e;
+        }
+        return -1;
+    }
+
     void IndexCursor::setTailable() {
-        // tailable cursors may not be created over secondary indexes, which means
-        // this is a table scan cursor with trivial bounds.
+        // tailable cursors may not be created over secondary indexes,
+        // and they must intend to read to the end of the collection.
         verify( _d->isPKIndex(_idx) );
-        verify( _startKey.isEmpty() || _startKey == minKey );
         verify( _endKey.isEmpty() || _endKey == maxKey );
         // mark the cursor as tailable and set the end key bound tothe minimum unsafe
         // key to read from the namespace, non-inclusive.
         _tailable = true;
         _endKey = _d->minUnsafeKey();
         _endKeyInclusive = false;
+        // Tailable cursors _must_ use endKey/endKeyInclusive so the bounds we
+        // may or may not have gotten via the constructor is no longer valid.
+        _bounds.reset();
         checkCurrentAgainstBounds();
     }
 
-    void IndexCursor::prelockRange(const BSONObj &startKey, const BSONObj &endKey) {
+    bool IndexCursor::forward() const {
+        return _direction > 0;
+    }
+
+    bool IndexCursor::reverseMinMaxBoundsOrder(const Ordering &ordering, const int direction) {
+        // Only the first field's direction matters, because this function is only called
+        // to possibly reverse bounds ordering with min/max key, which is single field.
+        const bool ascending = !ordering.descending(1);
+        const bool forward = direction > 0;
+        // We need to reverse the order if exactly one of the query or the index are descending.  If
+        // both are descending, the normal order is fine.
+        return ascending != forward;
+    }
+
+    void IndexCursor::_prelockRange(const BSONObj &startKey, const BSONObj &endKey) {
         const bool isSecondary = !_d->isPKIndex(_idx);
 
-        storage::Key sKey(startKey, isSecondary ? &minKey : NULL);
-        storage::Key eKey(endKey, isSecondary ? &maxKey : NULL);
+        // The ydb requires that we only lock ranges such that the left
+        // endpoint is less than or equal to the right endpoint.
+        // Reverse cursors describe the start and end key as the two
+        // keys where they start and end iteration, which is backwards
+        // in the key space (because they iterate in reverse).
+        const BSONObj &leftKey = forward() ? startKey : endKey; 
+        const BSONObj &rightKey = forward() ? endKey : startKey; 
+        dassert(leftKey.woCompare(rightKey, _ordering) <= 0);
+
+        storage::Key sKey(leftKey, isSecondary ? &minKey : NULL);
+        storage::Key eKey(rightKey, isSecondary ? &maxKey : NULL);
         DBT start = sKey.dbt();
         DBT end = eKey.dbt();
 
@@ -299,7 +354,7 @@ namespace mongo {
                 startKey.appendAs( (*i)->_lower._bound, "" );
                 endKey.appendAs( (*i)->_upper._bound, "" );
             }
-            prelockRange( startKey.done(), endKey.done() );
+            _prelockRange( startKey.done(), endKey.done() );
         } else {
             const vector<FieldInterval> &intervals = ranges[currentRange].intervals();
             for ( vector<FieldInterval>::const_iterator i = intervals.begin();
@@ -312,7 +367,7 @@ namespace mongo {
         }
     }
 
-    void IndexCursor::prelockBounds() {
+    void IndexCursor::_prelockBounds() {
         BufBuilder startKeyBuilder(512);
         BufBuilder endKeyBuilder(512);
 
@@ -330,7 +385,7 @@ namespace mongo {
                   i != intervals.end(); i++ ) {
                 startKey.appendAs( i->_lower._bound, "" );
                 endKey.appendAs( i->_upper._bound, "" );
-                prelockRange( startKey.done(), endKey.done() );
+                _prelockRange( startKey.done(), endKey.done() );
             }
         } else {
             // When there's more than one field range, we need to prelock combinations
@@ -342,9 +397,45 @@ namespace mongo {
         }
     }
 
+    // The ydb prelocking API serves two purposes: to enable prefetching
+    // and acquire row locks. Row locks are acquired by serializable
+    // transactions, serializable cursors, and RMW (write) cursors.
+    //
+    // If row locks are to be acquired, we _must_ prelock here, since we
+    // pass DB_PRELOCKED to cursor operations.
+    //
+    // We would ideally use the ydb prelocking API to prelock each interval
+    // as we iterated (via advance()), because there may be multiple intervals
+    // and we can only lock/prefetch one at a time. Or, there could be separate
+    // ydb APIs for prefetching and locking, which means we could take row locks
+    // here if necessary and enable prefetching as we advance.
+    //
+    // Until that happens, we'll only enable prefetching if we think its worth it.
+    // For simple start/end key cursors, it's always worth it, because it's
+    // just one call to prelock. For bounds-based cursors, it is _probably_
+    // worth it as long as the bounds vector doesn't soley contain point
+    // intervals ($in, $or with equality). Most secondary indexes have
+    // cardinality such that points (excluding appended PK) all fit in a
+    // single basement node (64k of data, about), so prefetching wouldn't
+    // have done anything. For non-points, we can't make any guess as to
+    // how much data is in that range.
+    void IndexCursor::prelock() {
+        if (cc().txn().serializable() ||
+            cc().opSettings().getQueryCursorMode() != DEFAULT_LOCK_CURSOR ||
+            _bounds == NULL || !_bounds->containsOnlyPointIntervals()) {
+            if ( _bounds != NULL ) {
+                _prelockBounds();
+            } else {
+                _prelockRange( _startKey, _endKey );
+            }
+        }
+    }
+
     void IndexCursor::initializeDBC() {
+        // We need to prelock first, then position the cursor.
+        prelock();
+
         if ( _bounds != NULL ) {
-            prelockBounds();
             const int r = skipToNextKey( _startKey );
             if ( r == -1 ) {
                 // The bounds iterator suggests _bounds->startKey() is within
@@ -355,25 +446,37 @@ namespace mongo {
                 findKey( _startKey );
             }
         } else {
-            // Don't prelock point ranges.
-            if ( _startKey != _endKey ) {
-                prelockRange( _startKey, _endKey );
-            }
-            // Seek to an initial key described by _startKey 
             findKey( _startKey );
         }
         checkCurrentAgainstBounds();
     }
 
+    int IndexCursor::cursor_flags() {
+        QueryCursorMode mode = cc().opSettings().getQueryCursorMode();
+        switch ( mode ) {
+            // All locks are grabbed up front, during initializeDBC().
+            // These flags determine the type of lock. Serializable
+            // gets you a read lock. Both serializable and rmw gets
+            // you a write lock.
+            case WRITE_LOCK_CURSOR:
+                return DB_SERIALIZABLE | DB_RMW;
+            case READ_LOCK_CURSOR:
+                return DB_SERIALIZABLE;
+            default:
+                return 0;
+        }
+    }
+
     int IndexCursor::getf_flags() {
-        // Disable prefetching when a limit exists, to prevent unnecessary
-        // IO and deserialization work. This will cause out-of-memory queries
-        // with non-trivial limits to slow down, however. Not sure if that's bad.
-        return _numWanted > 0 ? DBC_DISABLE_PREFETCHING : 0;
+        // Since all locktree locks are acquired on cursor creation,
+        // we should pass DB_PRELOCKED (see cursor_flags()).
+        const int lockFlags = DB_PRELOCKED;
+        const int prefetchFlags = _numWanted > 0 ? DBC_DISABLE_PREFETCHING : 0;
+        return lockFlags | prefetchFlags;
     }
 
     int IndexCursor::getf_fetch_count() {
-        bool shouldBulkFetch = cc().tokuCommandSettings().shouldBulkFetch() && !tailable();
+        bool shouldBulkFetch = cc().opSettings().shouldBulkFetch();
         if ( shouldBulkFetch ) {
             // Read-only cursor may bulk fetch rows into a buffer, for speed.
             // The number of rows fetched is proportional to the number of
@@ -388,16 +491,13 @@ namespace mongo {
                     return 2 << (_getf_iteration < 20 ? _getf_iteration : 20);
             }
         } else {
-            // Cursors that are not read only may not buffer rows, because they
-            // may perform a write some time in the future and possibly invalidate
-            // buffered data.
             return 1;
         }
     }
 
     void IndexCursor::findKey(const BSONObj &key) {
         const bool isSecondary = !_d->isPKIndex(_idx);
-        const BSONObj &pk = _direction > 0 ? minKey : maxKey;
+        const BSONObj &pk = forward() ? minKey : maxKey;
         setPosition(key, isSecondary ? pk : BSONObj());
     };
 
@@ -427,10 +527,13 @@ namespace mongo {
         const int rows_to_fetch = getf_fetch_count();
         struct cursor_getf_extra extra(&_buffer, rows_to_fetch);
         DBC *cursor = _cursor.dbc();
-        if ( _direction > 0 ) {
+        if ( forward() ) {
             r = cursor->c_getf_set_range(cursor, getf_flags(), &key_dbt, cursor_getf, &extra);
         } else {
             r = cursor->c_getf_set_range_reverse(cursor, getf_flags(), &key_dbt, cursor_getf, &extra);
+        }
+        if ( extra.ex != NULL ) {
+            throw *extra.ex;
         }
         if ( r != 0 && r != DB_NOTFOUND ) {
             storage::handle_ydb_error(r);
@@ -479,10 +582,10 @@ namespace mongo {
             } else {
                 if ( _ordering.descending( 1 << i ) ) {
                     // Descending sort order, so min key skips forward.
-                    _direction > 0 ? b.appendMinKey( "" ) : b.appendMaxKey( "" );
+                    forward() ? b.appendMinKey( "" ) : b.appendMaxKey( "" );
                 } else {
                     // Regular ascending order. Max key skips forward.
-                    _direction > 0 ? b.appendMaxKey( "" ) : b.appendMinKey( "" );
+                    forward() ? b.appendMaxKey( "" ) : b.appendMinKey( "" );
                 }
             }
         }
@@ -490,7 +593,7 @@ namespace mongo {
         // This differs from findKey in that we set PK to max to move forward and min
         // to move backward, resulting in a "skip" of the key prefix, not a "find".
         const bool isSecondary = !_d->isPKIndex(_idx);
-        const BSONObj &pk = _direction > 0 ? maxKey : minKey;
+        const BSONObj &pk = forward() ? maxKey : minKey;
         setPosition( b.done(), isSecondary ? pk : BSONObj() );
     }
 
@@ -586,23 +689,15 @@ again:      while ( !allInclusive && ok() ) {
         return false;
     }
 
-    // Return a value in the set {-1, 0, 1} to represent the sign of parameter i.
-    int sgn( int i ) {
-        if ( i == 0 ) {
-            return 0;
-        } else {
-            return i > 0 ? 1 : -1;
-        }
-    }
-
     // Check if the current key is beyond endKey.
     void IndexCursor::checkEnd() {
         if ( !ok() ) {
             return;
         }
         if ( !_endKey.isEmpty() ) {
-            const int c = sgn( _endKey.woCompare( _currKey, _ordering ) );
-            if ( (c != 0 && c != _direction) || (c == 0 && !_endKeyInclusive) ) {
+            const int cmp = _endKey.woCompare( _currKey, _ordering );
+            const int sign = cmp == 0 ? 0 : (cmp > 0 ? 1 : -1);
+            if ( (sign != 0 && sign != _direction) || (sign == 0 && !_endKeyInclusive) ) {
                 _ok = false;
                 TOKULOG(3) << toString() << ": checkEnd() stopping @ curr, end: " << _currKey << _endKey << endl;
             }
@@ -617,10 +712,13 @@ again:      while ( !allInclusive && ok() ) {
         const int rows_to_fetch = getf_fetch_count();
         struct cursor_getf_extra extra(&_buffer, rows_to_fetch);
         DBC *cursor = _cursor.dbc();
-        if ( _direction > 0 ) {
+        if ( forward() ) {
             r = cursor->c_getf_next(cursor, getf_flags(), cursor_getf, &extra);
         } else {
             r = cursor->c_getf_prev(cursor, getf_flags(), cursor_getf, &extra);
+        }
+        if ( extra.ex != NULL ) {
+            throw *extra.ex;
         }
         if ( r != 0 && r != DB_NOTFOUND ) {
             storage::handle_ydb_error(r);
@@ -631,14 +729,22 @@ again:      while ( !allInclusive && ok() ) {
     }
 
     void IndexCursor::_advance() {
+        // first try to get data from the bulk fetch buffer
         _ok = _buffer.next();
+        // if there is not data remaining in the bulk fetch buffer,
+        // do a fractal tree call to get more rows
         if ( !ok() ) {
             _ok = fetchMoreRows();
         }
+        // at this point, if there are rows to be gotten,
+        // it is residing in the bulk fetch buffer.
+        // Get a row from the bulk fetch buffer
         if ( ok() ) {
             getCurrentFromBuffer();
+            TOKULOG(3) << "_advance moved to K, PK, Obj" << _currKey << _currPK << _currObj << endl;
+        } else {
+            TOKULOG(3) << "_advance exhausted" << endl;
         }
-        TOKULOG(3) << "_advance moved to K, PK, Obj" << _currKey << _currPK << _currObj << endl;
     }
 
     bool IndexCursor::advance() {
@@ -648,19 +754,19 @@ again:      while ( !allInclusive && ok() ) {
             _advance();
         } else {
             if ( tailable() ) {
-                // There may be keys between the current key and the end key.
-                dassert( _currKey <= _endKey );
                 if ( _currKey < _endKey ) {
+                    // Read the most up-to-date minUnsafeKey from the namespace
+                    _endKey = _d->minUnsafeKey();
                     _advance();
                 } else {
-                    // The cursor advanced reached the minimum safe bound.
-                    // Read a new safe bound from the namespace and reposition 
-                    // to the current key. checkCurrent() will mark the cursor as ok()
-                    // if the new current key is within bounds, and !ok() otherwise.
+                    // reset _currKey, we may have accidentally
+                    // gone past _endKey when we did our last advance
+                    // and saw something we are not allowed to see.
+                    _currKey = _endKey;
+                    // Read the most up-to-date minUnsafeKey from the namespace
                     _endKey = _d->minUnsafeKey();
                     findKey( _currKey.isEmpty() ? minKey : _currKey );
                 }
-                dassert( _currKey <= _endKey );
             } else {
                 // Exhausted cursors that are not tailable never advance
                 return false;
@@ -692,7 +798,7 @@ again:      while ( !allInclusive && ok() ) {
                 }
             }
         }
-        bool shouldAppendPK = _d->isCapped() && cc().tokuCommandSettings().shouldCappedAppendPK();
+        bool shouldAppendPK = _d->isCapped() && cc().opSettings().shouldCappedAppendPK();
         if (shouldAppendPK) {
             BSONObjBuilder b;
             b.appendElements(_currObj);

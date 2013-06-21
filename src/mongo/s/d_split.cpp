@@ -2,6 +2,7 @@
 
 /**
 *    Copyright (C) 2008 10gen Inc.
+*    Copyright (C) 2013 Tokutek Inc.
 *
 *    This program is free software: you can redistribute it and/or  modify
 *    it under the terms of the GNU Affero General Public License, version 3,
@@ -27,6 +28,7 @@
 #include "mongo/db/instance.h"
 #include "mongo/db/queryoptimizer.h"
 #include "mongo/db/clientcursor.h"
+#include "mongo/db/namespace_details.h"
 #include "mongo/client/dbclientcursor.h"
 
 #include "mongo/client/connpool.h"
@@ -41,11 +43,9 @@
 namespace mongo {
 
 
-    class CmdMedianKey : public Command {
+    class CmdMedianKey : public InformationCommand {
     public:
-        CmdMedianKey() : Command( "medianKey" ) {}
-        virtual bool slaveOk() const { return true; }
-        virtual LockType locktype() const { return NONE; }
+        CmdMedianKey() : InformationCommand("medianKey", false) {}
         virtual void help( stringstream &help ) const {
             help << "Deprecated internal command. Use splitVector command instead. \n";
         }
@@ -55,11 +55,10 @@ namespace mongo {
         }
     } cmdMedianKey;
 
-    class CheckShardingIndex : public Command {
+    class CheckShardingIndex : public QueryCommand {
     public:
-        CheckShardingIndex() : Command( "checkShardingIndex" , false ) {}
+        CheckShardingIndex() : QueryCommand("checkShardingIndex") {}
         virtual bool slaveOk() const { return false; }
-        virtual LockType locktype() const { return READ; }
         virtual void help( stringstream &help ) const {
             help << "Internal command.\n";
         }
@@ -108,8 +107,7 @@ namespace mongo {
                 max = Helpers::modifiedRangeBound( max , idx->keyPattern() , -1 );
             }
 
-            IndexCursor *idxCursor = new IndexCursor( d , *idx , min , max , false , 1 );
-            shared_ptr<Cursor> c( idxCursor );
+            shared_ptr<IndexCursor> c( IndexCursor::make( d , *idx , min , max , false , 1 ) );
             auto_ptr<ClientCursor> cc( new ClientCursor( QueryOption_NoCursorTimeout , c , ns ) );
             if ( ! cc->ok() ) {
                 // range is empty
@@ -148,7 +146,7 @@ namespace mongo {
                         continue;
                     
                     ostringstream os;
-                    os << "found null value in key " << idxCursor->prettyKey( currKey ) << " for doc: "
+                    os << "found null value in key " << c->prettyKey( currKey ) << " for doc: "
                        << ( obj.hasField( "_id" ) ? obj.toString() : obj["_id"].toString() );
                     log() << "checkShardingIndex for '" << ns << "' failed: " << os.str() << endl;
                     
@@ -163,19 +161,189 @@ namespace mongo {
         }
     } cmdCheckShardingIndex;
 
-    class SplitVector : public Command {
+    class SplitVectorFinder {
+        std::exception *_ex;
+        NamespaceDetails *_d;
+        const IndexDetails &_idx;
+        KeyPattern _chunkPattern;
+        Ordering _ordering;
+        storage::Key _chunkMin, _chunkMax;
+        vector<BSONObj> &_splitPoints;
+        bool _chunkTooBig;
+        bool _doneFindingPoints;
+        long long _justSkipped;
+        bool _useCursor;
+        BSONObj _lastSplitKey;
+
+        void isTooBigCallback(const storage::KeyV1 *endKey, BSONObj *endPK __attribute__((unused)), uint64_t skipped) {
+            if (endKey == NULL) {
+                return;
+            }
+            const storage::KeyV1 max(_chunkMax.buf());
+            const int c = endKey->woCompare(max, _ordering);
+            if (c < 0) {
+                _chunkTooBig = true;
+            }
+        }
+        
+        void getPointCallback(const storage::KeyV1 *endKey, BSONObj *endPK, uint64_t skipped) {
+            if (endKey == NULL) {
+                _doneFindingPoints = true;
+                return;
+            }
+            if (skipped == 0) {
+                // We didn't actually skip anything, because the current min document is too
+                // big.  Fallback to using a cursor.
+                _useCursor = true;
+                return;
+            }
+
+            const storage::KeyV1 max(_chunkMax.buf());
+            int c = endKey->woCompare(max, _ordering);
+            if (c >= 0) {
+                _doneFindingPoints = true;
+                return;
+            }
+
+            // This wastefully constructs two BSONs when we should be able to go straight from KeyV1
+            // format to a BSON with field names.  TODO: optimize it if it shows up in profiling.
+            BSONObj splitKey = _chunkPattern.prettyKey(endKey->toBson());
+            c = splitKey.woCompare(_lastSplitKey, _ordering);
+            massert(16797, "next split key cannot be less than the last split key", c >= 0);
+            if (c == 0) {
+                // If we got the same as the current chunk min, that means there are many documents
+                // with that same key (or a few really big ones).  Since we can't split in the
+                // middle of them, we fall back to just using a cursor from this point forward.
+                if (!_idx.isIdIndex()) {
+                    _chunkMin.reset(*endKey, endPK);
+                    _justSkipped += skipped;
+                }
+                _useCursor = true;
+                return;
+            }
+
+            // This is our new split key.  We have to save it in storage::Key form for the next
+            // query, and in BSONObj form to pass it back.
+            _lastSplitKey = splitKey.getOwned();
+            _splitPoints.push_back(_lastSplitKey);
+            BSONObj modSplitKey = Helpers::modifiedRangeBound(_lastSplitKey, _idx.keyPattern(), -1);
+            _chunkMin.reset(modSplitKey, _idx.isIdIndex() ? NULL : &minKey);
+        }
+
+        void slowFindSplitPoint(long long targetChunkSize) {
+            long long skipped = 0;
+            for (shared_ptr<IndexCursor> c(IndexCursor::make(_d, _idx, _chunkMin.key(), _chunkMax.key(), false, 1)); c->ok(); c->advance()) {
+                const BSONObj &currKey = c->currKey();
+                const BSONObj &currPK = c->currPK();
+                long long docsize = currKey.objsize() + currPK.objsize() + c->current().objsize();
+                if (skipped + docsize > targetChunkSize) {
+                    BSONObj splitKey = _chunkPattern.prettyKey(currKey);
+                    int c = splitKey.woCompare(_lastSplitKey, _ordering);
+                    massert(16798, "next split key cannot be less than the last split key", c >= 0);
+                    if (c > 0) {
+                        if (skipped - targetChunkSize > 16<<10) {
+                            int logLevel = skipped - targetChunkSize > 512<<10 ? 0 : 1;
+                            LOG(logLevel) << "Finding a split point was hard, probably because of high cardinality, on the chunk containing "
+                                          << _lastSplitKey << " instead." << endl
+                                          << "You should review your choice of shard key." << endl;
+                        }
+                        _lastSplitKey = splitKey.getOwned();
+                        _splitPoints.push_back(_lastSplitKey);
+                        BSONObj modSplitKey = Helpers::modifiedRangeBound(_lastSplitKey, _idx.keyPattern(), -1);
+                        _chunkMin.reset(modSplitKey, _idx.isIdIndex() ? NULL : &minKey);
+                        return;
+                    }
+                }
+                skipped += docsize;
+            }
+            // If we get all the way to the end, we can't split any more.
+            _doneFindingPoints = true;
+        }
+
+      public:
+        SplitVectorFinder(NamespaceDetails *d, const IndexDetails &idx, const BSONObj &chunkPattern, const BSONObj &min, const BSONObj &max,
+                          vector<BSONObj> &splitPoints)
+                : _d(d),
+                  _idx(idx),
+                  _chunkPattern(chunkPattern.getOwned()),
+                  _ordering(Ordering::make(_idx.keyPattern())),
+                  _chunkMin(min, _idx.isIdIndex() ? NULL : &minKey),
+                  _chunkMax(max, _idx.isIdIndex() ? NULL : &maxKey),
+                  _splitPoints(splitPoints),
+                  _chunkTooBig(false),
+                  _doneFindingPoints(false),
+                  _justSkipped(0),
+                  _useCursor(false),
+                  _lastSplitKey()
+        {
+            massert(16799, "shard key pattern must be a prefix of the index key pattern", chunkPattern.isPrefixOf(_idx.keyPattern()));
+        }
+
+        // Functors that wrap the above callbacks
+        class IsTooBigCallback {
+            SplitVectorFinder &_finder;
+          public:
+            IsTooBigCallback(SplitVectorFinder &finder) : _finder(finder) {}
+            void operator()(const storage::KeyV1 *endKey, BSONObj *endPK, uint64_t skipped) {
+                _finder.isTooBigCallback(endKey, endPK, skipped);
+            }
+        };
+        class GetPointCallback {
+            SplitVectorFinder &_finder;
+          public:
+            GetPointCallback(SplitVectorFinder &finder) : _finder(finder) {}
+            void operator()(const storage::KeyV1 *endKey, BSONObj *endPK, uint64_t skipped) {
+                _finder.getPointCallback(endKey, endPK, skipped);
+            }
+        };
+
+        // Schedules the calls down into get_key_after_bytes.
+        void find(long long maxChunkSize, long long maxSplitPoints) {
+            {
+                IsTooBigCallback cb(*this);
+                _idx.getKeyAfterBytes(_chunkMin, maxChunkSize, cb);
+            }
+            if (!_chunkTooBig) {
+                return;
+            }
+            {
+                // If _chunkMin doesn't actually exist (could be {x: MinKey} for example) we need to
+                // get the actual first key in the chunk so that we make sure we don't try to split
+                // on the first key.
+                shared_ptr<IndexCursor> c(IndexCursor::make(_d, _idx, _chunkMin.key(), _chunkMax.key(), false, 1, 1));
+                massert(16794, "didn't find anything actually in our chunk, but we thought we should split it", c->ok());
+                _lastSplitKey = _chunkPattern.prettyKey(c->currKey());
+            }
+            {
+                GetPointCallback cb(*this);
+                const long long targetChunkSize = maxChunkSize / 2;
+                while (!_doneFindingPoints) {
+                    if (maxSplitPoints && _splitPoints.size() >= (size_t) maxSplitPoints) {
+                        break;
+                    }
+                    if (_useCursor) {
+                        slowFindSplitPoint(targetChunkSize - _justSkipped);
+                        _useCursor = false;
+                    }
+                    else {
+                        _idx.getKeyAfterBytes(_chunkMin, targetChunkSize, cb);
+                    }
+                }
+            }
+        }
+    };
+
+    class SplitVector : public QueryCommand {
     public:
-        SplitVector() : Command( "splitVector" , false ) {}
+        SplitVector() : QueryCommand("splitVector") {}
         virtual bool slaveOk() const { return false; }
-        virtual LockType locktype() const { return NONE; }
-        virtual bool needsTxn() const { return false; }
         virtual void help( stringstream &help ) const {
             help <<
                  "Internal command.\n"
                  "examples:\n"
                  "  { splitVector : \"blog.post\" , keyPattern:{x:1} , min:{x:10} , max:{x:20}, maxChunkSize:200 }\n"
                  "  maxChunkSize unit in MBs\n"
-                 "  May optionally specify 'maxSplitPoints' and 'maxChunkObjects' to avoid traversing the whole chunk\n"
+                 "  May optionally specify 'maxSplitPoints' to avoid traversing the whole chunk\n"
                  "  \n"
                  "  { splitVector : \"blog.post\" , keyPattern:{x:1} , min:{x:10} , max:{x:20}, force: true }\n"
                  "  'force' will produce one split point even if data is small; defaults to false\n"
@@ -211,88 +379,80 @@ namespace mongo {
                 maxSplitPoints = maxSplitPointsElem.numberLong();
             }
 
-            long long maxChunkObjects = Chunk::MaxObjectPerChunk;
-            BSONElement MaxChunkObjectsElem = jsobj[ "maxChunkObjects" ];
-            if ( MaxChunkObjectsElem.isNumber() ) {
-                maxChunkObjects = MaxChunkObjectsElem.numberLong();
-            }
-
             vector<BSONObj> splitKeys;
 
+            // Get the size estimate for this namespace
+            NamespaceDetails *d = nsdetails( ns );
+            if ( ! d ) {
+                errmsg = "ns not found";
+                return false;
+            }
+
+            const IndexDetails *idx = d->findIndexByPrefix( keyPattern ,
+                                                            true ); /* require single key */
+            if ( idx == NULL ) {
+                errmsg = (string)"couldn't find index over splitting key " +
+                         keyPattern.clientReadable().toString();
+                return false;
+            }
+            // extend min to get (min, MinKey, MinKey, ....)
+            min = Helpers::modifiedRangeBound( min , idx->keyPattern() , -1 );
+            if  ( max.isEmpty() ) {
+                // if max not specified, make it (MaxKey, Maxkey, MaxKey...)
+                max = Helpers::modifiedRangeBound( max , idx->keyPattern() , 1 );
+            } else {
+                // otherwise make it (max,MinKey,MinKey...) so that bound is non-inclusive
+                max = Helpers::modifiedRangeBound( max , idx->keyPattern() , -1 );
+            }
+
+            // 'force'-ing a split is equivalent to having maxChunkSize be the size of the current chunk, i.e., the
+            // logic below will split that chunk in half
+            long long maxChunkSize = 0;
+            bool force = false;
             {
-                // Get the size estimate for this namespace
-                Client::ReadContext ctx( ns );
-                Client::Transaction txn(DB_TXN_SNAPSHOT | DB_TXN_READ_ONLY);
-                NamespaceDetails *d = nsdetails( ns );
-                if ( ! d ) {
-                    errmsg = "ns not found";
+                BSONElement maxSizeElem = jsobj[ "maxChunkSize" ];
+                BSONElement forceElem = jsobj[ "force" ];
+
+                if ( forceElem.trueValue() ) {
+                    force = true;
+                }
+                else if ( maxSizeElem.isNumber() ) {
+                    maxChunkSize = maxSizeElem.numberLong() * 1<<20;
+                }
+                else {
+                    maxSizeElem = jsobj["maxChunkSizeBytes"];
+                    if ( maxSizeElem.isNumber() ) {
+                        maxChunkSize = maxSizeElem.numberLong();
+                    }
+                }
+
+                if ( !force && maxChunkSize <= 0 ) {
+                    errmsg = "need to specify the desired max chunk size (maxChunkSize or maxChunkSizeBytes)";
                     return false;
                 }
-                
-                const IndexDetails *idx = d->findIndexByPrefix( keyPattern ,
-                                                                true ); /* require single key */
-                if ( idx == NULL ) {
-                    errmsg = (string)"couldn't find index over splitting key " +
-                             keyPattern.clientReadable().toString();
-                    return false;
-                }
-                // extend min to get (min, MinKey, MinKey, ....)
-                min = Helpers::modifiedRangeBound( min , idx->keyPattern() , -1 );
-                if  ( max.isEmpty() ) {
-                    // if max not specified, make it (MaxKey, Maxkey, MaxKey...)
-                    max = Helpers::modifiedRangeBound( max , idx->keyPattern() , 1 );
-                } else {
-                    // otherwise make it (max,MinKey,MinKey...) so that bound is non-inclusive
-                    max = Helpers::modifiedRangeBound( max , idx->keyPattern() , -1 );
-                }
-                
+            }
+
+            if (!force && idx->clustering()) {
+                SplitVectorFinder finder(d, *idx, keyPattern, min, max, splitKeys);
+                finder.find(maxChunkSize, maxSplitPoints);
+            } else {
+                // Haven't implemented a better version using get_key_after_bytes yet, do the slow thing
                 NamespaceDetailsAccStats stats;
                 BSONObjBuilder statsResult;
                 d->fillCollectionStats(&stats, &statsResult, 1);
                 const long long recCount = stats.count;
                 const long long dataSize = stats.size;
-                
-                //
-                // 1.b Now that we have the size estimate, go over the remaining parameters and apply any maximum size
-                //     restrictions specified there.
-                //
-                
+
                 // 'force'-ing a split is equivalent to having maxChunkSize be the size of the current chunk, i.e., the
                 // logic below will split that chunk in half
-                long long maxChunkSize = 0;
-                bool force = false;
-                {
-                    BSONElement maxSizeElem = jsobj[ "maxChunkSize" ];
-                    BSONElement forceElem = jsobj[ "force" ];
-                    
-                    if ( forceElem.trueValue() ) {
-                        force = true;
-                        maxChunkSize = dataSize;
-                        
-                    }
-                    else if ( maxSizeElem.isNumber() ) {
-                        maxChunkSize = maxSizeElem.numberLong() * 1<<20;
-                        
-                    }
-                    else {
-                        maxSizeElem = jsobj["maxChunkSizeBytes"];
-                        if ( maxSizeElem.isNumber() ) {
-                            maxChunkSize = maxSizeElem.numberLong();
-                        }
-                    }
-                    
-                    if ( maxChunkSize <= 0 ) {
-                        errmsg = "need to specify the desired max chunk size (maxChunkSize or maxChunkSizeBytes)";
-                        return false;
-                    }
+                if (force) {
+                    maxChunkSize = dataSize;
                 }
-                
-                
+
                 // If there's not enough data for more than one chunk, no point continuing.
                 if ( dataSize < maxChunkSize || recCount == 0 ) {
                     vector<BSONObj> emptyVector;
                     result.append( "splitKeys" , emptyVector );
-                    txn.commit();
                     return true;
                 }
 
@@ -311,8 +471,7 @@ namespace mongo {
                 long long numChunks = 0;
 
                 {
-                    IndexCursor *idxCursor = new IndexCursor( d , *idx , min , max , false , 1 );
-                    shared_ptr<Cursor> c( idxCursor );
+                    shared_ptr<IndexCursor> c(IndexCursor::make( d , *idx , min , max , false , 1 ));
                     auto_ptr<ClientCursor> cc( new ClientCursor( QueryOption_NoCursorTimeout , c , ns ) );
                     if ( ! cc->ok() ) {
                         errmsg = "can't open a cursor for splitting (desired range is possibly empty)";
@@ -323,7 +482,7 @@ namespace mongo {
                     // at the end. If a key appears more times than entries allowed on a chunk, we issue a warning and
                     // split on the following key.
                     set<BSONObj> tooFrequentKeys;
-                    splitKeys.push_back(idxCursor->prettyKey(c->currKey().getOwned()).extractFields(keyPattern));
+                    splitKeys.push_back(c->prettyKey(c->currKey().getOwned()).extractFields(keyPattern));
                     while (true) {
                         while (cc->ok()) {
                             const BSONObj &currObj = cc->current();
@@ -331,8 +490,8 @@ namespace mongo {
                             currCount++;
 
                             // we want ~half-full chunks
-                            if (2 * currSize >= maxChunkSize || currCount >= maxChunkObjects) {
-                                BSONObj currKey = idxCursor->prettyKey(c->currKey()).extractFields(keyPattern);
+                            if (2 * currSize >= maxChunkSize) {
+                                BSONObj currKey = c->prettyKey(c->currKey()).extractFields(keyPattern);
                                 // Do not use this split key if it is the same used in the previous split point.
                                 if (currKey.woCompare(splitKeys.back()) == 0) {
                                     tooFrequentKeys.insert(currKey.getOwned());
@@ -363,12 +522,11 @@ namespace mongo {
                         }
 
                         force = false;
-                        maxChunkObjects = currCount / 2;
+                        maxChunkSize = currSize;
                         currCount = 0;
-                        LOG(0) << "splitVector doing another cycle because of force, maxChunkObjects now: " << maxChunkObjects << endl;
+                        LOG(0) << "splitVector doing another cycle because of force, maxChunkSize now: " << maxChunkSize << endl;
 
-                        idxCursor = new IndexCursor(d, *idx, min, max, false, 1);
-                        c.reset(idxCursor);
+                        c = IndexCursor::make(d, *idx, min, max, false, 1);
                         cc.reset(new ClientCursor(QueryOption_NoCursorTimeout, c, ns));
                     }
 
@@ -380,7 +538,7 @@ namespace mongo {
                     // Warn for keys that are more numerous than maxChunkSize allows.
                     for ( set<BSONObj>::const_iterator it = tooFrequentKeys.begin(); it != tooFrequentKeys.end(); ++it ) {
                         warning() << "chunk is larger than " << maxChunkSize
-                                  << " bytes because of key " << idxCursor->prettyKey( *it ) << endl;
+                                  << " bytes because of key " << c->prettyKey( *it ) << endl;
                     }
 
                     // Remove the sentinel at the beginning before returning
@@ -389,21 +547,19 @@ namespace mongo {
 
                     if ( timer.millis() > cmdLine.slowMS ) {
                         warning() << "Finding the split vector for " <<  ns << " over "<< keyPattern
-                                  << " maxChunkObjects: " << maxChunkObjects << " numSplits: " << splitKeys.size() 
+                                  << " maxChunkSize: " << maxChunkSize << " numSplits: " << splitKeys.size() 
                                   << " lookedAt: " << currCount << " took " << timer.millis() << "ms"
                                   << endl;
                     }
                 }
-                txn.commit();
-
-                // Warning: we are sending back an array of keys but are currently limited to
-                // 4MB work of 'result' size. This should be okay for now.
             }
+
+            // Warning: we are sending back an array of keys but are currently limited to
+            // 4MB work of 'result' size. This should be okay for now.
 
             result.append( "splitKeys" , splitKeys );
 
             return true;
-
         }
     } cmdSplitVector;
 
@@ -449,8 +605,12 @@ namespace mongo {
 
         virtual bool slaveOk() const { return false; }
         virtual bool adminOnly() const { return true; }
-        virtual LockType locktype() const { return NONE; }
+        virtual LockType locktype() const { return OPLOCK; }
+        virtual bool requiresSync() const { return false; }
         virtual bool needsTxn() const { return false; }
+        virtual int txnFlags() const { return noTxnFlags(); }
+        virtual bool canRunInMultiStmtTxn() const { return false; }
+        virtual OpSettings getOpSettings() const { return OpSettings(); }
 
         bool run(const string& dbname, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl ) {
 
@@ -622,10 +782,8 @@ namespace mongo {
             vector<ChunkInfo> newChunks;
 
             try {
-                shared_ptr<ScopedDbConnection> conn(
-                    ScopedDbConnection::getInternalScopedDbConnection(
-                        shardingState.getConfigServer() ) );
-                RemoteTransaction txn(conn, "serializable");
+                scoped_ptr<ScopedDbConnection> conn(ScopedDbConnection::getInternalScopedDbConnection(shardingState.getConfigServer()));
+                RemoteTransaction txn(conn->conn(), "serializable");
 
                 // Check the precondition
                 BSONObjBuilder b;
@@ -734,17 +892,16 @@ namespace mongo {
                     BSONObj newmin = Helpers::modifiedRangeBound(chunk.min, idx->keyPattern(), -1);
                     BSONObj newmax = Helpers::modifiedRangeBound(chunk.max , idx->keyPattern(), -1);
 
-                    scoped_ptr<Cursor> bc( new IndexCursor( d ,
-                                                            *idx ,
-                                                            newmin , /* lower */
-                                                            newmax , /* upper */
-                                                            false , /* upper noninclusive */
-                                                            1 ) ); /* direction */
+                    shared_ptr<Cursor> c( IndexCursor::make( d , *idx ,
+                                                             newmin , /* lower */
+                                                             newmax , /* upper */
+                                                             false , /* upper noninclusive */
+                                                             1 ) ); /* direction */
 
                     // check if exactly one document found
-                    if ( bc->ok() ) {
-                        bc->advance();
-                        if ( bc->eof() ) {
+                    if ( c->ok() ) {
+                        c->advance();
+                        if ( c->eof() ) {
                             result.append( "shouldMigrate",
                                            BSON("min" << chunk.min << "max" << chunk.max) );
                             break;

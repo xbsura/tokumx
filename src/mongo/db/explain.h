@@ -1,6 +1,7 @@
 // @file explain.h - Helper classes for generating query explain output.
 
 /*    Copyright 2012 10gen Inc.
+ *    Copyright (C) 2013 Tokutek Inc.
  *
  *    Licensed under the Apache License, Version 2.0 (the "License");
  *    you may not use this file except in compliance with the License.
@@ -104,7 +105,6 @@ namespace mongo {
         long long nscannedObjectsAllPlans() const { return _nscannedObjects; }
         long long nscannedAllPlans() const;
         long long nChunkSkips() const { return _nChunkSkips; }
-        int nYields() const { return _nYields; }
         int millis() const { return _timer.duration(); }
 
     private:
@@ -118,7 +118,6 @@ namespace mongo {
         long long _n;
         long long _nscannedObjects;
         long long _nChunkSkips;
-        int _nYields;
         DurationTimer _timer;
     };
     

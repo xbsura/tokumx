@@ -3,6 +3,7 @@
 
 /**
  *    Copyright (C) 2008 10gen Inc.
+ *    Copyright (C) 2013 Tokutek Inc.
  *
  *    This program is free software: you can redistribute it and/or  modify
  *    it under the terms of the GNU Affero General Public License, version 3,
@@ -18,11 +19,10 @@
  */
 
 #include "pch.h"
-#include "../db/db.h"
-#include "../db/instance.h"
-#include "../db/json.h"
-#include "../db/lasterror.h"
-#include "../util/timer.h"
+#include "mongo/db/instance.h"
+#include "mongo/db/json.h"
+#include "mongo/db/lasterror.h"
+#include "mongo/util/timer.h"
 #include "dbtests.h"
 
 namespace DirectClientTests {
@@ -52,6 +52,8 @@ namespace DirectClientTests {
                 for( int j =0; j < pass*3; j++ )
                     client().insert(ns, BSON("x" << j));
 
+// TokuMX doesn't have this command
+#if 0
                 // test truncation of a capped collection
                 if( pass ) {
                     BSONObj info;
@@ -61,6 +63,7 @@ namespace DirectClientTests {
                     //cout << info.toString() << endl;
                     ASSERT(ok);
                 }
+#endif
 
                 ASSERT( client().dropCollection(ns) );
             }
@@ -79,7 +82,7 @@ namespace DirectClientTests {
             client().dropCollection(ns);
             client().insert(ns, objs);
             ASSERT_EQUALS(client().getLastErrorDetailed()["code"].numberInt(), 11000);
-            ASSERT_EQUALS((int)client().count(ns), 1);
+            ASSERT_EQUALS((int)client().count(ns), 0);  // TokuMX: all or nothing
 
             client().dropCollection(ns);
             client().insert(ns, objs, InsertOption_ContinueOnError);

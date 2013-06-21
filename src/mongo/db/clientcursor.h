@@ -2,6 +2,7 @@
 
 /**
 *    Copyright (C) 2008 10gen Inc.
+*    Copyright (C) 2013 Tokutek Inc.
 *
 *    This program is free software: you can redistribute it and/or  modify
 *    it under the terms of the GNU Affero General Public License, version 3,
@@ -54,6 +55,8 @@ namespace mongo {
     typedef map<CursorId, ClientCursor*> CCById;
 
     extern BSONObj id_obj;
+    
+    bool opForSlaveTooOld(uint64_t ts);
 
     class ClientCursor : private boost::noncopyable {
         friend class CmdCursorInfo;
@@ -157,7 +160,8 @@ namespace mongo {
             CCById::const_iterator _i;
         };
         
-        ClientCursor(int queryOptions, const shared_ptr<Cursor>& c, const string& ns, BSONObj query = BSONObj() );
+        ClientCursor(int queryOptions, const shared_ptr<Cursor>& c, const string& ns,
+                     BSONObj query = BSONObj(), const bool inMultiStatementTxn = false );
 
         ~ClientCursor();
 
@@ -172,7 +176,8 @@ namespace mongo {
         /* Get rid of cursors for namespaces 'ns'. When dropping a db, ns is "dbname."
            Used by drop, dropIndexes, dropDatabase.
         */
-        static void invalidate(const char *ns);
+        static void invalidate(const StringData &ns);
+        static void invalidateAllCursors();
 
         // --- some pass through helpers for Cursor ---
 
@@ -248,7 +253,7 @@ namespace mongo {
             }
             return it->second;
         }
-        
+
     public:
         static ClientCursor* find(CursorId id, bool warn = true) {
             recursive_scoped_lock lock(ccmutex);
@@ -275,16 +280,12 @@ namespace mongo {
          */
         bool shouldTimeout( unsigned millis );
 
-        //void storeOpForSlave( DiskLoc last );
+        void storeOpForSlave( BSONObj curr );
         void updateSlaveLocation( CurOp& curop );
+        bool lastOpForSlaveTooOld();
 
         unsigned idleTime() const { return _idleAgeMillis; }
-
-        void slaveReadTill( const OpTime& t ) { _slaveReadTill = t; }
         
-        /** Just for testing. */
-        OpTime getSlaveReadTill() const { return _slaveReadTill; }
-
     public: // static methods
 
         static void idleTimeReport(unsigned millis);
@@ -301,6 +302,15 @@ namespace mongo {
         // declare it first.
         shared_ptr<Client::TransactionStack> transactions; // the transaction this cursor is under,
                                                            // only set to support getMore() 
+        
+        // True if the above transaction stack is multi-statement. If it is,
+        // then this caller must be the owner of that multi-statement txn,
+        // otherwise uassert.
+        //
+        // If the above transaction stack is not multi-statement, return false.
+        // It will be necessary to use WithTxnStack(transactions) in order to
+        // use this cursor again.
+        bool checkMultiStatementTxn();
 
     private: // methods
 
@@ -320,7 +330,11 @@ namespace mongo {
         const BSONObj _query;            // used for logging diags only; optional in constructor
         int _queryOptions;        // see enum QueryOptions dbclient.h
 
-        OpTime _slaveReadTill;
+        // if this ClientCursor belongs to a secondary that is pulling
+        // data for replication, this will hold the point that the slave has
+        // read up to. Used for write concern
+        GTID _slaveReadTill;
+        uint64_t _slaveReadTillTS;
 
         unsigned _idleAgeMillis;                 // how long has the cursor been around, relative to server idle time
 
@@ -331,6 +345,7 @@ namespace mongo {
         unsigned _pinValue;
 
         ShardChunkManagerPtr _chunkManager;
+        bool _partOfMultiStatementTxn;
 
     public:
         shared_ptr<ParsedQuery> pq;
@@ -352,14 +367,3 @@ namespace mongo {
     };
 
 } // namespace mongo
-
-// ClientCursor should only be used with auto_ptr because it needs to be
-// release()ed after a yield if stillOk() returns false and these pointer types
-// do not support releasing. This will prevent them from being used accidentally
-// Instead of auto_ptr<>, which still requires some degree of manual management
-// of this, consider using ClientCursor::Holder which handles ClientCursor's
-// unusual self-deletion mechanics.
-namespace boost{
-    template<> class scoped_ptr<mongo::ClientCursor> {};
-    template<> class shared_ptr<mongo::ClientCursor> {};
-}

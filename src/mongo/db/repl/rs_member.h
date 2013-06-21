@@ -1,6 +1,7 @@
 // @file rsmember.h
 /*
  *    Copyright (C) 2010 10gen Inc.
+ *    Copyright (C) 2013 Tokutek Inc.
  *
  *    This program is free software: you can redistribute it and/or  modify
  *    it under the terms of the GNU Affero General Public License, version 3,
@@ -72,9 +73,12 @@ namespace mongo {
     class HeartbeatInfo {
         unsigned _id;
     public:
-        HeartbeatInfo() : _id(0xffffffff), hbstate(MemberState::RS_UNKNOWN), health(-1.0),
-            downSince(0), skew(INT_MIN), authIssue(false), ping(0) { }
-        HeartbeatInfo(unsigned id);
+        HeartbeatInfo()
+                : _id(0xffffffff), hbstate(MemberState::RS_UNKNOWN), health(-1.0),
+                  downSince(0), opTime(0), skew(INT_MIN), authIssue(false), ping(0) {}
+        HeartbeatInfo(unsigned id)
+                : _id(id), hbstate(MemberState::RS_UNKNOWN), health(-1.0), upSince(0),
+                  downSince(0), lastHeartbeat(0), opTime(0), skew(INT_MIN), authIssue(false), ping(0) {}
         unsigned id() const { return _id; }
         MemberState hbstate;
         double health;
@@ -99,17 +103,6 @@ namespace mongo {
         /* true if changed in a way of interest to the repl set manager. */
         bool changed(const HeartbeatInfo& old) const;
     };
-
-    inline HeartbeatInfo::HeartbeatInfo(unsigned id) : 
-        _id(id), 
-        authIssue(false),
-        ping(0) {
-        hbstate = MemberState::RS_UNKNOWN;
-        health = -1.0;
-        downSince = 0;
-        lastHeartbeat = upSince = 0;
-        skew = INT_MIN;
-    }
 
     inline bool HeartbeatInfo::changed(const HeartbeatInfo& old) const {
         return health != old.health ||

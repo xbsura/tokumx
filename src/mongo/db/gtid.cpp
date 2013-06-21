@@ -1,5 +1,5 @@
 /**
-*    Copyright (C) 2012 Tokutek Inc.
+*    Copyright (C) 2013 Tokutek Inc.
 *
 *    This program is free software: you can redistribute it and/or  modify
 *    it under the terms of the GNU Affero General Public License, version 3,
@@ -18,6 +18,7 @@
 
 #include "mongo/pch.h"
 #include "mongo/util/time_support.h"
+#include "mongo/util/stacktrace.h"
 
 namespace mongo {
 
@@ -50,11 +51,6 @@ namespace mongo {
         _GTSeqNo = 0;
     }
 
-    GTID::GTID(uint64_t primarySeqNo, uint64_t GTSeqNo) {
-        _primarySeqNo = primarySeqNo;
-        _GTSeqNo = GTSeqNo;
-    }
-
     GTID::GTID(const char* binData) {
         const char* pos = binData;
         uint64_t swappedPrim = *(uint64_t *)pos;
@@ -84,7 +80,7 @@ namespace mongo {
 
     string GTID::toString() const {
         stringstream ss;
-        ss << "primary: " << _primarySeqNo<< "secondary: " << _GTSeqNo;
+        ss << "primary: " << _primarySeqNo<< " secondary: " << _GTSeqNo;
         return ss.str();
     }
 
@@ -95,10 +91,12 @@ namespace mongo {
 
 
     
-    GTIDManager::GTIDManager( GTID lastGTID, uint64_t lastTime, uint64_t lastHash ) {
+    GTIDManager::GTIDManager( GTID lastGTID, uint64_t lastTime, uint64_t lastHash, uint32_t id ) {
+        _selfID = id;
         _lastLiveGTID = lastGTID;
         _minLiveGTID = _lastLiveGTID;
         _minLiveGTID.inc(); // comment this
+        _incPrimary = false;
 
         // note that _minUnappliedGTID is not set
 
@@ -120,16 +118,26 @@ namespace mongo {
         // it is ok for this to be racy. It is used for heuristic purposes
         *timestamp = curTimeMillis64();
 
-        _lock.lock();
+        boost::unique_lock<boost::mutex> lock(_lock);
         dassert(GTID::cmp(_lastLiveGTID, _lastUnappliedGTID) == 0);
-        _lastLiveGTID.inc();
+        if (_incPrimary) {
+            _incPrimary = false;
+            _lastLiveGTID.inc_primary();
+        }
+        else {
+            _lastLiveGTID.inc();
+        }
+
+        if (_liveGTIDs.size() == 0) {
+            _minLiveGTID = _lastLiveGTID;
+        }
+
         _lastUnappliedGTID = _lastLiveGTID;
         *gtid = _lastLiveGTID;
         _liveGTIDs.insert(*gtid);
         _lastTimestamp = *timestamp;
-        *hash = _lastHash + 1; // temporary
+        *hash = (_lastHash* 131 + *timestamp) * 17 + _selfID;
         _lastHash = *hash;
-        _lock.unlock();
     }
     
     // notification that user of GTID has completed work
@@ -139,7 +147,7 @@ namespace mongo {
     // THIS MUST BE DONE ON A PRIMARY
     //
     void GTIDManager::noteLiveGTIDDone(const GTID& gtid) {
-        _lock.lock();
+        boost::unique_lock<boost::mutex> lock(_lock);
         dassert(GTID::cmp(gtid, _minLiveGTID) >= 0);
         dassert(_liveGTIDs.size() > 0);
         // remove from list of GTIDs
@@ -160,14 +168,13 @@ namespace mongo {
             // notify that _minLiveGTID has changed
             _minLiveCond.notify_all();
         }
-        _lock.unlock();
     }
 
 
     // This function is called on a secondary when a GTID 
     // from the primary is added and committed to the opLog
     void GTIDManager::noteGTIDAdded(const GTID& gtid, uint64_t ts, uint64_t lastHash) {
-        _lock.lock();
+        boost::unique_lock<boost::mutex> lock(_lock);
         // if we are adding a GTID on a secondary, then 
         // these values must be equal
         dassert(GTID::cmp(_lastLiveGTID, _minLiveGTID) < 0);
@@ -180,53 +187,67 @@ namespace mongo {
         _lastHash = lastHash;
 
         _minLiveCond.notify_all();
-        _lock.unlock();
     }
 
     // called when a secondary takes an unapplied GTID it has read in the oplog
     // and starts to apply it
     void GTIDManager::noteApplyingGTID(const GTID& gtid) {
-        _lock.lock();
-        dassert(GTID::cmp(gtid, _minUnappliedGTID) >= 0);
-        dassert(GTID::cmp(gtid, _lastUnappliedGTID) > 0);
-        if (_unappliedGTIDs.size() == 0) {
-            _minUnappliedGTID = gtid;
-        }
+        try {
+            boost::unique_lock<boost::mutex> lock(_lock);
+            dassert(GTID::cmp(gtid, _minUnappliedGTID) >= 0);
+            dassert(GTID::cmp(gtid, _lastUnappliedGTID) > 0);
+            if (_unappliedGTIDs.size() == 0) {
+                _minUnappliedGTID = gtid;
+            }
 
-        _unappliedGTIDs.insert(gtid);        
-        _lastUnappliedGTID = gtid;
-        _lock.unlock();
+            _unappliedGTIDs.insert(gtid);
+            _lastUnappliedGTID = gtid;
+        }
+        catch (std::exception &e) {
+            log() << "exception during noteApplyingGTID, aborting system: " << e.what() << endl;
+            stringstream ss;
+            printStackTrace(ss);
+            log() << ss.str() << endl;
+            ::abort();
+        }
     }
 
     // called when a GTID has finished being applied, which means
     // we can remove it from the unappliedGTIDs set
     void GTIDManager::noteGTIDApplied(const GTID& gtid) {
-        _lock.lock();
-        dassert(GTID::cmp(gtid, _minUnappliedGTID) >= 0);
-        dassert(_unappliedGTIDs.size() > 0);
-        // remove from list of GTIDs
-        _unappliedGTIDs.erase(gtid);
-        // if what we are removing is currently the minumum live GTID
-        // we need to update the minimum live GTID
-        if (GTID::cmp(_minUnappliedGTID, gtid) == 0) {
-            if (_unappliedGTIDs.size() == 0) {
-                _minUnappliedGTID = _lastUnappliedGTID;
-                _minUnappliedGTID.inc();
-            }
-            else {
-                // get the minumum from _liveGTIDs and set it to _minLiveGTIDs
-                _minUnappliedGTID = *(_unappliedGTIDs.begin());
+        try {
+            boost::unique_lock<boost::mutex> lock(_lock);
+            dassert(GTID::cmp(gtid, _minUnappliedGTID) >= 0);
+            dassert(_unappliedGTIDs.size() > 0);
+            // remove from list of GTIDs
+            _unappliedGTIDs.erase(gtid);
+            // if what we are removing is currently the minumum live GTID
+            // we need to update the minimum live GTID
+            if (GTID::cmp(_minUnappliedGTID, gtid) == 0) {
+                if (_unappliedGTIDs.size() == 0) {
+                    _minUnappliedGTID = _lastUnappliedGTID;
+                    _minUnappliedGTID.inc();
+                }
+                else {
+                    // get the minumum from _liveGTIDs and set it to _minLiveGTIDs
+                    _minUnappliedGTID = *(_unappliedGTIDs.begin());
+                }
             }
         }
-        _lock.unlock();
+        catch (std::exception &e) {
+            log() << "exception during noteApplyingGTID, aborting system: " << e.what() << endl;
+            stringstream ss;
+            printStackTrace(ss);
+            log() << ss.str() << endl;
+            ::abort();
+        }
     }
 
 
     void GTIDManager::getMins(GTID* minLiveGTID, GTID* minUnappliedGTID) {
-        _lock.lock();
+        boost::unique_lock<boost::mutex> lock(_lock);
         *minLiveGTID = _minLiveGTID;
         *minUnappliedGTID = _minUnappliedGTID;
-        _lock.unlock();
     }
 
     GTID GTIDManager::getMinLiveGTID() {
@@ -237,39 +258,37 @@ namespace mongo {
     }
 
     void GTIDManager::resetManager() {
-        _lock.lock();
+        boost::unique_lock<boost::mutex> lock(_lock);
         dassert(_liveGTIDs.size() == 0);
-        _lastLiveGTID.inc_primary();
+        // tell the GTID Manager that the next GTID
+        // we get for a primary, we increment the primary
+        _incPrimary = true;
+
         _minLiveGTID = _lastLiveGTID;
         _minLiveGTID.inc();
 
         _lastUnappliedGTID = _lastLiveGTID;
         _minUnappliedGTID = _minLiveGTID;
-
-        _lock.unlock();
     }
     GTID GTIDManager::getLiveState() {
-        _lock.lock();
+        boost::unique_lock<boost::mutex> lock(_lock);
         GTID ret = _lastLiveGTID;
-        _lock.unlock();
         return ret;
     }
 
     void GTIDManager::getLiveGTIDs(GTID* lastLiveGTID, GTID* lastUnappliedGTID) {
-        _lock.lock();
+        boost::unique_lock<boost::mutex> lock(_lock);
         *lastLiveGTID = _lastLiveGTID;
         *lastUnappliedGTID = _lastUnappliedGTID;
-        _lock.unlock();
     }
 
     // does some sanity checks to make sure the GTIDManager
     // is in a state where it can become primary
     void GTIDManager::verifyReadyToBecomePrimary() {
-        _lock.lock();
+        boost::unique_lock<boost::mutex> lock(_lock);
         verify(GTID::cmp(_lastLiveGTID, _lastUnappliedGTID) == 0);
         verify(GTID::cmp(_minLiveGTID, _minUnappliedGTID) == 0);
         verify(GTID::cmp(_minLiveGTID, _lastLiveGTID) > 0);
-        _lock.unlock();
     }
 
     // used for Tailable cursors on the oplog. The input GTID states the last
@@ -279,13 +298,12 @@ namespace mongo {
     // allows tailable cursors to know when there is some new data
     // to be read
     void GTIDManager::waitForDifferentMinLive(GTID last, uint32_t millis) {
-        _lock.lock();
+        boost::unique_lock<boost::mutex> lock(_lock);
         dassert(GTID::cmp(last, _minLiveGTID) <= 0);
         if (GTID::cmp(last, _minLiveGTID) == 0) {
             // wait on cond
             _minLiveCond.timed_wait(_lock, boost::posix_time::milliseconds(millis));
         }
-        _lock.unlock();
     }
 
     // after an intial sync has happened and the oplog has been updated
@@ -294,7 +312,7 @@ namespace mongo {
     // of the GTIDManager to reflect the state of the oplog so that
     // we can proceed with replication.
     void GTIDManager::resetAfterInitialSync(GTID last, uint64_t lastTime, uint64_t lastHash) {
-        _lock.lock();
+        boost::unique_lock<boost::mutex> lock(_lock);
         verify(_liveGTIDs.size() == 0);
         verify(_unappliedGTIDs.size() == 0);
         _lastLiveGTID = last;
@@ -306,24 +324,20 @@ namespace mongo {
 
         _lastTimestamp = lastTime;
         _lastHash = lastHash;
-
-        _lock.unlock();
     }
 
     uint64_t GTIDManager::getCurrTimestamp() {
-        _lock.lock();
+        boost::unique_lock<boost::mutex> lock(_lock);
         uint64_t ret = _lastTimestamp;
-        _lock.unlock();
         return ret;        
     }
 
     void GTIDManager::catchUnappliedToLive() {
-        _lock.lock();
+        boost::unique_lock<boost::mutex> lock(_lock);
         verify(_liveGTIDs.size() == 0);
         verify(_unappliedGTIDs.size() == 0);
         _lastUnappliedGTID = _lastLiveGTID;
         _minUnappliedGTID = _minLiveGTID;
-        _lock.unlock();
     }
     
     bool GTIDManager::rollbackNeeded(

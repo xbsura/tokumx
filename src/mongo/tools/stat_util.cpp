@@ -2,6 +2,7 @@
 
 /**
  *    Copyright (C) 2008 10gen Inc.
+ *    Copyright (C) 2013 Tokutek Inc.
  *
  *    This program is free software: you can redistribute it and/or  modify
  *    it under the terms of the GNU Affero General Public License, version 3,
@@ -100,18 +101,6 @@ namespace mongo {
             _append( result , "flushes" , 6 , (int)diff( "flushes" , ax , bx ) );
         }
 
-        if ( b.getFieldDotted("mem.supported").trueValue() ) {
-            BSONObj bx = b["mem"].embeddedObject();
-            BSONObjIterator i( bx );
-            if (!isMongos)
-                _appendMem( result , "mapped" , 6 , bx["mapped"].numberInt() );
-            _appendMem( result , "vsize" , 6 , bx["virtual"].numberInt() );
-            _appendMem( result , "res" , 6 , bx["resident"].numberInt() );
-
-            if ( !isMongos && _all )
-                _appendMem( result , "non-mapped" , 6 , bx["virtual"].numberInt() - bx["mapped"].numberInt() );
-        }
-
         if ( b["extra_info"].type() == Object ) {
             BSONObj ax = a["extra_info"].embeddedObject();
             BSONObj bx = b["extra_info"].embeddedObject();
@@ -154,9 +143,6 @@ namespace mongo {
             else {
                 _append( result , "locked %" , 8 , percent( "globalLock.totalTime" , "globalLock.lockTime" , a , b ) );
             }
-
-            
-            _append( result , "idx miss %" , 8 , percent( "indexCounters.btree.accesses" , "indexCounters.btree.misses" , a , b ) );
         }
 
         if ( b.getFieldDotted( "globalLock.currentQueue" ).type() == Object ) {

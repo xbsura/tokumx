@@ -146,12 +146,12 @@ class mongod(object):
         sock.connect(("localhost", int(port)))
         sock.close()
 
-    def is_mongo_alive(self):
+    def is_mongod_alive(self):
         try:
-            self.check_mongo_port(int(port))
+            self.check_mongo_port(self.port)
             return True
         except Exception, e:
-            return False 
+            return False
 
     def did_mongod_start(self, port=mongod_port, timeout=300):
         while timeout > 0:
@@ -190,6 +190,8 @@ class mongod(object):
             self.port += 1
             self.slave = True
         if os.path.exists(dir_name):
+            pass
+            """ Cleanbb is the most irritating script ever created.
             if 'slave' in self.kwargs:
                 argv = [utils.find_python(), "buildscripts/cleanbb.py", '--nokill', dir_name]
             else:
@@ -202,6 +204,7 @@ class mongod(object):
                     f.close()
             else:
                 call(argv)
+            """
         utils.ensureDir(dir_name)
         argv = [mongod_executable, "--port", str(self.port), "--dbpath", dir_name]
         if self.kwargs.get('small_oplog'):
@@ -498,10 +501,12 @@ def runTest(test):
     finally:
         tempfile.close()
 
+"""
     try:
         c = Connection( "127.0.0.1" , int(mongod_port) )
     except Exception,e:
         raise TestServerFailure(path)
+"""
 
 def run_tests(tests):
     # FIXME: some suites of tests start their own mongod, so don't
@@ -556,8 +561,8 @@ def run_tests(tests):
                     try:
                         if not quiet:
                             print f
-                        if not master.is_mongo_alive():
-                            # mongo died. restart it.
+                        if not master.is_mongod_alive():
+                            print 'restarting mongod...'
                             master = mongod(small_oplog_rs=small_oplog_rs,small_oplog=small_oplog,no_journal=no_journal,no_preallocj=no_preallocj,auth=auth).__enter__()
                         # Record the failing test and re-raise.
                         losers[f.path] = f.status
@@ -583,7 +588,7 @@ def report():
         print "%d tests didn't get run" % num_missed
     if losers:
         print "The following tests failed (with exit code):"
-        for loser in losers:
+        for loser in sorted(losers.keys()):
             print "%s\t%d" % (loser, losers[loser])
 
     def missing(lst, src, dst):
@@ -868,6 +873,9 @@ def main():
     parser.add_option('--quiet', dest='quiet', default=False,
                       action="store_true",
                       help='Generate a quieter report (use with --tests-log)')
+    parser.add_option('--shuffle', dest='shuffle', default=False,
+                      action="store_true",
+                      help='Shuffle tests instead of running them in alphabetical order')
 
     # Buildlogger invocation from command line
     parser.add_option('--buildlogger-builder', dest='buildlogger_builder', default=None,
@@ -935,6 +943,10 @@ def main():
                 f.close()
         else:
             call([utils.find_python(), "buildscripts/cleanbb.py", "--nokill", dbroot])
+
+    if options.shuffle:
+        import random
+        random.shuffle(tests)
 
     try:
         run_tests(tests)

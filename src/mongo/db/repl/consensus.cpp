@@ -1,5 +1,6 @@
 /**
 *    Copyright (C) 2010 10gen Inc.
+*    Copyright (C) 2013 Tokutek Inc.
 *
 *    This program is free software: you can redistribute it and/or  modify
 *    it under the terms of the GNU Affero General Public License, version 3,
@@ -30,7 +31,7 @@ namespace mongo {
     private:
 
         bool shouldVeto(const BSONObj& cmdObj, string& errmsg) {
-            GTIDManager* gtidMgr = theReplSet->gtidManager;
+            GTIDManager* gtidMgr = theReplSet->gtidManager.get();
             // don't veto older versions
             if (cmdObj["id"].eoo()) {
                 // they won't be looking for the veto field
@@ -75,13 +76,12 @@ namespace mongo {
             return false;
         }
 
-        virtual bool needsTxn() const { return false; }
         virtual bool run(const string& , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
             if( !check(errmsg, result) ) {
                 return false;
             }
             
-            GTIDManager* gtidMgr = theReplSet->gtidManager;
+            GTIDManager* gtidMgr = theReplSet->gtidManager.get();
             if( cmdObj["set"].String() != theReplSet->name() ) {
                 errmsg = "wrong repl set name";
                 return false;
@@ -99,7 +99,8 @@ namespace mongo {
             }
             // check not only our own GTID, but any other member we can reach
             else if (GTID::cmp(remoteGTID, ourGTID) < 0 ||
-                     GTID::cmp(remoteGTID, theReplSet->lastOtherGTID())) {
+                     GTID::cmp(remoteGTID, theReplSet->lastOtherGTID()) < 0) {                
+                log() << "we are fresher! remoteGTID" << remoteGTID.toString() << " ourGTID " << ourGTID.toString() << " lastOther " << theReplSet->lastOtherGTID() << " " << rsLog;
                 weAreFresher = true;
             }
             addGTIDToBSON("GTID", ourGTID, result);
@@ -114,7 +115,6 @@ namespace mongo {
     public:
         CmdReplSetElect() : ReplSetCommand("replSetElect") { }
     private:
-        virtual bool needsTxn() const { return false; }
         virtual bool run(const string& , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
             if( !check(errmsg, result) )
                 return false;
@@ -217,20 +217,17 @@ namespace mongo {
             log() << "replSet electCmdReceived couldn't find member with id " << whoid << rsLog;
             vote = -10000;
         }
-        else if( primary && 
-            primary == rs._self && 
-            GTID::cmp(rs.gtidManager->getLiveState(), hopeful->hbinfo().gtid) >= 0 
-            )
+        else if( primary && primary == rs._self)
         {
             // hbinfo is not updated, so we have to check the primary's last GTID separately
             log() << "I am already primary, " << hopeful->fullName()
                   << " can try again once I've stepped down" << rsLog;
             vote = -10000;
         }
-        else if( primary && GTID::cmp(primary->hbinfo().gtid, hopeful->hbinfo().gtid) >= 0) {
+        else if( primary ) {
             // other members might be aware of more up-to-date nodes
             log() << hopeful->fullName() << " is trying to elect itself but " <<
-                  primary->fullName() << " is already primary and more up-to-date" << rsLog;
+                  primary->fullName() << " is already primary" << rsLog;
             vote = -10000;
         }
         else if( highestPriority && highestPriority->config().priority > hopeful->config().priority) {
@@ -241,11 +238,6 @@ namespace mongo {
             try {
                 vote = yea(whoid);
                 dassert( hopeful->id() == whoid );
-                // Not sure where the right place to put this lock is. 
-                // Maybe this belongs at the top of the function?
-                boost::unique_lock<boost::mutex> lock(rs.stateChangeMutex);
-                RSBase::lock lk(&rs);
-                rs.relinquish();
                 log() << "replSet info voting yea for " <<  hopeful->fullName() << " (" << whoid << ')' << rsLog;
             }
             catch(VoteException&) {

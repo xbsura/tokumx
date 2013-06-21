@@ -2,6 +2,7 @@
 
 /**
 *    Copyright (C) 2008 10gen Inc.
+*    Copyright (C) 2013 Tokutek Inc.
 *
 *    This program is free software: you can redistribute it and/or  modify
 *    it under the terms of the GNU Affero General Public License, version 3,
@@ -36,7 +37,6 @@
 #include "../util/net/message.h"
 #include "../util/background.h"
 #include "../client/connpool.h"
-#include "db.h"
 #include "commands.h"
 #include "security.h"
 #include "cmdline.h"
@@ -56,7 +56,6 @@ namespace mongo {
 
     /* if 1 sync() is running */
     volatile int syncing = 0;
-    static volatile int relinquishSyncingSome = 0;
 
     /* "dead" means something really bad happened like replication falling completely out of sync.
        when non-null, we are dead and the string is informational
@@ -111,11 +110,11 @@ namespace mongo {
             int n = 0;
             list<BSONObj> src;
             {
-                Client::ReadContext ctx( "local.sources", dbpath, authed );
-                shared_ptr<Cursor> c = Helpers::findTableScan("local.sources", BSONObj());
-                while ( c->ok() ) {
-                    src.push_back(c->current());
-                    c->advance();
+                const char *ns = "local.sources";
+                Client::ReadContext ctx( ns, dbpath, authed );
+                NamespaceDetails *d = nsdetails( ns );
+                for (shared_ptr<Cursor> c( BasicCursor::make( d ) ); c->ok(); c->advance()) {
+                    src.push_back(c->current().copy());
                 }
             }
 
@@ -171,8 +170,12 @@ namespace mongo {
             help << "Check if this server is primary for a replica pair/set; also if it is --master or --slave in simple master/slave setups.\n";
             help << "{ isMaster : 1 }";
         }
-        virtual bool needsTxn() const { return false; }
         virtual LockType locktype() const { return NONE; }
+        virtual bool requiresSync() const { return false; }
+        virtual bool needsTxn() const { return false; }
+        virtual int txnFlags() const { return noTxnFlags(); }
+        virtual bool canRunInMultiStmtTxn() const { return true; }
+        virtual OpSettings getOpSettings() const { return OpSettings(); }
         CmdIsMaster() : Command("isMaster", true, "ismaster") { }
         virtual bool run(const string& , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool /*fromRepl*/) {
             /* currently request to arbiter is (somewhat arbitrarily) an ismaster request that is not
@@ -196,8 +199,10 @@ namespace mongo {
         /* if we are going to be a replica set, we aren't doing other forms of replication. */
         if( !cmdLine._replSet.empty() ) {
             replSet = true;
-            setTxnLogOperations(true);
+            setLogTxnOpsForReplication(true);
             setLogTxnToOplog(logTransactionOps);
+            setLogTxnRefToOplog(logTransactionOpsRef);
+            setLogOpsToOplogRef(logOpsToOplogRef);
             ReplSetCmdline *replSetCmdline = new ReplSetCmdline(cmdLine._replSet);
             boost::thread t( boost::bind( &startReplSets, replSetCmdline) );
 

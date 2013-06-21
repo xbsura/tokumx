@@ -3,6 +3,7 @@
  */
 
 /*    Copyright 2009 10gen Inc.
+ *    Copyright (C) 2013 Tokutek Inc.
  *
  *    Licensed under the Apache License, Version 2.0 (the "License");
  *    you may not use this file except in compliance with the License.
@@ -21,10 +22,11 @@
 
 #include <db.h>
 
-#include "jsobj.h"
-#include "commands.h"
-#include "client.h"
-#include "replutil.h"
+#include "mongo/db/jsobj.h"
+#include "mongo/db/commands.h"
+#include "mongo/db/client.h"
+#include "mongo/db/replutil.h"
+#include "mongo/db/namespacestring.h"
 
 namespace mongo {
 
@@ -53,17 +55,6 @@ namespace mongo {
         }
 #endif
         return dbname + '.' + coll;
-    }
-
-    int Command::txnFlags() const {
-        if (locktype() == READ) {
-            // TODO: Maybe add DB_TXN_READ_ONLY?
-            return DB_TXN_SNAPSHOT;
-        } else if (locktype() == WRITE) {
-            return DB_SERIALIZABLE;
-        } else {
-            return DB_SERIALIZABLE;
-        }
     }
 
     void Command::htmlHelp(stringstream& ss) const {
@@ -190,36 +181,26 @@ namespace mongo {
 
     extern DBConnectionPool pool;
 
-    class PoolFlushCmd : public Command {
+    class PoolFlushCmd : public InformationCommand {
     public:
-        PoolFlushCmd() : Command( "connPoolSync" , false , "connpoolsync" ) {}
+        PoolFlushCmd() : InformationCommand( "connPoolSync" , false , "connpoolsync" ) {}
         virtual void help( stringstream &help ) const { help<<"internal"; }
-        virtual LockType locktype() const { return NONE; }
         virtual bool run(const string&, mongo::BSONObj&, int, std::string&, mongo::BSONObjBuilder& result, bool) {
             pool.flush();
             return true;
         }
-        virtual bool slaveOk() const {
-            return true;
-        }
-
     } poolFlushCmd;
 
-    class PoolStats : public Command {
+    class PoolStats : public InformationCommand {
     public:
-        PoolStats() : Command( "connPoolStats" ) {}
+        PoolStats() : InformationCommand( "connPoolStats", false ) {}
         virtual void help( stringstream &help ) const { help<<"stats about connection pool"; }
-        virtual LockType locktype() const { return NONE; }
         virtual bool run(const string&, mongo::BSONObj&, int, std::string&, mongo::BSONObjBuilder& result, bool) {
             pool.appendInfo( result );
             result.append( "numDBClientConnection" , DBClientConnection::getNumConnections() );
             result.append( "numAScopedConnection" , AScopedConnection::getNumConnections() );
             return true;
         }
-        virtual bool slaveOk() const {
-            return true;
-        }
-
     } poolStatsCmd;
 
 } // namespace mongo

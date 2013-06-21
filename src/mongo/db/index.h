@@ -2,6 +2,7 @@
 
 /**
 *    Copyright (C) 2008 10gen Inc.
+*    Copyright (C) 2013 Tokutek Inc.
 *
 *    This program is free software: you can redistribute it and/or  modify
 *    it under the terms of the GNU Affero General Public License, version 3,
@@ -26,12 +27,15 @@
 #include "mongo/db/client.h"
 #include "mongo/db/indexkey.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/namespace.h"
 #include "mongo/db/storage/cursor.h"
 #include "mongo/db/storage/env.h"
+#include "mongo/db/storage/key.h"
 #include "mongo/db/storage/txn.h"
+#include "mongo/db/storage/loader.h"
 
 namespace mongo {
+
+    class NamespaceDetails;
 
     /* Details about a particular index. There is one of these effectively for each object in
        system.namespaces (although this also includes the head pointer, which is not in that
@@ -42,6 +46,9 @@ namespace mongo {
         explicit IndexDetails(const BSONObj &info, bool may_create=true);
 
         ~IndexDetails();
+
+        // Closes the underlying DB *.  In case that throws, we can't do it in the destructor.
+        void close();
 
         BSONObj getKeyFromQuery(const BSONObj& query) const {
             BSONObj k = keyPattern();
@@ -68,15 +75,17 @@ namespace mongo {
          * @return offset into keyPattern for key
                    -1 if doesn't exist
          */
-        int keyPatternOffset( const string& key ) const;
-        bool inKeyPattern( const string& key ) const { return keyPatternOffset( key ) >= 0; }
+        int keyPatternOffset( const StringData& key ) const;
+        bool inKeyPattern( const StringData& key ) const { return keyPatternOffset( key ) >= 0; }
 
         /* true if the specified key is in the index */
         bool hasKey(const BSONObj& key);
 
-        static string indexNamespace(const string &ns, const string &idxName) {
+        static string indexNamespace(const StringData& ns, const StringData& idxName) {
             dassert(ns != "" && idxName != "");
-            return ns + ".$" + idxName;
+            stringstream ss;
+            ss << ns.toString() << ".$" << idxName.toString();
+            return ss.str();
         }
 
         // returns name of this index's storage area
@@ -137,15 +146,28 @@ namespace mongo {
         const BSONObj &info() const { return _info; }
 
         void insertPair(const BSONObj &key, const BSONObj *pk, const BSONObj &val, uint64_t flags);
-        void deletePair(const BSONObj &key, const BSONObj *pk);
+        void deletePair(const BSONObj &key, const BSONObj *pk, uint64_t flags);
 
         enum toku_compression_method getCompressionMethod() const;
         uint32_t getPageSize() const;
         uint32_t getReadPageSize() const;
         void getStat64(DB_BTREE_STAT64* stats) const;
-        void uniqueCheckCallback(const BSONObj &newkey, const BSONObj &oldkey, bool &isUnique) const;
-        void uniqueCheck(const BSONObj &key, const BSONObj *pk) const ;
         void optimize();
+
+        struct UniqueCheckExtra {
+            const BSONObj &newkey;
+            const Ordering &ordering;
+            bool &isUnique;
+            std::exception *ex;
+            UniqueCheckExtra(const BSONObj &k, const Ordering &o, bool &u)
+                    : newkey(k), ordering(o), isUnique(u), ex(NULL) {}
+        };
+        static int uniqueCheckCallback(const DBT *key, const DBT *val, void *extra);
+        void uniqueCheck(const BSONObj &key, const BSONObj *pk) const ;
+        void uassertedDupKey(const BSONObj &key) const;
+
+        template<class Callback>
+        void getKeyAfterBytes(const storage::Key &startKey, uint64_t skipLen, Callback &cb) const;
 
         class Cursor : public storage::Cursor {
         public:
@@ -154,19 +176,28 @@ namespace mongo {
             }
         };
 
+        class Builder {
+        public:
+            Builder(IndexDetails &idx);
+
+            void insertPair(const BSONObj &key, const BSONObj *pk, const BSONObj &val);
+
+            void done();
+
+        private:
+            IndexDetails &_idx;
+            storage::Loader _loader;
+        };
+
     private:
         // Open dictionary representing the index on disk.
         DB *_db;
 
+        void _build();
+        static int hot_opt_callback(void *extra, float progress);
 
-        /* Info about the index. Stored on disk in the .ns file for this database
-         * as a NamespaceDetails object.
-         */
-        /* Currenty known format:
-             { name:"nameofindex", ns:"parentnsname", key: {keypattobject}
-               [, unique: <bool>, background: <bool>, v:<version>]
-             }
-        */
+        // Info about the index. Stored on disk in the database.ns dictionary
+        // for this database as a BSON object.
         const BSONObj _info;
 
         // Precomputed values from _info, for speed.
@@ -198,6 +229,46 @@ namespace mongo {
         uint32_t _readPageSize;
         uint32_t _pageSize;
     };
+
+    template<class Callback>
+    void IndexDetails::getKeyAfterBytes(const storage::Key &startKey, uint64_t skipLen, Callback &cb) const {
+        class CallbackWrapper {
+            Callback &_cb;
+          public:
+            std::exception *ex;
+            CallbackWrapper(Callback &cb) : _cb(cb), ex(NULL) {}
+            static void call(const DBT *endKeyDBT, uint64_t skipped, void *thisv) {
+                CallbackWrapper *t = static_cast<CallbackWrapper *>(thisv);
+                try {
+                    if (endKeyDBT == NULL) {
+                        t->_cb(NULL, NULL, skipped);
+                    }
+                    else {                
+                        storage::KeyV1 endKey(static_cast<char *>(endKeyDBT->data));
+                        if (endKey.dataSize() < (ssize_t) endKeyDBT->size) {
+                            BSONObj endPK(static_cast<char *>(endKeyDBT->data) + endKey.dataSize());
+                            t->_cb(&endKey, &endPK, skipped);
+                        }
+                        else {
+                            t->_cb(&endKey, NULL, skipped);
+                        }
+                    }
+                }
+                catch (std::exception &e) {
+                    t->ex = &e;
+                }
+            }
+        };
+        DBT startDBT = startKey.dbt();
+        CallbackWrapper cbw(cb);
+        int r = _db->get_key_after_bytes(_db, cc().txn().db_txn(), &startDBT, skipLen, &CallbackWrapper::call, &cbw, 0);
+        if (r != 0) {
+            storage::handle_ydb_error(r);
+        }
+        if (cbw.ex != NULL) {
+            throw *cbw.ex;
+        }
+    }
 
 } // namespace mongo
 

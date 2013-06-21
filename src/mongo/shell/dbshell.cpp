@@ -1,6 +1,7 @@
 // dbshell.cpp
 /*
  *    Copyright 2010 10gen Inc.
+ *    Copyright (C) 2013 Tokutek Inc.
  *
  *    Licensed under the Apache License, Version 2.0 (the "License");
  *    you may not use this file except in compliance with the License.
@@ -23,6 +24,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "mongo/base/initializer.h"
 #include "mongo/client/dbclientinterface.h"
 #include "mongo/db/cmdline.h"
 #include "mongo/db/repl/rs_member.h"
@@ -243,7 +245,7 @@ void setupSignals() {
     set_terminate( myterminate );
 }
 
-string fixHost( string url , string host , string port ) {
+string fixHost( const std::string& url, const std::string& host, const std::string& port ) {
     //cout << "fixHost url: " << url << " host: " << host << " port: " << port << endl;
 
     if ( host.size() == 0 && port.size() == 0 ) {
@@ -264,10 +266,7 @@ string fixHost( string url , string host , string port ) {
         ::_exit(-1);
     }
 
-    if ( host.size() == 0 )
-        host = "127.0.0.1";
-
-    string newurl = host;
+    string newurl( ( host.size() == 0 ) ? "127.0.0.1" : host );
     if ( port.size() > 0 )
         newurl += ":" + port;
     else if ( host.find(':') == string::npos ) {
@@ -288,14 +287,14 @@ bool isOpSymbol( char c ) {
     return false;
 }
 
-bool isUseCmd( string code ) {
+bool isUseCmd( const std::string& code ) {
     string cmd = code;
     if ( cmd.find( " " ) > 0 )
         cmd = cmd.substr( 0 , cmd.find( " " ) );
     return cmd == "use";
 }
 
-bool isBalanced( string code ) {
+bool isBalanced( const std::string& code ) {
     if (isUseCmd( code ))
         return true;  // don't balance "use <dbname>" in case dbname contains special chars
     int curlyBrackets = 0;
@@ -420,7 +419,7 @@ string finishCode( string code ) {
 namespace po = boost::program_options;
 
 void show_help_text( const char* name, po::options_description options ) {
-    cout << "MongoDB shell version: " << mongo::fullVersionString() << endl;
+    cout << "TokuMX mongo shell v" << mongo::fullVersionString() << endl;
     cout << "usage: " << name << " [options] [db address] [file names (ending in .js)]" << endl
          << "db address can be:" << endl
          << "  foo                   foo database on local machine" << endl
@@ -598,7 +597,8 @@ static void edit( const string& whatToEdit ) {
     }
 }
 
-int _main( int argc, char* argv[] ) {
+int _main( int argc, char* argv[], char **envp ) {
+    mongo::runGlobalInitializersOrDie(argc, argv, envp);
     mongo::isShell = true;
     setupSignals();
 
@@ -702,7 +702,7 @@ int _main( int argc, char* argv[] ) {
         files = params["files"].as< vector<string> >();
     }
     if ( params.count( "version" ) ) {
-        cout << "MongoDB shell version: " << mongo::fullVersionString() << endl;
+        cout << "TokuMX mongo shell v" << mongo::fullVersionString() << endl;
         return mongo::EXIT_CLEAN;
     }
     if ( params.count( "quiet" ) ) {
@@ -757,7 +757,7 @@ int _main( int argc, char* argv[] ) {
     }
 
     if ( ! mongo::cmdLine.quiet )
-        cout << "MongoDB shell version: " << mongo::fullVersionString() << endl;
+        cout << "TokuMX mongo shell v" << mongo::fullVersionString() << endl;
 
     mongo::StartupTest::runTests();
 
@@ -981,7 +981,7 @@ int wmain( int argc, wchar_t* argvW[] ) {
     int returnValue = -1;
     try {
         WindowsCommandLine wcl( argc, argvW );
-        returnValue = _main( argc, wcl.argv() );
+        returnValue = _main( argc, wcl.argv(), NULL );  // TODO: Convert wide env to utf8 env.
     }
     catch ( mongo::DBException& e ) {
         cerr << "exception: " << e.what() << endl;
@@ -991,11 +991,11 @@ int wmain( int argc, wchar_t* argvW[] ) {
     ::_exit(returnValue);
 }
 #else // #ifdef _WIN32
-int main( int argc, char* argv[] ) {
+int main( int argc, char* argv[], char **envp ) {
     static mongo::StaticObserver staticObserver;
     int returnCode;
     try {
-        returnCode = _main( argc , argv );
+        returnCode = _main( argc , argv, envp );
     }
     catch ( mongo::DBException& e ) {
         cerr << "exception: " << e.what() << endl;

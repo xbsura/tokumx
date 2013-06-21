@@ -1,6 +1,7 @@
 // syncclusterconnection.cpp
 /*
  *    Copyright 2010 10gen Inc.
+ *    Copyright (C) 2013 Tokutek Inc.
  *
  *    Licensed under the Apache License, Version 2.0 (the "License");
  *    you may not use this file except in compliance with the License.
@@ -28,7 +29,7 @@
 
 namespace mongo {
 
-    SyncClusterConnection::SyncClusterConnection( const list<HostAndPort> & L, double socketTimeout) : _mutex("SyncClusterConnection"), _socketTimeout( socketTimeout ) {
+    SyncClusterConnection::SyncClusterConnection( const list<HostAndPort> & L, double socketTimeout) : _mutex("SyncClusterConnection"), _txnNestLevel(0), _socketTimeout( socketTimeout ) {
         {
             stringstream s;
             int n=0;
@@ -42,19 +43,19 @@ namespace mongo {
             _connect( i->toString() );
     }
 
-    SyncClusterConnection::SyncClusterConnection( string commaSeperated, double socketTimeout)  : _mutex("SyncClusterConnection"), _socketTimeout( socketTimeout ) {
-        _address = commaSeperated;
+    SyncClusterConnection::SyncClusterConnection( string commaSeparated, double socketTimeout)  : _mutex("SyncClusterConnection"), _txnNestLevel(0), _socketTimeout( socketTimeout ) {
+        _address = commaSeparated;
         string::size_type idx;
-        while ( ( idx = commaSeperated.find( ',' ) ) != string::npos ) {
-            string h = commaSeperated.substr( 0 , idx );
-            commaSeperated = commaSeperated.substr( idx + 1 );
+        while ( ( idx = commaSeparated.find( ',' ) ) != string::npos ) {
+            string h = commaSeparated.substr( 0 , idx );
+            commaSeparated = commaSeparated.substr( idx + 1 );
             _connect( h );
         }
-        _connect( commaSeperated );
+        _connect( commaSeparated );
         uassert( 8004 ,  "SyncClusterConnection needs 3 servers" , _conns.size() == 3 );
     }
 
-    SyncClusterConnection::SyncClusterConnection( string a , string b , string c, double socketTimeout)  : _mutex("SyncClusterConnection"), _socketTimeout( socketTimeout ) {
+    SyncClusterConnection::SyncClusterConnection( const std::string& a , const std::string& b , const std::string& c, double socketTimeout)  : _mutex("SyncClusterConnection"), _txnNestLevel(0), _socketTimeout( socketTimeout ) {
         _address = a + "," + b + "," + c;
         // connect to all even if not working
         _connect( a );
@@ -62,7 +63,7 @@ namespace mongo {
         _connect( c );
     }
 
-    SyncClusterConnection::SyncClusterConnection( SyncClusterConnection& prev, double socketTimeout) : _mutex("SyncClusterConnection"), _socketTimeout( socketTimeout ) {
+    SyncClusterConnection::SyncClusterConnection( SyncClusterConnection& prev, double socketTimeout) : _mutex("SyncClusterConnection"), _txnNestLevel(0), _socketTimeout( socketTimeout ) {
         verify(0);
     }
 
@@ -70,6 +71,7 @@ namespace mongo {
         for ( size_t i=0; i<_conns.size(); i++ )
             delete _conns[i];
         _conns.clear();
+        verify(_txnNestLevel == 0);
     }
 
     bool SyncClusterConnection::prepare( string& errmsg ) {
@@ -154,7 +156,7 @@ namespace mongo {
         return DBClientBase::getLastErrorDetailed(db,fsync,j,w,wtimeout);
     }
 
-    void SyncClusterConnection::_connect( string host ) {
+    void SyncClusterConnection::_connect( const std::string& host ) {
         log() << "SyncClusterConnection connecting to [" << host << "]" << endl;
         DBClientConnection * c = new DBClientConnection( true );
         c->setSoTimeout( _socketTimeout );
@@ -175,9 +177,7 @@ namespace mongo {
         if ( ns.find( ".$cmd" ) != string::npos ) {
             string cmdName = query.obj.firstElementFieldName();
 
-            int lockType = _lockType( cmdName );
-
-            if ( lockType > 0 ) { // write $cmd
+            if (_requiresSync(cmdName)) { // write $cmd
                 string errmsg;
                 if ( ! prepare( errmsg ) )
                     throw UserException( 13104 , (string)"SyncClusterConnection::findOne prepare failed: " + errmsg );
@@ -191,8 +191,24 @@ namespace mongo {
                 
                 for ( size_t i=0; i<all.size(); i++ ) {
                     BSONObj temp = all[i];
-                    if ( isOk( temp ) )
-                        continue;
+                    if (isOk(temp)) {
+                        if (i == 0) {
+                            continue;
+                        }
+                        else {
+                            if (temp.equal(all[0])) {
+                                continue;
+                            }
+                            stringstream ss;
+                            ss << "write $cmd failed on a node: " << temp.jsonString()
+                               << " from " << _conns[i]->toString()
+                               << " differs from " << all[0].jsonString()
+                               << " from " << _conns[0]->toString()
+                               << " ns: " << ns
+                               << " cmd: " << query.toString();
+                            throw UserException(16780, ss.str());
+                        }
+                    }
                     stringstream ss;
                     ss << "write $cmd failed on a node: " << temp.jsonString();
                     ss << " " << _conns[i]->toString();
@@ -293,8 +309,8 @@ namespace mongo {
         _lastErrors.clear();
         if ( ns.find( ".$cmd" ) != string::npos ) {
             string cmdName = query.obj.firstElementFieldName();
-            int lockType = _lockType( cmdName );
-            uassert( 13054 , (string)"write $cmd not supported in SyncClusterConnection::query for:" + cmdName , lockType <= 0 );
+            uassert(16783, (string)"$cmd not supported in SyncClusterConnection::query during a multi-statement transaction for:" + cmdName, _txnNestLevel == 0);
+            uassert(13054, (string)"write $cmd not supported in SyncClusterConnection::query for:" + cmdName , !_requiresSync(cmdName));
         }
 
         return _queryOnActive( ns , query , nToReturn , nToSkip , fieldsToReturn , queryOptions , batchSize );
@@ -465,22 +481,53 @@ namespace mongo {
         verify(0);
     }
 
-    int SyncClusterConnection::_lockType( const string& name ) {
+    bool SyncClusterConnection::_requiresSync( const string& name ) {
+        if (_txnNestLevel > 0) {
+            // Force us to act in "write to all" mode if we're inside a multi-statement transaction.
+            return true;
+        }
         {
             scoped_lock lk(_mutex);
-            map<string,int>::iterator i = _lockTypes.find( name );
-            if ( i != _lockTypes.end() )
+            map<string,int>::iterator i = _syncRequiredMap.find( name );
+            if ( i != _syncRequiredMap.end() )
                 return i->second;
         }
 
         BSONObj info;
         uassert( 13053 , str::stream() << "help failed: " << info , _commandOnActive( "admin" , BSON( name << "1" << "help" << 1 ) , info ) );
 
-        int lockType = info["lockType"].numberInt();
+        bool requiresSync = info["requiresSync"].trueValue();
 
         scoped_lock lk(_mutex);
-        _lockTypes[name] = lockType;
-        return lockType;
+        _syncRequiredMap[name] = requiresSync;
+        return requiresSync;
+    }
+
+    bool SyncClusterConnection::beginTransaction(const string &isolation, BSONObj *res) {
+        _txnNestLevel++;
+        try {
+            return DBClientWithCommands::beginTransaction(isolation, res);
+        }
+        catch (DBException &e) {
+            _txnNestLevel--;
+            throw e;
+        }
+    }
+
+    bool SyncClusterConnection::commitTransaction(BSONObj *res) {
+        bool ok = DBClientWithCommands::commitTransaction(res);
+        if (ok) {
+            _txnNestLevel--;
+        }
+        return ok;
+    }
+
+    bool SyncClusterConnection::rollbackTransaction(BSONObj *res) {
+        bool ok = DBClientWithCommands::rollbackTransaction(res);
+        if (ok) {
+            _txnNestLevel--;
+        }
+        return ok;
     }
 
     void SyncClusterConnection::killCursor( long long cursorID ) {

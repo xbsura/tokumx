@@ -2,6 +2,7 @@
 
 /**
 *    Copyright (C) 2008 10gen Inc.
+*    Copyright (C) 2013 Tokutek Inc.
 *
 *    This program is free software: you can redistribute it and/or  modify
 *    it under the terms of the GNU Affero General Public License, version 3,
@@ -22,21 +23,19 @@
    mostly around shard management and checking
  */
 
-#include "pch.h"
+#include "mongo/pch.h"
+
 #include <map>
 #include <string>
 
-#include "../db/commands.h"
-#include "../db/jsobj.h"
-#include "../db/db.h"
-#include "../db/replutil.h"
-#include "../client/connpool.h"
-
-#include "../util/queue.h"
-
-#include "shard.h"
-#include "d_logic.h"
-#include "config.h"
+#include "mongo/client/connpool.h"
+#include "mongo/db/commands.h"
+#include "mongo/db/jsobj.h"
+#include "mongo/db/replutil.h"
+#include "mongo/s/shard.h"
+#include "mongo/s/d_logic.h"
+#include "mongo/s/config.h"
+#include "mongo/util/queue.h"
 #include "mongo/util/concurrency/mutex.h"
 #include "mongo/util/concurrency/ticketholder.h"
 
@@ -395,12 +394,12 @@ namespace mongo {
     public:
         MongodShardCommand( const char * n ) : Command( n ) {
         }
-        virtual bool slaveOk() const {
-            return false;
-        }
-        virtual bool adminOnly() const {
-            return true;
-        }
+        virtual bool slaveOk() const { return false; }
+        virtual bool adminOnly() const { return true; }
+        virtual bool requiresSync() const { return false; }
+        virtual bool canRunInMultiStmtTxn() const { return false; }
+        virtual bool needsTxn() const { return false; }
+        virtual int txnFlags() const { return noTxnFlags(); }
     };
 
 
@@ -601,7 +600,21 @@ namespace mongo {
             // this is because of a weird segfault I saw and I can't see why this should ever be set
             massert( 13647 , str::stream() << "context should be empty here, is: " << cc().getContext()->ns() , cc().getContext() == 0 ); 
         
-            Lock::GlobalWrite setShardVersionLock; // TODO: can we get rid of this??
+            struct SetShardVersionLock {
+                SetShardVersionLock() : _lk(new Lock::GlobalWrite()) { }
+                // Just yields the lock. Doesn't need to do anything with
+                // context because we asserted above that there is none.
+                struct temprelease {
+                    temprelease(SetShardVersionLock &lk) : _lk(lk._lk) {
+                        _lk.reset();
+                    };
+                    ~temprelease() {
+                        _lk.reset(new Lock::GlobalWrite());
+                    }
+                    scoped_ptr<Lock::GlobalWrite> &_lk;
+                };
+                scoped_ptr<Lock::GlobalWrite> _lk;
+            } setShardVersionLock; // TODO: can we get rid of this??
             
             if ( oldVersion.isSet() && ! globalVersion.isSet() ) {
                 // this had been reset
@@ -643,7 +656,7 @@ namespace mongo {
             // TODO: Refactor all of this
             if ( version < globalVersion && version.hasCompatibleEpoch( globalVersion ) ) {
                 while ( shardingState.inCriticalMigrateSection() ) {
-                    dbtemprelease r;
+                    SetShardVersionLock::temprelease temp(setShardVersionLock);
                     sleepmillis(20);
                     OCCASIONALLY log() << "waiting till out of critical section" << endl;
                 }
@@ -660,7 +673,7 @@ namespace mongo {
                 // should require a reload.
                 // TODO: Maybe a more elegant way of doing this
                 while ( shardingState.inCriticalMigrateSection() ) {
-                    dbtemprelease r;
+                    SetShardVersionLock::temprelease temp(setShardVersionLock);
                     sleepmillis(2);
                     OCCASIONALLY log() << "waiting till out of critical section for version reset" << endl;
                 }
@@ -674,7 +687,7 @@ namespace mongo {
 
             Timer relockTime;
             {
-                dbtemprelease unlock;
+                SetShardVersionLock::temprelease temp(setShardVersionLock);
 
                 ShardChunkVersion currVersion = version;
                 if ( ! shardingState.trySetVersion( ns , currVersion ) ) {

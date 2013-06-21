@@ -1,6 +1,7 @@
 // sniffer.cpp
 /*
  *    Copyright (C) 2010 10gen Inc.
+ *    Copyright (C) 2013 Tokutek Inc.
  *
  *    This program is free software: you can redistribute it and/or  modify
  *    it under the terms of the GNU Affero General Public License, version 3,
@@ -34,6 +35,7 @@
 #undef max
 #endif
 
+#include "mongo/base/initializer.h"
 #include "../bson/util/builder.h"
 #include "../util/net/message.h"
 #include "../db/dbmessage.h"
@@ -445,7 +447,8 @@ void usage() {
          << endl;
 }
 
-int main(int argc, char **argv) {
+int main(int argc, char **argv, char** envp) {
+    mongo::runGlobalInitializersOrDie(argc, argv, envp);
 
     stringstream nullStream;
     nullStream.clear(ios::failbit);

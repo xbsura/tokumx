@@ -1,5 +1,6 @@
 /**
  *    Copyright (C) 2008 10gen Inc.
+ *    Copyright (C) 2013 Tokutek Inc.
  *
  *    This program is free software: you can redistribute it and/or  modify
  *    it under the terms of the GNU Affero General Public License, version 3,
@@ -22,21 +23,34 @@
 
 namespace mongo {
 
-    Cursor *BasicCursor::make( NamespaceDetails *d, int direction ) {
+    const BSONObj &IndexScanCursor::startKey(const BSONObj &keyPattern, const int direction) {
+        // Scans intuitively start at minKey, but may need to be reversed to maxKey.
+        return reverseMinMaxBoundsOrder(Ordering::make(keyPattern), direction) ? maxKey : minKey;
+    }
+
+    const BSONObj &IndexScanCursor::endKey(const BSONObj &keyPattern, const int direction) {
+        // Scans intuitively end at maxKey, but may need to be reversed to minKey.
+        return reverseMinMaxBoundsOrder(Ordering::make(keyPattern), direction) ? minKey : maxKey;
+    }
+
+    IndexScanCursor::IndexScanCursor( NamespaceDetails *d, const IndexDetails &idx,
+                                      int direction, int numWanted ) :
+        IndexCursor( d, idx,
+                     startKey(idx.keyPattern(), direction),
+                     endKey(idx.keyPattern(), direction),
+                     true, direction, numWanted ) {
+    }
+
+    shared_ptr<Cursor> BasicCursor::make( NamespaceDetails *d, int direction ) {
         if ( d != NULL ) {
-            return new BasicCursor(d, direction);
+            return shared_ptr<Cursor>(new BasicCursor(d, direction));
         } else {
-            return new DummyCursor(direction);
+            return shared_ptr<Cursor>(new DummyCursor(direction));
         }
     }
 
     BasicCursor::BasicCursor( NamespaceDetails *d, int direction ) :
-        _c( d, d->getPKIndex(),
-            direction > 0 ? minKey : maxKey, // start at the beginning for forward cursor
-            direction > 0 ? maxKey : minKey, // finish at the end for forward cursor
-            true, // end key is inclusive, because we want to scan everything.
-            direction ),
-        _direction(direction) {
+        IndexScanCursor( d, d->getPKIndex(), direction ) {
     }
 
 } // namespace mongo

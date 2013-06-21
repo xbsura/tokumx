@@ -15,21 +15,20 @@
 *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 
-#include "pch.h"
-#include "../commands.h"
-#include "../instance.h"
-#include "../../scripting/engine.h"
-#include "../clientcursor.h"
+#include "mongo/pch.h"
+#include "mongo/db/commands.h"
+#include "mongo/db/instance.h"
+#include "mongo/db/namespace_details.h"
+#include "mongo/db/clientcursor.h"
+#include "mongo/scripting/engine.h"
 
 namespace mongo {
 
-    class GroupCommand : public Command {
-    public:
-        GroupCommand() : Command("group") {}
-        virtual LockType locktype() const { return READ; }
+    class GroupCommand : public QueryCommand {
+      public:
+        GroupCommand() : QueryCommand("group") {}
         virtual bool slaveOk() const { return false; }
         virtual bool slaveOverrideOk() const { return true; }
-        virtual bool canRunInMultiStmtTxn() const { return true; }
         virtual void help( stringstream &help ) const {
             help << "http://dochub.mongodb.org/core/aggregation";
         }
@@ -48,11 +47,17 @@ namespace mongo {
             return obj.extractFields( keyPattern , true ).getOwned();
         }
 
-        bool group( string realdbname , const string& ns , const BSONObj& query ,
-                    BSONObj keyPattern , string keyFunctionCode , string reduceCode , const char * reduceScope ,
-                    BSONObj initial , string finalize ,
-                    string& errmsg , BSONObjBuilder& result ) {
-
+        bool group( const std::string& realdbname,
+                    const std::string& ns,
+                    const BSONObj& query,
+                    BSONObj keyPattern,
+                    const std::string& keyFunctionCode,
+                    const std::string& reduceCode,
+                    const char * reduceScope,
+                    BSONObj initial,
+                    const std::string& finalize,
+                    string& errmsg,
+                    BSONObjBuilder& result ) {
 
             auto_ptr<Scope> s = globalScriptEngine->getPooledScope( realdbname );
             s->localConnect( realdbname.c_str() );

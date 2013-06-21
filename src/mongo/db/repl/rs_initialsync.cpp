@@ -1,5 +1,6 @@
 /**
 *    Copyright (C) 2008 10gen Inc.
+*    Copyright (C) 2013 Tokutek Inc.
 *
 *    This program is free software: you can redistribute it and/or  modify
 *    it under the terms of the GNU Affero General Public License, version 3,
@@ -14,21 +15,23 @@
 *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 
-#include "pch.h"
+#include "mongo/pch.h"
 
-#include "mongo/db/repl/rs.h"
-
+#include "mongo/client/remote_transaction.h"
 #include "mongo/db/client.h"
-#include "mongo/db/dbhelpers.h"
-#include "mongo/db/oplog.h"
-#include "mongo/db/oplogreader.h"
-#include "mongo/db/repl.h"
-#include "mongo/db/repl/bgsync.h"
-#include "mongo/db/repl/rs_optime.h"
-#include "mongo/db/repl/rs_sync.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/db/cursor.h"
 #include "mongo/db/instance.h"
 #include "mongo/db/jsobjmanipulator.h"
+#include "mongo/db/oplog.h"
+#include "mongo/db/oplogreader.h"
+#include "mongo/db/namespace_details.h"
+#include "mongo/db/repl.h"
+#include "mongo/db/repl/bgsync.h"
+#include "mongo/db/repl/rs.h"
+#include "mongo/db/repl/rs_optime.h"
+#include "mongo/db/repl/rs_sync.h"
+#include "mongo/db/storage/env.h"
+#include "mongo/util/mongoutils/str.h"
 
 namespace mongo {
 
@@ -36,14 +39,11 @@ namespace mongo {
     using namespace bson;
 
     static void dropAllDatabasesExceptLocal() {
-        Lock::GlobalWrite lk;
-
         vector<string> n;
         getDatabaseNames(n);
-        if( n.size() == 0 ) return;
-        log() << "dropAllDatabasesExceptLocal " << n.size() << endl;
-        for( vector<string>::iterator i = n.begin(); i != n.end(); i++ ) {
-            if( *i != "local" ) {
+        LOG(0) << "dropAllDatabasesExceptLocal " << n.size() << endl;
+        for (vector<string>::const_iterator i = n.begin(); i != n.end(); i++) {
+            if (*i != "local") {
                 Client::Context ctx(*i);
                 dropDatabase(*i);
             }
@@ -83,8 +83,9 @@ namespace mongo {
     /* todo : progress metering to sethbmsg. */
     static bool clone(
         const char *master, 
-        string db,
-        shared_ptr<DBClientConnection> conn
+        const std::string& db,
+        shared_ptr<DBClientConnection> conn,
+        bool syncIndexes
         ) 
     {
         CloneOptions options;
@@ -94,11 +95,10 @@ namespace mongo {
         options.logForRepl = false;
         options.slaveOk = true;
         options.useReplAuth = true;
-        options.mayYield = true;
         options.mayBeInterrupted = false;
         
         options.syncData = true;
-        options.syncIndexes = true;
+        options.syncIndexes = syncIndexes;
 
         string err;
         return cloneFrom(master, options, conn, err);
@@ -111,18 +111,18 @@ namespace mongo {
         shared_ptr<DBClientConnection> conn
         ) 
     {
-        for( list<string>::const_iterator i = dbs.begin(); i != dbs.end(); i++ ) {
+        verify(Lock::isW());
+        for (list<string>::const_iterator i = dbs.begin(); i != dbs.end(); i++) {
             string db = *i;
-            if( db == "local" ) 
+            if (db == "local") {
                 continue;
+            }
             
-            sethbmsg( str::stream() << "initial sync cloning db: " << db , 0);
+            sethbmsg(str::stream() << "initial sync cloning db: " << db, 0);
 
-            Client::WriteContext ctx(db);
-            if ( ! clone( master, db,  conn) ) {
-                sethbmsg( str::stream() 
-                              << "initial sync error clone of " << db 
-                              << " failed sleeping 5 minutes" ,0);
+            Client::Context ctx(db);
+            if (!clone(master, db, conn, _buildIndexes)) {
+                sethbmsg(str::stream() << "initial sync error clone of " << db << " failed sleeping 5 minutes", 0);
                 return false;
             }
         }
@@ -270,16 +270,17 @@ namespace mongo {
     void ReplSetImpl::_fillGaps(OplogReader* r) {
         Client::ReadContext ctx(rsoplog);
         Client::Transaction catchupTransaction(0);
+        NamespaceDetails *d = nsdetails(rsReplInfo);
         
         // now we should have replInfo on this machine,
         // let's query the minLiveGTID to figure out from where
         // we should copy the opLog
         BSONObj result;
-        bool foundMinLive = Helpers::findOne(
-            rsReplInfo, 
-            BSON( "_id" << "minLive" ), 
-            result
-            );
+        const bool foundMinLive = d != NULL &&
+            d->findOne(
+               BSON( "_id" << "minLive" ),
+               result
+               );
         verify(foundMinLive);
         GTID minLiveGTID;
         minLiveGTID = getGTIDFromBSON("GTID", result);
@@ -302,7 +303,12 @@ namespace mongo {
                 }
                 BSONObj op = r->nextSafe().getOwned();
                 currEntry = getGTIDFromOplogEntry(op);
-                replicateTransactionToOplogToFillGap(op);
+                // try inserting it into the oplog, if it does not
+                // already exist
+                if (!gtidExistsInOplog(currEntry)) {
+                    bool bigTxn;
+                    replicateFullTransactionToOplog(op, *r, &bigTxn);
+                }
             }
         }
         catchupTransaction.commit(0);
@@ -314,15 +320,17 @@ namespace mongo {
             // accumulate a list of transactions that are unapplied
             Client::ReadContext ctx(rsoplog);
             Client::Transaction catchupTransaction(0);        
+            NamespaceDetails *d = nsdetails(rsReplInfo);
+
             // now we should have replInfo on this machine,
             // let's query the minUnappliedGTID to figure out from where
             // we should copy the opLog
             BSONObj result;
-            bool foundMinUnapplied = Helpers::findOne(
-                rsReplInfo, 
-                BSON( "_id" << "minUnapplied" ), 
-                result
-                );
+            const bool foundMinUnapplied = d != NULL &&
+                d->findOne(
+                   BSON( "_id" << "minUnapplied" ), 
+                   result
+                   );
             verify(foundMinUnapplied);
             GTID minUnappliedGTID;
             minUnappliedGTID = getGTIDFromBSON("GTID", result);
@@ -346,7 +354,7 @@ namespace mongo {
                         BSONObj curr = c->current();                    
                         bool transactionAlreadyApplied = curr["a"].Bool();
                         if (!transactionAlreadyApplied) {
-                            unappliedTransactions.push_back(curr);
+                            unappliedTransactions.push_back(curr.getOwned());
                         }
                     }
                     c->advance();
@@ -404,91 +412,99 @@ namespace mongo {
                 return false;
             }
 
-            sethbmsg("initial sync drop all databases", 0);
-            dropAllDatabasesExceptLocal();
+            {
+                Lock::GlobalWrite lk;
+                Client::Transaction dropTransaction(DB_SERIALIZABLE);
+                sethbmsg("initial sync drop all databases", 0);
+                dropAllDatabasesExceptLocal();
+                dropTransaction.commit();
+            }
 
             // now deal with creation of oplog
             // first delete any existing data in the oplog
-            Client::Transaction fileOpsTransaction(DB_SERIALIZABLE);
-            deleteOplogFiles();
-            // now recreate the oplog
-            createOplog();
-            openOplogFiles();
-            fileOpsTransaction.commit(0);
 
-            sethbmsg("initial sync clone all databases", 0);
+            {
+                Lock::DBWrite lk("local");
+                Client::Transaction fileOpsTransaction(DB_SERIALIZABLE);
+                deleteOplogFiles();
+                // now recreate the oplog
+                createOplog();
+                openOplogFiles();
+                fileOpsTransaction.commit(0);
+            }
+
+            try {
+                sethbmsg("initial sync clone all databases", 0);
             
-            BSONObj beginCommand = BSON( 
-                "beginTransaction" << 1 << 
-                "isolation" << "mvcc"
-                );
-            BSONObj commandRet;
-            if( !r.conn()->runCommand("local", beginCommand, commandRet)) {
-                sethbmsg("failed to begin transaction for copying data", 0);
+                shared_ptr<DBClientConnection> conn(r.conn_shared());
+                RemoteTransaction rtxn(*conn, "mvcc");
+
+                list<string> dbs = conn->getDatabaseNames();
+
+                //
+                // Not sure if it is necessary to have a separate fileOps 
+                // transaction and clone transaction. The cloneTransaction
+                // has a higher chance of failing, and I don't know at the moment
+                // if it is ok to do fileops successfully, and then an operation (cloning) that
+                // later causes an abort. So, to be cautious, they are separate
+
+                {
+                    Lock::GlobalWrite lk;
+                    Client::Transaction cloneTransaction(DB_SERIALIZABLE);
+                    bool ret = _syncDoInitialSync_clone(sourceHostname.c_str(), dbs, conn);
+
+                    if (!ret) {
+                        veto(source->fullName(), 600);
+                        sleepsecs(300);
+                        return false;
+                    }
+
+                    // at this point, we have copied all of the data from the 
+                    // remote machine. Now we need to copy the replication information
+                    // on the remote machine's local database, we need to copy
+                    // the entire (small) replInfo dictionary, and the necessary portion
+                    // of the oplog
+
+                    // first copy the replInfo, as we will use its information
+                    // to determine  how much of the opLog to copy
+                    BSONObj q;
+                    cloneCollectionData(conn,
+                                        rsReplInfo,
+                                        q,
+                                        true, //copyIndexes
+                                        false //logForRepl
+                                        );
+
+                    // copy entire oplog (probably overkill)
+                    cloneCollectionData(conn,
+                                        rsoplog,
+                                        q,
+                                        true, //copyIndexes
+                                        false //logForRepl
+                                        );
+
+                    // copy entire oplog.refs (probably overkill)
+                    cloneCollectionData(conn,
+                                        rsOplogRefs,
+                                        q,
+                                        true, //copyIndexes
+                                        false //logForRepl
+                                        );
+                    cloneTransaction.commit(0);
+                }
+
+                bool ok = rtxn.commit();
+                verify(ok);  // absolutely no reason this should fail, it was read only
+                // data should now be consistent
+            }
+            catch (DBException &e) {
+                sethbmsg("exception trying to copy data", 0);
                 sleepsecs(1);
                 return false;
             }
-
-            list<string> dbs = r.conn()->getDatabaseNames();
-
-            //
-            // Not sure if it is necessary to have a separate fileOps 
-            // transaction and clone transaction. The cloneTransaction
-            // has a higher chance of failing, and I don't know at the moment
-            // if it is ok to do fileops successfully, and then an operation (cloning) that
-            // later causes an abort. So, to be cautious, they are separate
-            Client::Transaction cloneTransaction(DB_SERIALIZABLE);
-            bool ret = _syncDoInitialSync_clone(
-                sourceHostname.c_str(), 
-                dbs, 
-                r.conn_shared()
-                );
-
-            if (!ret) {
-                veto(source->fullName(), 600);
-                sleepsecs(300);
-                return false;
-            }
-
-            // at this point, we have copied all of the data from the 
-            // remote machine. Now we need to copy the replication information
-            // on the remote machine's local database, we need to copy
-            // the entire (small) replInfo dictionary, and the necessary portion
-            // of the oplog
-            {                
-                Client::WriteContext ctx(rsoplog);
-                // first copy the replInfo, as we will use its information
-                // to determine  how much of the opLog to copy
-                BSONObj q;
-                cloneCollectionData(
-                    r.conn_shared(),
-                    rsReplInfo,
-                    q,
-                    true, //copyIndexes
-                    false //logForRepl
-                    );
-
-                // copy entire oplog (probably overkill)
-                cloneCollectionData(
-                    r.conn_shared(),
-                    rsoplog,
-                    q,
-                    true, //copyIndexes
-                    false //logForRepl
-                    );
-            }
-            cloneTransaction.commit(0);
-
-            BSONObj commitCommand = BSON("commitTransaction" << 1);
-            if (!r.conn()->runCommand("local", commitCommand, commandRet)) {
-                sethbmsg("failed to commit transaction for copying data", 0);
-                sleepsecs(1);
-                return false;
-            }
-            // data should now be consistent
-
         }
         else {
+            Lock::DBWrite lk("local");
             openOplogFiles();
         }
         if (needGapsFilled) {

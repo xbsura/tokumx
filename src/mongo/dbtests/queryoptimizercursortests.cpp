@@ -3,6 +3,7 @@
 
 /**
  *    Copyright (C) 2009 10gen Inc.
+ *    Copyright (C) 2013 Tokutek Inc.
  *
  *    This program is free software: you can redistribute it and/or  modify
  *    it under the terms of the GNU Affero General Public License, version 3,
@@ -24,11 +25,11 @@
 #include "mongo/db/queryoptimizer.h"
 #include "mongo/db/instance.h"
 #include "mongo/db/clientcursor.h"
+#include "mongo/db/ops/insert.h"
 #include "mongo/db/json.h"
 #include "mongo/dbtests/dbtests.h"
 
 namespace mongo {
-    void __forceLinkGeoPlugin();
     shared_ptr<Cursor> newQueryOptimizerCursor( const char *ns, const BSONObj &query,
                                                const BSONObj &order = BSONObj(),
                                                const QueryPlanSelectionPolicy &planPolicy =
@@ -45,9 +46,37 @@ namespace QueryOptimizerCursorTests {
         BSONObjBuilder result;
         dropCollection( ns, errmsg, result );
     }
+
+    void ensureIndex(const char *ns, BSONObj keyPattern, bool unique, const char *name) {
+        NamespaceDetails *d = nsdetails(ns);
+        if( d == 0 )
+            return;
+
+        {
+            NamespaceDetails::IndexIterator i = d->ii();
+            while( i.more() ) {
+                if( i.next().keyPattern().woCompare(keyPattern) == 0 )
+                    return;
+            }
+        }
+
+        if( d->nIndexes() >= NamespaceDetails::NIndexesMax ) {
+            problem() << "Helper::ensureIndex fails, MaxIndexes exceeded " << ns << '\n';
+            return;
+        }
+
+        string system_indexes = cc().database()->name() + ".system.indexes";
+
+        BSONObjBuilder b;
+        b.append("name", name);
+        b.append("ns", ns);
+        b.append("key", keyPattern);
+        b.appendBool("unique", unique);
+        BSONObj o = b.done();
+
+        insertObject(system_indexes.c_str(), o, 0, true);
+    }
         
-    using boost::shared_ptr;
-    
     namespace CachedMatchCounter {
         
         using mongo::CachedMatchCounter;
@@ -1002,7 +1031,7 @@ namespace QueryOptimizerCursorTests {
             _cli.ensureIndex( ns(), BSON( "a" << 1 << "b" << 1 ) );
             
             {
-                // Create a btree cursor on an optimal a:1,b:1 plan.
+                // Create an index cursor on an optimal a:1,b:1 plan.
                 Client::Transaction transaction(DB_TXN_SNAPSHOT | DB_TXN_READ_ONLY);
                 Client::ReadContext ctx( ns() );
                 shared_ptr<Cursor> cursor = getCursor();
@@ -1582,7 +1611,7 @@ namespace QueryOptimizerCursorTests {
                 if ( c->indexKeyPattern() == BSON( "a" << 1 ) ) {
                     foundA = true;
                     ASSERT( c->keyFieldsOnly() );
-                    ASSERT_EQUALS( BSON( "a" << 1 ), c->keyFieldsOnly()->hydrate( c->currKey() ) );
+                    ASSERT_EQUALS( BSON( "a" << 1 ), c->keyFieldsOnly()->hydrate( c->currKey(), c->currPK() ) );
                 }
                 if ( c->indexKeyPattern() == BSON( "b" << 1 ) ) {
                     foundB = true;
@@ -1620,8 +1649,8 @@ namespace QueryOptimizerCursorTests {
                 if ( c->indexKeyPattern() == BSON( "a" << 1 ) ) {
                     foundA = true;
                     ASSERT( c->keyFieldsOnly() );
-                    ASSERT( BSON( "a" << 1 ) == c->keyFieldsOnly()->hydrate( c->currKey() ) ||
-                           BSON( "a" << 2 ) == c->keyFieldsOnly()->hydrate( c->currKey() ) );
+                    ASSERT( BSON( "a" << 1 ) == c->keyFieldsOnly()->hydrate( c->currKey(), c->currPK() ) ||
+                           BSON( "a" << 2 ) == c->keyFieldsOnly()->hydrate( c->currKey(), c->currPK() ) );
                 }
                 if ( c->indexKeyPattern() == BSON( "b" << 1 ) ) {
                     foundB = true;
@@ -1686,7 +1715,7 @@ namespace QueryOptimizerCursorTests {
                 // Best plan selected by query.
                 nPlans( 1 );
                 nPlans( 1 );
-                Helpers::ensureIndex( ns(), BSON( "c" << 1 ), false, "c_1" );
+                ensureIndex( ns(), BSON( "c" << 1 ), false, "c_1" );
                 // Best plan cleared when new index added.
                 nPlans( 3 );
                 runQuery();
@@ -2787,45 +2816,6 @@ namespace QueryOptimizerCursorTests {
 
         } // namespace IdElseNatural
         
-        /**
-         * Generating a cursor for an invalid query asserts, even if the collection is empty or
-         * missing.
-         */
-        class MatcherValidation : public Base {
-        public:
-            void run() {
-                // Matcher validation with an empty collection.
-                _cli.remove( ns(), BSONObj() );
-                // The historical behavior has been to generate a MsgAssertionException for the
-                // multiple cursors case, but it should be a UserException.
-                checkInvalidQueryAssertions<MsgAssertionException>();
-                
-                // Matcher validation with a missing collection.
-                _cli.dropCollection( ns() );
-                checkInvalidQueryAssertions<UserException>();
-            }
-        private:
-            template<class MultipleCursorException>
-            static void checkInvalidQueryAssertions() {
-                Client::Transaction transaction(DB_TXN_SNAPSHOT | DB_TXN_READ_ONLY);
-                Client::ReadContext ctx( ns() );
-                
-                // An invalid query generaing a single query plan asserts.
-                BSONObj invalidQuery = fromjson( "{$and:[{$atomic:true}]}" );
-                assertInvalidQueryAssertion<UserException>( invalidQuery );
-                
-                // An invalid query generating multiple query plans asserts.
-                BSONObj invalidIdQuery = fromjson( "{_id:0,$and:[{$atomic:true}]}" );
-                assertInvalidQueryAssertion<MultipleCursorException>( invalidIdQuery );                
-                transaction.commit();
-            }
-            template<class Exception>
-            static void assertInvalidQueryAssertion( const BSONObj &query ) {
-                ASSERT_THROWS( NamespaceDetailsTransient::getCursor( ns(), query, BSONObj() ),
-                              Exception );
-            }
-        };
-        
     } // namespace GetCursor
     
     namespace Explain {
@@ -3457,8 +3447,9 @@ namespace QueryOptimizerCursorTests {
             add<GetCursor::SimpleId>();
             add<GetCursor::OptimalIndex>();
             add<GetCursor::SimpleKeyMatch>();
-            add<GetCursor::Geo>();
-            add<GetCursor::GeoNumWanted>();
+            // TokuMX: no geo
+            //add<GetCursor::Geo>();
+            //add<GetCursor::GeoNumWanted>();
             add<GetCursor::PreventOutOfOrderPlan>();
             add<GetCursor::AllowOutOfOrderPlan>();
             add<GetCursor::BestSavedOutOfOrder>();
@@ -3487,7 +3478,8 @@ namespace QueryOptimizerCursorTests {
             //add<GetCursor::IdElseNatural::HintedNaturalForQuery>( BSON( "_id" << 1 ) );
             //add<GetCursor::IdElseNatural::HintedNaturalForQuery>( BSON( "a" << 1 ) );
             //add<GetCursor::IdElseNatural::HintedNaturalForQuery>( BSON( "_id" << 1 << "a" << 1 ) );
-            add<GetCursor::MatcherValidation>();
+            // There's no more $atomic operator, so this test isn't useful anymore.
+            //add<GetCursor::MatcherValidation>(); 
             add<Explain::ClearRecordedIndex>();
             add<Explain::Initial>();
             add<Explain::Empty>();

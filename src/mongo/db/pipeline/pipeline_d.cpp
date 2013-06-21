@@ -1,5 +1,6 @@
 /**
  * Copyright (c) 2012 10gen Inc.
+ * Copyright (C) 2013 Tokutek Inc.
  *
  * This program is free software: you can redistribute it and/or  modify
  * it under the terms of the GNU Affero General Public License, version 3,
@@ -14,13 +15,13 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#include "pch.h"
-#include "db/pipeline/pipeline.h"
-#include "db/pipeline/pipeline_d.h"
-
-#include "db/cursor.h"
-#include "db/queryutil.h"
-#include "db/pipeline/document_source.h"
+#include "mongo/pch.h"
+#include "mongo/db/pipeline/pipeline.h"
+#include "mongo/db/pipeline/pipeline_d.h"
+#include "mongo/db/cursor.h"
+#include "mongo/db/queryutil.h"
+#include "mongo/db/namespace_details.h"
+#include "mongo/db/pipeline/document_source.h"
 #include "mongo/client/dbclientinterface.h"
 
 

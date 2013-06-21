@@ -1,6 +1,7 @@
 // @file log.h
 
 /*    Copyright 2009 10gen Inc.
+ *    Copyright (C) 2013 Tokutek Inc.
  *
  *    Licensed under the Apache License, Version 2.0 (the "License");
  *    you may not use this file except in compliance with the License.
@@ -26,6 +27,7 @@
 #include <boost/thread/tss.hpp>
 
 #include "mongo/bson/util/builder.h"
+#include "mongo/util/allocator.h"
 #include "mongo/util/concurrency/mutex.h"
 #include "mongo/util/debug_util.h"
 #include "mongo/util/exit_code.h"
@@ -95,7 +97,7 @@ namespace mongo {
             return LabeledLevel( _label + string("::") + label, _level );
         }
 
-        LabeledLevel operator+( string& label ) const {
+        LabeledLevel operator+( const std::string& label ) const {
             return LabeledLevel( _label + string("::") + label, _level );
         }
 
@@ -289,7 +291,7 @@ namespace mongo {
         /** note these are virtual */
         Logstream& operator<<(const char *x) { ss << x; return *this; }
         Logstream& operator<<(const string& x) { ss << x; return *this; }
-        Logstream& operator<<(const StringData& x) { ss << x.data(); return *this; }
+        Logstream& operator<<(const StringData& x) { ss << x; return *this; }
         Logstream& operator<<(char *x)       { ss << x; return *this; }
         Logstream& operator<<(char x)        { ss << x; return *this; }
         Logstream& operator<<(int x)         { ss << x; return *this; }
@@ -425,7 +427,7 @@ namespace mongo {
     }
 
     inline Nullstream &tokulog(int level=0) {
-        return tlog(LabeledLevel("tokudb", level));
+        return tlog(LabeledLevel("tokumx", level));
     }
 
     inline Nullstream& error() {

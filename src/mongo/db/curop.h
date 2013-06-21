@@ -2,6 +2,7 @@
 
 /*
  *    Copyright (C) 2010 10gen Inc.
+ *    Copyright (C) 2013 Tokutek Inc.
  *
  *    This program is free software: you can redistribute it and/or  modify
  *    it under the terms of the GNU Affero General Public License, version 3,
@@ -19,13 +20,12 @@
 
 #pragma once
 
-#include "namespace.h"
-#include "client.h"
-#include "../bson/util/atomic_int.h"
-#include "../util/concurrency/spin_lock.h"
-#include "../util/time_support.h"
-#include "../util/net/hostandport.h"
-#include "../util/progress_meter.h"
+#include "mongo/db/client.h"
+#include "mongo/bson/util/atomic_int.h"
+#include "mongo/util/concurrency/spin_lock.h"
+#include "mongo/util/time_support.h"
+#include "mongo/util/net/hostandport.h"
+#include "mongo/util/progress_meter.h"
 
 namespace mongo {
 
@@ -37,6 +37,8 @@ namespace mongo {
         OpDebug() : ns(""){ reset(); }
 
         void reset();
+        // if returns true, then don't log info
+        bool vetoLog( const CurOp& curop ) const;
         
         string report( const CurOp& curop ) const;
         void append( const CurOp& curop, BSONObjBuilder& b ) const;
@@ -48,7 +50,7 @@ namespace mongo {
         // basic options
         int op;
         bool iscommand;
-        Namespace ns;
+        string ns;
         BSONObj query;
         BSONObj updateobj;
         
@@ -164,7 +166,7 @@ namespace mongo {
         void markCommand() { _command = true; }
         OpDebug& debug()           { return _debug; }
         int profileLevel() const   { return _dbprofile; }
-        const char * getNS() const { return _ns; }
+        const char * getNS() const { return _ns.c_str(); }
 
         bool shouldDBProfile( int ms ) const {
             if ( _dbprofile <= 0 )
@@ -233,7 +235,7 @@ namespace mongo {
         bool _command;
         int _dbprofile;                  // 0=off, 1=slow, 2=all
         AtomicUInt _opNum;               // todo: simple being "unsigned" may make more sense here
-        char _ns[Namespace::MaxNsLen+2];
+        string _ns;
         HostAndPort _remote;             // CAREFUL here with thread safety
         CachedBSONObj _query;            // CachedBSONObj is thread safe
         OpDebug _debug;
@@ -267,13 +269,56 @@ namespace mongo {
          * @param heedMutex if true and have a write lock, won't kill op since it might be unsafe
          */
         void checkForInterrupt( bool heedMutex = true );
+        void checkForInterrupt( Client &c );
 
         /** @return "" if not interrupted.  otherwise, you should stop. */
         const char *checkForInterruptNoAssert();
 
+        // increments _killForTransition, thereby making
+        // checkForInterrupt uassert and kill operations
+        void killForTransition() {
+            boost::unique_lock<boost::mutex> lock(_transitionLock);
+            dassert(_killForTransition >= 0);
+            _killForTransition++;
+        }
+        // decrements _killForTransition, thereby reallowing
+        // operations to complete successfully
+        void transitionComplete() {
+            boost::unique_lock<boost::mutex> lock(_transitionLock);
+            dassert(_killForTransition >= 0);
+            _killForTransition--;
+        }
+
     private:
         void interruptJs( AtomicUInt *op );
+        void _checkForInterrupt( Client &c, bool heedMutex );
         volatile bool _globalKill;
+        // number of threads that want operations killed
+        // because there will be a state transition
+        volatile uint32_t _killForTransition;
+        // protects _killForTransition variable
+        boost::mutex _transitionLock;
     } killCurrentOp;
+
+    class NoteStateTransition {
+        bool _noted;
+        public:
+            NoteStateTransition() {
+                killCurrentOp.killForTransition();
+                _noted = true;
+            }
+            ~NoteStateTransition() {
+                if (_noted) {
+                    killCurrentOp.transitionComplete();
+                }
+                _noted = false;
+            }
+            void noteTransitionComplete() {
+                verify(_noted);
+                killCurrentOp.transitionComplete();
+                _noted = false;
+            }
+            
+    };
 
 }

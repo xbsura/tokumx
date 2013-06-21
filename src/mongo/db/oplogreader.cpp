@@ -1,24 +1,26 @@
 /** @file oplogreader.cpp */
 #include "pch.h"
 
-
+#include "pcrecpp.h"
 #include <boost/thread/thread.hpp>
 
-#include "jsobj.h"
-#include "repl.h"
-#include "../util/net/message.h"
-#include "../util/background.h"
-#include "../client/connpool.h"
-#include "db.h"
-#include "commands.h"
-#include "security.h"
-#include "repl/rs.h"
-#include "repl/connections.h"
-#include "pcrecpp.h"
+#include "mongo/db/jsobj.h"
+#include "mongo/db/repl.h"
+#include "mongo/util/net/message.h"
+#include "mongo/util/background.h"
+#include "mongo/client/connpool.h"
+#include "mongo/db/commands.h"
+#include "mongo/db/security.h"
+#include "mongo/db/repl/rs.h"
+#include "mongo/db/repl/connections.h"
 #include "mongo/db/instance.h"
+#include "mongo/db/namespace_details.h"
 #include "mongo/db/queryutil.h"
+#include "mongo/db/relock.h"
 
 namespace mongo {
+    const BSONObj reverseNaturalObj = BSON( "$natural" << -1 );
+
     BSONObj userReplQuery = fromjson("{\"user\":\"repl\"}");
 
     // copied (only the) comment from mongodb 2.6
@@ -47,11 +49,12 @@ namespace mongo {
         else {
             BSONObj user;
             {
-                Lock::GlobalWrite lk;
-                Client::Context ctxt("local.");
-                if( !Helpers::findOne("local.system.users", userReplQuery, user) ||
-                        // try the first user in local
-                        !Helpers::getSingleton("local.system.users", user) ) {
+                const char *ns = "local.system.users";
+                Client::ReadContext ctx(ns);
+                NamespaceDetails *d = nsdetails(ns);
+                if( d == NULL || !d->findOne(userReplQuery, user) ||
+                                 // try the first user in local
+                                 !d->findOne(BSONObj(), user) ) {
                     log() << "replauthenticate: no user in local.system.users to use for authentication\n";
                     return false;
                 }
@@ -74,31 +77,39 @@ namespace mongo {
         return true;
     }
 
-    bool replHandshake(DBClientConnection *conn) {
+    void getMe(BSONObj& me) {
         string myname = getHostName();
-
-        BSONObj me;
-
-        {
-            // TODO: (Zardosht) figure out if this local.me stuff is needed
-            Lock::DBWrite l("local");
-            Client::Transaction transaction(0);            
-            // local.me is an identifier for a server for getLastError w:2+
-            if ( ! Helpers::getSingleton( "local.me" , me ) ||
-                 ! me.hasField("host") ||
-                 me["host"].String() != myname ) {
-
-                // clean out local.me
-                Helpers::emptyCollection("local.me");
-
-                // repopulate
-                BSONObjBuilder b;
-                b.appendOID( "_id" , 0 , true );
-                b.append( "host", myname );
-                me = b.obj();
-                Helpers::putSingleton( "local.me" , me );
+        Client::Transaction transaction(0);            
+        NamespaceDetails *d = nsdetails("local.me");
+        // local.me is an identifier for a server for getLastError w:2+
+        if ( d == NULL || !d->findOne( BSONObj(), me ) ||
+                          !me.hasField("host") ||
+             me["host"].String() != myname ) {
+        
+            // clean out local.me
+            if (d != NULL) {
+                d->empty();
             }
-            transaction.commit(0);
+        
+            // repopulate
+            BSONObjBuilder b;
+            b.appendOID( "_id" , 0 , true );
+            b.append( "host", myname );
+            me = b.obj();
+            Helpers::putSingleton( "local.me" , me );
+        }
+        transaction.commit(0);
+    }
+
+    bool replHandshake(DBClientConnection *conn) {
+        BSONObj me;
+        try {
+            Client::ReadContext ctx("local");
+            getMe(me);
+        }
+        catch (RetryWithWriteLock &e) {
+            Client::WriteContext ctx("local");
+            getMe(me);
         }
 
         BSONObjBuilder cmd;
@@ -138,7 +149,7 @@ namespace mongo {
         return true;
     }
     
-    bool OplogReader::connect(string hostName) {
+    bool OplogReader::connect(const std::string& hostName) {
         if (conn() != 0) {
             return true;
         }
@@ -175,7 +186,7 @@ namespace mongo {
         return conn()->runCommand( "admin" , cmd.obj() , res );
     }
 
-    void OplogReader::tailingQuery(const char *ns, const BSONObj& query, const BSONObj* fields ) {
+    void OplogReader::tailingQuery(const char *ns, Query& query, const BSONObj* fields ) {
         verify( !haveCursor() );
         LOG(2) << "repl: " << ns << ".find(" << query.toString() << ')' << endl;
         cursor.reset( _conn->query( ns, query, 0, 0, fields, _tailingQueryOptions ).release() );
@@ -186,6 +197,37 @@ namespace mongo {
         addGTIDToBSON("$gte", gtid, q);
         BSONObjBuilder query;
         query.append("_id", q.done());
-        tailingQuery(ns, query.done(), fields);
+        tailingQuery(ns, Query(query.done()).hint(BSON("_id" << 1)), fields);
+    }
+
+    shared_ptr<DBClientCursor> OplogReader::getRollbackCursor(GTID lastGTID) {
+        shared_ptr<DBClientCursor> retCursor;
+        BSONObjBuilder q;
+        addGTIDToBSON("$lte", lastGTID, q);
+        BSONObjBuilder query;
+        query.append("_id", q.done());
+        retCursor.reset(
+            _conn->query(rsoplog, Query(query.done()).sort(reverseNaturalObj), 0, 0, NULL, QueryOption_SlaveOk).release()
+            );
+        return retCursor;
+    }
+
+    bool OplogReader::propogateSlaveLocation(GTID lastGTID){
+        BSONObjBuilder cmd;
+        cmd.append("updateSlave", 1);
+        addGTIDToBSON("gtid", lastGTID, cmd);
+        BSONObj ret;
+        return _conn->runCommand(
+            "local",
+            cmd.done(),
+            ret
+            );
+    }
+
+    shared_ptr<DBClientCursor> OplogReader::getOplogRefsCursor(OID &oid) {
+        shared_ptr<DBClientCursor> retCursor;
+        // this maps to {_id : {$gt : { oid : oid , seq : 0 }}}
+        retCursor.reset(_conn->query(rsOplogRefs, QUERY("_id" << BSON("$gt" << BSON("oid" << oid << "seq" << 0)) ).hint(BSON("_id" << 1))).release());
+        return retCursor;
     }
 }

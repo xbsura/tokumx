@@ -1,5 +1,6 @@
 /**
  * Copyright 2011 (c) 10gen Inc.
+ * Copyright (C) 2013 Tokutek Inc.
  *
  * This program is free software: you can redistribute it and/or  modify
  * it under the terms of the GNU Affero General Public License, version 3,
@@ -18,6 +19,7 @@
 
 #include "mongo/db/pipeline/document_source.h"
 
+#include "mongo/db/client.h"
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/instance.h"
 #include "mongo/db/pipeline/document.h"
@@ -27,14 +29,14 @@ namespace mongo {
 
     DocumentSourceCursor::CursorWithContext::CursorWithContext( const string& ns )
             : _context(ns)
+            , _txn(DB_TXN_SNAPSHOT | DB_TXN_READ_ONLY)
             , _chunkMgr(shardingState.needShardChunkManager( ns )
                         ? shardingState.getShardChunkManager( ns )
                         : ShardChunkManagerPtr()) {
     }
 
     DocumentSourceCursor::CursorWithContext::~CursorWithContext() {
-        // Doesn't commit its transaction, will lead to inaccurate commit/abort counts but not a big deal since it's read-only.
-        // TODO: figure out if we were successful and commit in that case.
+        _txn.commit();
     }
 
     DocumentSourceCursor::~DocumentSourceCursor() {
@@ -100,7 +102,7 @@ namespace mongo {
             BSONObj documentObj;
             if (canUseCoveredIndex()) {
                 // Can't have a Chunk Manager if we are here
-                documentObj = cursor()->c()->keyFieldsOnly()->hydrate(cursor()->currKey());
+                documentObj = cursor()->c()->keyFieldsOnly()->hydrate(cursor()->currKey(), cursor()->currPK());
             }
             else {
                 documentObj = cursor()->current();

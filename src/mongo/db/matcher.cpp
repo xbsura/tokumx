@@ -4,6 +4,7 @@
 
 /**
 *    Copyright (C) 2008 10gen Inc.
+*    Copyright (C) 2013 Tokutek Inc.
 *
 *    This program is free software: you can redistribute it and/or  modify
 *    it under the terms of the GNU Affero General Public License, version 3,
@@ -18,14 +19,14 @@
 *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 
-#include "pch.h"
-#include "matcher.h"
-#include "../util/goodies.h"
-#include "../util/startup_test.h"
-#include "../scripting/engine.h"
-#include "db.h"
-#include "queryutil.h"
-#include "client.h"
+#include "mongo/pch.h"
+#include "mongo/db/matcher.h"
+#include "mongo/util/goodies.h"
+#include "mongo/util/startup_test.h"
+#include "mongo/scripting/engine.h"
+#include "mongo/db/queryutil.h"
+#include "mongo/db/client.h"
+#include "mongo/db/namespacestring.h"
 
 namespace {
     inline pcrecpp::RE_Options flags2options(const char* flags) {
@@ -551,13 +552,16 @@ namespace mongo {
         
         if ( e.type() == Array ) {
             _hasArray = true;
-        }
-        else if( *fn == '$' ) {
-            if( str::equals(fn, "$atomic") || str::equals(fn, "$isolated") ) {
-                uassert( 14844, "$atomic specifier must be a top level field", !nested );
-                _atomic = e.trueValue();
-                return;
-            }
+        } else if (str::equals(fn, "$atomic") || str::equals(fn, "$isolated")) {
+            // TokuMX does not support the $atomic clause (all operations are atomic
+            // by virtue of running in their own transaction), but we need to keep
+            // this early-return for compatibility reasons. Consider the following
+            // statement:
+            //    db.foo.remove({'$atomic:true'})
+            // This means remove '{}' with options '{$atomic:true}' and without this
+            // early return, we would interpet it as remove '{$atomic:true}' with
+            // options {}, which is incorrect.
+            return;
         }
         
         // normal, simple case e.g. { a : "foo" }
@@ -567,7 +571,7 @@ namespace mongo {
     /* _jsobj          - the query pattern
     */
     Matcher::Matcher(const BSONObj &jsobj, bool nested) :
-        _where(0), _jsobj(jsobj), _haveSize(), _all(), _hasArray(0), _haveNeg(), _atomic(false) {
+        _where(0), _jsobj(jsobj), _haveSize(), _all(), _hasArray(0), _haveNeg() {
 
         BSONObjIterator i(_jsobj);
         while ( i.more() ) {
@@ -576,7 +580,7 @@ namespace mongo {
     }
 
     Matcher::Matcher( const Matcher &docMatcher, const BSONObj &key ) :
-        _where(0), _constrainIndexKey( key ), _haveSize(), _all(), _hasArray(0), _haveNeg(), _atomic(false) {
+        _where(0), _constrainIndexKey( key ), _haveSize(), _all(), _hasArray(0), _haveNeg() {
         // Filter out match components that will provide an incorrect result
         // given a key from a single key index.
         for( vector< ElementMatcher >::const_iterator i = docMatcher._basics.begin(); i != docMatcher._basics.end(); ++i ) {

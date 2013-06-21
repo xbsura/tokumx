@@ -1,6 +1,7 @@
 // s_only.cpp
 
 /*    Copyright 2009 10gen Inc.
+ *    Copyright (C) 2013 Tokutek Inc.
  *
  *    Licensed under the Apache License, Version 2.0 (the "License");
  *    you may not use this file except in compliance with the License.
@@ -15,12 +16,13 @@
  *    limitations under the License.
  */
 
-#include "pch.h"
-#include "request.h"
-#include "client_info.h"
-#include "../db/dbhelpers.h"
-#include "../db/matcher.h"
-#include "../db/commands.h"
+#include "mongo/pch.h"
+#include "mongo/s/request.h"
+#include "mongo/s/client_info.h"
+#include "mongo/db/dbhelpers.h"
+#include "mongo/db/matcher.h"
+#include "mongo/db/commands.h"
+#include "mongo/db/namespacestring.h"
 
 /*
   most a pile of hacks to make linking nicer
@@ -49,7 +51,7 @@ namespace mongo {
         _shutdown(false),
         _desc(desc),
         _god(0),
-        _lastOp(0),
+        _lastGTID(),
         _mp(p) {
     }
     Client::~Client() {}

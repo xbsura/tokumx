@@ -19,27 +19,22 @@
 #include "mongo/db/commands.h"
 #include <db.h>
 #include "mongo/db/client.h"
+#include "mongo/db/repl/rs.h"
 
 namespace mongo {
 
-    class BeginTransactionCmd : public Command {
+    class BeginTransactionCmd : public InformationCommand {
     public:
-        virtual LockType locktype() const { return NONE; }
         virtual bool adminOnly() const { return false; }
-        virtual bool slaveOk() const { return true; }
-        virtual bool logTheOp() { return false; }
-        // dont create the transaction outside of us, because we are managing the
-        // the transaction here
-        virtual bool needsTxn() const { return false; }
-        virtual bool canRunInMultiStmtTxn() const { return true; }
+        virtual bool requiresAuth() { return true; }
+        virtual LockType locktype() const { return OPLOCK; }
         virtual void help( stringstream& help ) const {
             help << "begin transaction\n"
                 "Create a transaction for multiple statements.\n"
                 "{ beginTransaction, [isolation : ]  }\n"
                 " Possible values for isolation: serializable, mvcc (default), readUncommitted \n";
         }
-        virtual bool requiresAuth() { return true; }
-        BeginTransactionCmd() : Command("beginTransaction") { }
+        BeginTransactionCmd() : InformationCommand("beginTransaction") {}
 
         virtual bool run(const string& db, 
                          BSONObj& cmdObj, 
@@ -60,6 +55,7 @@ namespace mongo {
                 string iso = isoBSON.String();
                 if (iso == "serializable") {
                     iso_flags = 0;
+                    uassert(16807, "Cannot set multi statement transaction to serializable on machine that is not primary", !(theReplSet && theReplSet->isPrimary()));
                 }
                 else if (iso == "mvcc") {
                     iso_flags = DB_TXN_SNAPSHOT;
@@ -71,35 +67,25 @@ namespace mongo {
                     uasserted(16739, "invalid isolation passed in");
                 }
             }
-            // we already have a multi-stmt transaction, do nothing
-            if (cc().hasTxn()) {
-                result.append("status", "transaction exists, no-op");
-            }
-            else {
-                cc().beginClientTxn(iso_flags);
-                result.append("status", "transaction began");
-            }
+
+            uassert(16787, "transaction already exists", !cc().hasTxn());
+            cc().beginClientTxn(iso_flags);
+            result.append("status", "transaction began");
             return true;
         }
     } beginTransactionCmd;
 
-    class CommitTransactionCmd : public Command {
+    class CommitTransactionCmd : public InformationCommand {
     public:
-        virtual LockType locktype() const { return NONE; }
         virtual bool adminOnly() const { return false; }
-        virtual bool slaveOk() const { return true; }
-        virtual bool logTheOp() { return false; }
-        // dont create the transaction outside of us, because we are managing the
-        // the transaction here
-        virtual bool needsTxn() const { return false; }
-        virtual bool canRunInMultiStmtTxn() const { return true; }
+        virtual bool requiresAuth() { return true; }
+        virtual LockType locktype() const { return OPLOCK; }
         virtual void help( stringstream& help ) const {
             help << "commit transaction\n"
                 "If running a multi statement transaction, commit transaction, no-op otherwise .\n"
                 "{ commitTransaction }";
         }
-        virtual bool requiresAuth() { return true; }
-        CommitTransactionCmd() : Command("commitTransaction") { }
+        CommitTransactionCmd() : InformationCommand("commitTransaction") {}
 
         virtual bool run(const string& db, 
                          BSONObj& cmdObj, 
@@ -108,38 +94,27 @@ namespace mongo {
                          BSONObjBuilder& result, 
                          bool fromRepl) 
         {
-            if (!cc().hasTxn()) {
-                // we don't have a multi-stmt transaction, do nothing
-                result.append("status", "no transaction exists, no-op");
-            }
-            else {
-                result.append("status", "transaction committed");
-                cc().commitTopTxn();
-                // after committing txn, there should be 
-                // no txn left on stack, having a dassert to verify
-                dassert(!cc().hasTxn());
-            }
+            uassert(16788, "no transaction exists to be committed", cc().hasTxn());
+            result.append("status", "transaction committed");
+            cc().commitTopTxn();
+            // after committing txn, there should be 
+            // no txn left on stack, having a dassert to verify
+            dassert(!cc().hasTxn());
             return true;
         }
     } commitTransactionCmd;
 
-    class RollbackTransactionCmd : public Command {
+    class RollbackTransactionCmd : public InformationCommand {
     public:
-        virtual LockType locktype() const { return NONE; }
         virtual bool adminOnly() const { return false; }
-        virtual bool slaveOk() const { return true; }
-        virtual bool logTheOp() { return false; }
-        // dont create the transaction outside of us, because we are managing the
-        // the transaction here
-        virtual bool needsTxn() const { return false; }
-        virtual bool canRunInMultiStmtTxn() const { return true; }
+        virtual bool requiresAuth() { return true; }
+        virtual LockType locktype() const { return OPLOCK; }
         virtual void help( stringstream& help ) const {
             help << "rollback transaction\n"
                 "If running a multi statement transaction, rollback transaction, no-op otherwise .\n"
                 "{ rollbackTransaction }";
         }
-        virtual bool requiresAuth() { return true; }
-        RollbackTransactionCmd() : Command("rollbackTransaction") { }
+        RollbackTransactionCmd() : InformationCommand("rollbackTransaction") {}
 
         virtual bool run(const string& db, 
                          BSONObj& cmdObj, 
@@ -148,17 +123,12 @@ namespace mongo {
                          BSONObjBuilder& result, 
                          bool fromRepl) 
         {
-            if (!cc().hasTxn()) {
-                // we don't have a multi-stmt transaction, do nothing
-                result.append("status", "no transaction exists, no-op");
-            }
-            else {
-                result.append("status", "transaction rolled back");
-                cc().abortTopTxn();
-                // after committing txn, there should be 
-                // no txn left on stack, having a dassert to verify
-                dassert(!cc().hasTxn());
-            }
+            uassert(16789, "no transaction exists to be rolled back", cc().hasTxn());
+            result.append("status", "transaction rolled back");
+            cc().abortTopTxn();
+            // after committing txn, there should be 
+            // no txn left on stack, having a dassert to verify
+            dassert(!cc().hasTxn());
             return true;
         }
     } rollbackTransactionCmd;

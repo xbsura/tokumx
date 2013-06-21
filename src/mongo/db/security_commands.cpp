@@ -1,6 +1,7 @@
 // security_commands.cpp
 /*
  *    Copyright (C) 2010 10gen Inc.
+ *    Copyright (C) 2013 Tokutek Inc.
  *
  *    This program is free software: you can redistribute it and/or  modify
  *    it under the terms of the GNU Affero General Public License, version 3,
@@ -19,15 +20,14 @@
 
 // security.cpp
 
-#include "pch.h"
-#include "security.h"
-#include "../util/md5.hpp"
-#include "json.h"
-#include "db.h"
-#include "dbhelpers.h"
-#include "commands.h"
-#include "jsobj.h"
-#include "client.h"
+#include "mongo/pch.h"
+#include "mongo/db/security.h"
+#include "mongo/util/md5.hpp"
+#include "mongo/db/json.h"
+#include "mongo/db/dbhelpers.h"
+#include "mongo/db/commands.h"
+#include "mongo/db/jsobj.h"
+#include "mongo/db/client.h"
 
 namespace mongo {
 
@@ -45,16 +45,11 @@ namespace mongo {
 
     boost::thread_specific_ptr<nonce64> lastNonce;
 
-    class CmdGetNonce : public Command {
+    class CmdGetNonce : public InformationCommand {
     public:
+        CmdGetNonce() : InformationCommand("getnonce", false) {}
         virtual bool requiresAuth() { return false; }
-        virtual bool logTheOp() { return false; }
-        virtual bool slaveOk() const {
-            return true;
-        }
         void help(stringstream& h) const { h << "internal"; }
-        virtual LockType locktype() const { return NONE; }
-        CmdGetNonce() : Command("getnonce") {}
         bool run(const string&, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
             nonce64 *n = new nonce64(Security::getNonce());
             stringstream ss;

@@ -8,6 +8,7 @@
 
 /**
 *    Copyright (C) 2008 10gen Inc.
+*    Copyright (C) 2013 Tokutek Inc.
 *
 *    This program is free software: you can redistribute it and/or  modify
 *    it under the terms of the GNU Affero General Public License, version 3,
@@ -28,24 +29,22 @@
 
 #include <stack>
 
-#include "security.h"
-#include "namespace.h"
-#include "lasterror.h"
-#include "stats/top.h"
-#include "../db/client_common.h"
-#include "../util/concurrency/threadlocal.h"
-#include "../util/net/message_port.h"
-#include "../util/concurrency/rwlock.h"
-#include "d_concurrency.h"
+#include "mongo/db/security.h"
+#include "mongo/db/lasterror.h"
+#include "mongo/db/stats/top.h"
+#include "mongo/db/client_common.h"
+#include "mongo/db/d_concurrency.h"
 #include "mongo/db/lockstate.h"
+#include "mongo/db/gtid.h"
 #include "mongo/db/txn_context.h"
-//#include "mongo/db/storage/txn.h"
+#include "mongo/db/opsettings.h"
 #include "mongo/util/paths.h"
-#include "mongo/db/toku_command_settings.h"
+#include "mongo/util/concurrency/threadlocal.h"
+#include "mongo/util/net/message_port.h"
+#include "mongo/util/concurrency/rwlock.h"
 
 namespace mongo {
 
-    extern class ReplSet *theReplSet;
     class AuthenticationInfo;
     class Database;
     class CurOp;
@@ -54,6 +53,10 @@ namespace mongo {
     class AbstractMessagingPort;
     class LockCollectionForReading;
     class DBClientConnection;
+    class ReplSet;
+
+    extern ReplSet *theReplSet;
+    extern RWLockRecursive operationLock;
 
     TSP_DECLARE(Client, currentClient)
 
@@ -68,8 +71,7 @@ namespace mongo {
         static int getActiveClientCount( int& writers , int& readers );
         class Context;
         ~Client();
-        static int recommendedYieldMicros( int * writers = 0 , int * readers = 0,
-                                           bool needExact = false );
+        static void getReaderWriterClientCount( int *readers, int *writers );
         /** each thread which does db operations has a Client object in TLS.
          *  call this when your thread starts.
         */
@@ -80,6 +82,8 @@ namespace mongo {
                 return;
             initThread(desc);
         }
+        static void abortLiveTransactions();
+
 
         /** this has to be called as the client goes away, but before thread termination
          *  @return true if anything was done
@@ -95,14 +99,20 @@ namespace mongo {
         Database* database() const {  return _context ? _context->db() : 0; }
         const char *ns() const { return _context->ns(); }
         const std::string desc() const { return _desc; }
-        void setLastOp( OpTime op ) { _lastOp = op; }
-        OpTime getLastOp() const { return _lastOp; }
+
+        // these function for threads that do writes to report to the client
+        // what the last GTID completed was. When a transaction commits,
+        // this value is set. Subsequently, when getLastError is called,
+        // this value is read to determine what point slaves should 
+        // catch up to in order to satisfy write concern
+        void setLastOp( GTID gtid ) { _lastGTID = gtid; }
+        GTID getLastOp() const { return _lastGTID; }
 
         /** caution -- use Context class instead */
         void setContext(Context *c) { _context = c; }
 
         /* report what the last operation was.  used by getlasterror */
-        void appendLastOp( BSONObjBuilder& b ) const;
+        void appendLastGTID( BSONObjBuilder& b ) const;
 
         bool isGod() const { return _god; } /* this is for map/reduce writes */
         string toString() const;
@@ -142,6 +152,7 @@ namespace mongo {
             void beginTxn(int flags);
             /** Commit the innermost transaction. */
             void commitTxn(int flags);
+            void commitTxn();
             /** Abort the innermost transaction. */
             void abortTxn();
             uint32_t numLiveTxns();
@@ -176,7 +187,8 @@ namespace mongo {
           public:
             explicit Transaction(int flags);
             ~Transaction();
-            void commit(int flags = 0);
+            void commit(int flags);
+            void commit();
             void abort();
         };
 
@@ -187,8 +199,12 @@ namespace mongo {
             return _transactions->hasLiveTxn();
         }
 
+        const shared_ptr<TransactionStack> &txnStack() const {
+            return _transactions;
+        }
+
         void commitTopTxn() {
-            _transactions->commitTxn(0);
+            _transactions->commitTxn();
         }
 
         void abortTopTxn() {
@@ -222,12 +238,12 @@ namespace mongo {
             _authConn = conn;
         }
 
-        TokuCommandSettings tokuCommandSettings() const {
-            return _tokuCommandSettings;
+        OpSettings opSettings() const {
+            return _opSettings;
         }
 
-        void setTokuCommandSettings (const TokuCommandSettings& settings) {
-            _tokuCommandSettings = settings;
+        void setOpSettings (const OpSettings& settings) {
+            _opSettings = settings;
         }
 
         /**
@@ -237,6 +253,20 @@ namespace mongo {
         void swapTransactionStack(shared_ptr<TransactionStack> &other) {
             _transactions.swap(other);
         }
+
+        /**
+         * After you have saved a TransactionStack somewhere, you can use this class to temporarily return it to cc() and then save it back out again.
+         */
+        class WithTxnStack : boost::noncopyable {
+            shared_ptr<Client::TransactionStack> &_stack;
+            bool _released;
+          public:
+            WithTxnStack(shared_ptr<Client::TransactionStack> &stack);
+            ~WithTxnStack();
+            void release() {
+                _released = true;
+            }
+        };
 
     private:
         Client(const char *desc, AbstractMessagingPort *p = 0);
@@ -250,11 +280,11 @@ namespace mongo {
         std::string _desc;
         bool _god;
         AuthenticationInfo _ai;
-        OpTime _lastOp;
+        GTID _lastGTID;
         BSONObj _handshake;
         BSONObj _remoteId;
         AbstractMessagingPort * const _mp;
-        TokuCommandSettings _tokuCommandSettings;
+        OpSettings _opSettings;
 
         // for CmdCopyDb and CmdCopyDbGetNonce
         shared_ptr< DBClientConnection > _authConn;
@@ -273,48 +303,31 @@ namespace mongo {
             ~GodScope();
         };
 
-        //static void assureDatabaseIsOpen(const string& ns, string path=dbpath);
-        
-        /** "read lock, and set my context, all in one operation" 
-         *  This handles (if not recursively locked) opening an unopened database.
-         */
-        class ReadContext : boost::noncopyable { 
-        public:
-            ReadContext(const string &ns, string path=dbpath, bool doauth=true);
-            Context& ctx() { return *c.get(); }
-        private:
-            scoped_ptr<Lock::DBRead> lk;
-            scoped_ptr<Context> c;
-        };
-
         /* Set database we want to use, then, restores when we finish (are out of scope)
            Note this is also helpful if an exception happens as the state if fixed up.
         */
         class Context : boost::noncopyable {
         public:
             /** this is probably what you want */
-            Context(const string& ns, string path=dbpath, bool doauth=true, bool doVersion=true);
+            Context(const StringData &ns, const StringData &path=dbpath, bool doauth=true, bool doVersion=true );
 
             /** note: this does not call finishInit -- i.e., does not call 
                       shardVersionOk() for example. 
                 see also: reset().
             */
-            Context(string ns, Database * db, bool doauth=true);
+            Context( const StringData &ns , Database * db, bool doauth=true );
 
             // used by ReadContext
-            Context(const string& path, const string& ns, Database *db, bool doauth);
+            Context(const StringData &path, const StringData &ns, Database *db, bool doauth);
 
             ~Context();
             Client* getClient() const { return _client; }
             Database* db() const { return _db; }
             const char * ns() const { return _ns.c_str(); }
-            bool equals( const string& ns , const string& path=dbpath ) const { return _ns == ns && _path == path; }
-
-            /** @return if the db was created by this Context */
-            bool justCreated() const { return _justCreated; }
+            bool equals( const StringData &ns , const StringData &path=dbpath ) const { return _ns == ns && _path == path; }
 
             /** @return true iff the current Context is using db/path */
-            bool inDB( const string& db , const string& path=dbpath ) const;
+            bool inDB( const StringData& db , const StringData& path=dbpath ) const;
 
             void _clear() { // this is sort of an "early destruct" indication, _ns can never be uncleared
                 const_cast<string&>(_ns).clear();
@@ -339,7 +352,6 @@ namespace mongo {
             Client * const _client;
             Context * const _oldContext;
             const string _path;
-            bool _justCreated;
             bool _doVersion;
             const string _ns;
             Database * _db;
@@ -347,15 +359,25 @@ namespace mongo {
             Timer _timer;
         }; // class Client::Context
 
+        /** "read lock, and set my context, all in one operation" 
+         */
+        class ReadContext : boost::noncopyable { 
+        public:
+            ReadContext(const StringData &ns, const StringData &path=dbpath, bool doauth=true);
+            Context& ctx() { return _c; }
+        private:
+            Lock::DBRead _lk;
+            Client::Context _c;
+        };
+
         class WriteContext : boost::noncopyable {
         public:
-            WriteContext(const string& ns, string path=dbpath, bool doauth=true );
+            WriteContext(const StringData &ns, const StringData &path=dbpath, bool doauth=true );
             Context& ctx() { return _c; }
         private:
             Lock::DBWrite _lk;
             Context _c;
         };
-
 
     }; // class Client
 
@@ -364,6 +386,15 @@ namespace mongo {
         Client * c = currentClient.get();
         verify( c );
         return *c;
+    }
+
+    inline Client::WithTxnStack::WithTxnStack(shared_ptr<Client::TransactionStack> &stack) : _stack(stack), _released(false) {
+        cc().swapTransactionStack(_stack);
+    }
+    inline Client::WithTxnStack::~WithTxnStack() {
+        if (!_released) {
+            cc().swapTransactionStack(_stack);
+        }
     }
 
     inline Client::GodScope::GodScope() {

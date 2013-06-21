@@ -1,6 +1,7 @@
 /* builder.h */
 
 /*    Copyright 2009 10gen Inc.
+ *    Copyright (C) 2013 Tokutek Inc.
  *
  *    Licensed under the Apache License, Version 2.0 (the "License");
  *    you may not use this file except in compliance with the License.
@@ -25,7 +26,7 @@
 #include <string.h>
 
 #include "mongo/bson/inline_decls.h"
-#include "mongo/bson/stringdata.h"
+#include "mongo/base/string_data.h"
 
 namespace mongo {
     /* Accessing unaligned doubles on ARM generates an alignment trap and aborts with SIGBUS on Linux.
@@ -189,7 +190,7 @@ namespace mongo {
 
         void appendStr(const StringData &str , bool includeEndingNull = true ) {
             const int len = str.size() + ( includeEndingNull ? 1 : 0 );
-            memcpy(grow(len), str.data(), len);
+            str.copyTo( grow(len), includeEndingNull );
         }
 
         /** @return length of current string */
@@ -309,7 +310,7 @@ namespace mongo {
 
         void write( const char* buf, int len) { memcpy( _buf.grow( len ) , buf , len ); }
 
-        void append( const StringData& str ) { memcpy( _buf.grow( str.size() ) , str.data() , str.size() ); }
+        void append( const StringData& str ) { str.copyTo( _buf.grow( str.size() ), false ); }
 
         StringBuilderImpl& operator<<( const StringData& str ) {
             append( str );

@@ -3,6 +3,7 @@
 
 /**
  *    Copyright (C) 2009 10gen Inc.
+ *    Copyright (C) 2013 Tokutek Inc.
  *
  *    This program is free software: you can redistribute it and/or  modify
  *    it under the terms of the GNU Affero General Public License, version 3,
@@ -19,7 +20,6 @@
 
 #include "mongo/pch.h"
 #include "mongo/db/repl.h"
-#include "mongo/db/db.h"
 #include "mongo/db/instance.h"
 #include "mongo/db/json.h"
 #include "mongo/db/oplog.h"
@@ -114,7 +114,6 @@ namespace ReplSetTests {
     public:
         Base() {
             cmdLine._replSet = "foo";
-            cmdLine.oplogSize = 5;
             createOplog();
             setup();
         }

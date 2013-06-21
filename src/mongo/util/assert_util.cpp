@@ -1,6 +1,7 @@
 // assert_util.cpp
 
 /*    Copyright 2009 10gen Inc.
+ *    Copyright (C) 2013 Tokutek Inc.
  *
  *    Licensed under the Apache License, Version 2.0 (the "License");
  *    you may not use this file except in compliance with the License.
@@ -161,7 +162,7 @@ namespace mongo {
         throw MsgAssertionException(msgid, msg);
     }
 
-    NOINLINE_DECL void streamNotGood( int code , string msg , std::ios& myios ) {
+    NOINLINE_DECL void streamNotGood( int code , const std::string& msg , std::ios& myios ) {
         stringstream ss;
         // errno might not work on all systems for streams
         // if it doesn't for a system should deal with here

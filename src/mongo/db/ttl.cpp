@@ -2,6 +2,7 @@
 
 /**
 *    Copyright (C) 2008 10gen Inc.
+*    Copyright (C) 2013 Tokutek Inc.
 *
 *    This program is free software: you can redistribute it and/or  modify
 *    it under the terms of the GNU Affero General Public License, version 3,
@@ -76,28 +77,27 @@ namespace mongo {
                 long long n = 0;
                 {
                     string ns = idx["ns"].String();
-                    TokuCommandSettings settings;
+                    OpSettings settings;
                     settings.setQueryCursorMode(WRITE_LOCK_CURSOR);
-                    cc().setTokuCommandSettings(settings);
+                    cc().setOpSettings(settings);
+
                     Client::ReadContext ctx(ns);
                     Client::Transaction transaction(DB_SERIALIZABLE);
-                    NamespaceDetails* nsd = nsdetails( ns.c_str() );
-                    if ( ! nsd ) {
+                    NamespaceDetails* nsd = nsdetails(ns.c_str());
+                    if (!nsd) {
                         // collection was dropped
                         continue;
                     }
                     // only do deletes if on master
-                    if ( ! isMasterNs( dbName.c_str() ) ) {
+                    if (!isMasterNs(dbName.c_str())) {
                         continue;
                     }
-
-                    n = deleteObjects( ns.c_str() , query , false , true );
+                    n = deleteObjects(ns.c_str(), query, false, true);
                     transaction.commit();
                 }
 
                 LOG(1) << "\tTTL deleted: " << n << endl;
             }
-            
         }
 
         virtual void run() {

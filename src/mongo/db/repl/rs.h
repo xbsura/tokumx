@@ -2,6 +2,7 @@
 
 /**
 *    Copyright (C) 2008 10gen Inc.
+*    Copyright (C) 2013 Tokutek Inc.
 *
 *    This program is free software: you can redistribute it and/or  modify
 *    it under the terms of the GNU Affero General Public License, version 3,
@@ -20,6 +21,7 @@
 
 #include "mongo/db/commands.h"
 #include "mongo/db/index.h"
+#include "mongo/db/namespace_details.h"
 #include "mongo/db/oplog.h"
 #include "mongo/db/oplogreader.h"
 #include "mongo/db/repl/rs_config.h"
@@ -109,9 +111,9 @@ namespace mongo {
 
     class GhostSync : public task::Server {
         struct GhostSlave : boost::noncopyable {
-            GhostSlave() : last(0), slave(0), init(false) { }
+            GhostSlave() : slave(0), init(false) { }
             OplogReader reader;
-            OpTime last;
+            GTID lastGTID;
             Member* slave;
             bool init;
         };
@@ -143,9 +145,10 @@ namespace mongo {
          * it to P (_currentSyncTarget). Then it would use this connection to
          * pretend to be S1, replicating off of P.
          */
-        void percolate(const BSONObj& rid, const OpTime& last);
+        void percolate(const BSONObj& rid, const GTID& lastGTID);
         void associateSlave(const BSONObj& rid, const int memberId);
-        void updateSlave(const mongo::OID& id, const OpTime& last);
+        void updateSlave(const mongo::OID& id, const GTID& lastGTID);
+        void clearCache();
     };
 
     struct Target;
@@ -296,14 +299,17 @@ namespace mongo {
         SP sp;
     };
 
-    void parseReplsetCmdLine(string cfgString, string& setname, vector<HostAndPort>& seeds, set<HostAndPort>& seedSet );
+    void parseReplsetCmdLine(const std::string& cfgString,
+                             string& setname,
+                             vector<HostAndPort>& seeds,
+                             set<HostAndPort>& seedSet);
 
     /** Parameter given to the --replSet command line option (parsed).
         Syntax is "<setname>/<seedhost1>,<seedhost2>"
         where setname is a name and seedhost is "<host>[:<port>]" */
     class ReplSetCmdline {
     public:
-        ReplSetCmdline(string cfgString) { parseReplsetCmdLine(cfgString, setname, seeds, seedSet); }
+        ReplSetCmdline(const std::string& cfgString) { parseReplsetCmdLine(cfgString, setname, seeds, seedSet); }
         string setname;
         vector<HostAndPort> seeds;
         set<HostAndPort> seedSet;
@@ -329,18 +335,7 @@ namespace mongo {
 
         StateBox box;
 
-        GTIDManager* gtidManager;
-        boost::mutex stateChangeMutex;
-        bool forceSyncFrom(const string& host, string& errmsg, BSONObjBuilder& result);
-
-        /**
-         * Find the closest member (using ping time) with a higher latest optime.
-         */
-        Member* getMemberToSyncTo();
-        void veto(const string& host, unsigned secs=10);
-        bool gotForceSync();
-        void goStale(const Member* stale, GTID remoteGTID);
-    private:
+        shared_ptr<GTIDManager> gtidManager;
         // this lock protects the _blockSync variable and the _maintenanceMode
         // variable. It must be taken before the rslock. It protects state changes
         // that depend on those variables, meaning RS_SECONDARY, RS_PRIMARY,
@@ -348,19 +343,42 @@ namespace mongo {
         // lock held, and stopping the opsync thread may take seconds, this
         // lock may be held for a long time and should be taken before the
         // rslock.
+        boost::mutex stateChangeMutex;
+        bool forceSyncFrom(const string& host, string& errmsg, BSONObjBuilder& result);
+
+        /**
+         * Find the closest member (using ping time) with a higher latest GTID.
+         */
+        Member* getMemberToSyncTo();
+        void veto(const string& host, unsigned secs=10);
+        bool gotForceSync();
+        void goStale(const Member* stale, GTID remoteGTID);
+        void goToRollbackState();
+        void leaveRollbackState();
+    private:
+        // for replInfoUpdate
+        boost::mutex _replInfoMutex;
+        bool _replInfoUpdateRunning;
+        // for oplog purge
+        bool _replOplogPurgeRunning;
+        bool _replBackgroundShouldRun;
+
+        // for purge thread
+        boost::mutex _purgeMutex;
+        boost::condition _purgeCond;
+
         set<ReplSetHealthPollTask*> healthTasks;
         void endOldHealthTasks();
         void startHealthTaskFor(Member *m);
 
         Consensus elect;
-        void relinquish();
-        void forgetPrimary();
+        void relinquish(bool startReplication = true);
     protected:
         bool _stepDown(int secs);
         bool _freeze(int secs);
     private:
         bool assumePrimary();
-        void loadGTIDManager(bool quiet=false);
+        void loadGTIDManager();
         void changeState(MemberState s);
 
         Member* _forceSyncTarget;
@@ -376,7 +394,7 @@ namespace mongo {
         char _hbmsg[256]; // we change this unlocked, thus not an stl::string
         time_t _hbmsgTime; // when it was logged
     public:
-        void sethbmsg(string s, int logLevel = 0);
+        void sethbmsg(const std::string& s, int logLevel = 0);
 
         /**
          * Election with Priorities
@@ -487,16 +505,19 @@ namespace mongo {
          * call this and it will leave maintenance mode once all of the callers
          * have called it again, passing in false.
          */
-        bool setMaintenanceMode(const bool inc);
+        bool setMaintenanceMode(const bool inc, string& errmsg);
+        // Records a new slave's id in the GhostSlave map, at handshake time.
+        void registerSlave(const BSONObj& rid, const int memberId);
     private:
         Member* head() const { return _members.head(); }
     public:
         const Member* findById(unsigned id) const;
+        void stopReplInfoThread();
     private:
         void _getTargets(list<Target>&, int &configVersion);
         void getTargets(list<Target>&, int &configVersion);
         void startThreads();
-        void _updateReplInfo();
+        void purgeOplogThread();
         void updateReplInfoThread();
         friend class FeedbackThread;
         friend class CmdReplSetElect;
@@ -514,38 +535,19 @@ namespace mongo {
 
         // keep a list of hosts that we've tried recently that didn't work
         map<string,time_t> _veto;
-        // persistent pool of worker threads for writing ops to the databases
-        threadpool::ThreadPool _writerPool;
-        // persistent pool of worker threads for prefetching
-        threadpool::ThreadPool _prefetcherPool;
 
     public:
-        // Allow index prefetching to be turned on/off
-        enum IndexPrefetchConfig {
-            PREFETCH_NONE=0, PREFETCH_ID_ONLY=1, PREFETCH_ALL=2
-        };
-
-        void setIndexPrefetchConfig(const IndexPrefetchConfig cfg) {
-            _indexPrefetchConfig = cfg;
-        }
-        IndexPrefetchConfig getIndexPrefetchConfig() {
-            return _indexPrefetchConfig;
-        }
-            
-        static const int replWriterThreadCount;
-        static const int replPrefetcherThreadCount;
-        threadpool::ThreadPool& getPrefetchPool() { return _prefetcherPool; }
-        threadpool::ThreadPool& getWriterPool() { return _writerPool; }
-
 
         const ReplSetConfig::MemberCfg& myConfig() const { return _config; }
         void tryToGoLiveAsASecondary(); // readlocks
         const uint64_t lastOtherOpTime() const;
         const GTID lastOtherGTID() const;
+
+        void stopReplication();
+        void startReplication();
+        void forceUpdateReplInfo();
         
         int oplogVersion;
-    private:
-        IndexPrefetchConfig _indexPrefetchConfig;
     };
 
     class ReplSet : public ReplSetImpl {
@@ -581,8 +583,6 @@ namespace mongo {
         void summarizeAsHtml(stringstream& ss) const { _summarizeAsHtml(ss); }
         void summarizeStatus(BSONObjBuilder& b) const  { _summarizeStatus(b); }
         void fillIsMaster(BSONObjBuilder& b) { _fillIsMaster(b); }
-        threadpool::ThreadPool& getPrefetchPool() { return ReplSetImpl::getPrefetchPool(); }
-        threadpool::ThreadPool& getWriterPool() { return ReplSetImpl::getWriterPool(); }
 
         /**
          * We have a new config (reconfig) - apply it.
@@ -620,6 +620,10 @@ namespace mongo {
         virtual bool adminOnly() const { return true; }
         virtual bool logTheOp() { return false; }
         virtual LockType locktype() const { return NONE; }
+        virtual bool needsTxn() const { return false; }
+        virtual int txnFlags() const { return noTxnFlags(); }
+        virtual bool requiresSync() const { return false; }
+        virtual bool canRunInMultiStmtTxn() const { return true; }
         virtual void help( stringstream &help ) const { help << "internal"; }
 
         /**
@@ -700,6 +704,14 @@ namespace mongo {
         }
         
         return true;
+    }
+
+    inline BSONObj getLastEntryInOplog() {
+        BSONObj o;
+        Client::ReadContext lk(rsoplog);
+        NamespaceDetails *d = nsdetails(rsoplog);
+        shared_ptr<Cursor> c( BasicCursor::make(d, -1) );
+        return c->ok() ? c->current().copy() : BSONObj();
     }
 
 }

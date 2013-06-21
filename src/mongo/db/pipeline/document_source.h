@@ -1,5 +1,6 @@
 /**
  * Copyright (c) 2011 10gen Inc.
+ * Copyright (C) 2013 Tokutek Inc.
  *
  * This program is free software: you can redistribute it and/or  modify
  * it under the terms of the GNU Affero General Public License, version 3,
@@ -28,6 +29,7 @@
 #include "db/pipeline/value.h"
 #include "util/string_writer.h"
 #include "mongo/db/projection.h"
+#include "mongo/db/client.h"
 
 namespace mongo {
     class Accumulator;
@@ -97,8 +99,6 @@ namespace mongo {
          * Inform the source that it is no longer needed and may release its resources.  After
          * dispose() is called the source must still be able to handle iteration requests, but may
          * become eof().
-         * NOTE: For proper mutex yielding, dispose() must be called on any DocumentSource that will
-         * not be advanced until eof(), see SERVER-6123.
          */
         virtual void dispose();
 
@@ -363,6 +363,7 @@ namespace mongo {
             // Must be the first struct member for proper construction and destruction, as other
             // members may depend on the read lock it acquires.
             Client::ReadContext _context;
+            Client::Transaction _txn;
             shared_ptr<ShardChunkManager> _chunkMgr;
             ClientCursor::Holder _cursor;
         };
@@ -458,16 +459,6 @@ namespace mongo {
         const ShardChunkManager* chunkMgr() { return _cursorWithContext->_chunkMgr.get(); }
 
         bool canUseCoveredIndex();
-
-        /*
-          Yield the cursor sometimes.
-
-          If the state of the world changed during the yield such that we
-          are unable to continue execution of the query, this will release the
-          client cursor, and throw an error.  NOTE This differs from the
-          behavior of most other operations, see SERVER-2454.
-         */
-        void yieldSometimes();
     };
 
 
@@ -626,7 +617,7 @@ namespace mongo {
           @param pAccumulatorFactory used to create the accumulator for the
                 group field
          */
-        void addAccumulator(string fieldName,
+        void addAccumulator(const std::string& fieldName,
                             intrusive_ptr<Accumulator> (*pAccumulatorFactory)(
                             const intrusive_ptr<ExpressionContext> &),
                             const intrusive_ptr<Expression> &pExpression);

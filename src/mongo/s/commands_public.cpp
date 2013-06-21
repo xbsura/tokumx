@@ -2,6 +2,7 @@
 
 /**
 *    Copyright (C) 2008 10gen Inc.
+*    Copyright (C) 2013 Tokutek Inc.
 *
 *    This program is free software: you can redistribute it and/or  modify
 *    it under the terms of the GNU Affero General Public License, version 3,
@@ -51,12 +52,9 @@ namespace mongo {
 
     namespace dbgrid_pub_cmds {
 
-        class PublicGridCommand : public Command {
+        class PublicGridCommand : public InformationCommand {
         public:
-            PublicGridCommand( const char* n, const char* oldname=NULL ) : Command( n, false, oldname ) {
-            }
-            virtual bool slaveOk() const {
-                return true;
+            PublicGridCommand( const char* n, const char* oldname=NULL ) : InformationCommand( n, false, oldname ) {
             }
             virtual bool adminOnly() const {
                 return false;
@@ -65,9 +63,6 @@ namespace mongo {
             // Override if passthrough should also send query options
             // Safer as off by default, can slowly enable as we add more tests
             virtual bool passOptions() const { return false; }
-
-            // all grid commands are designed not to lock
-            virtual LockType locktype() const { return NONE; }
 
         protected:
 
@@ -100,15 +95,11 @@ namespace mongo {
             }
         };
 
-        class RunOnAllShardsCommand : public Command {
+        class RunOnAllShardsCommand : public InformationCommand {
         public:
-            RunOnAllShardsCommand(const char* n, const char* oldname=NULL) : Command(n, false, oldname) {}
+            RunOnAllShardsCommand(const char* n, const char* oldname=NULL) : InformationCommand(n, false, oldname) {}
 
-            virtual bool slaveOk() const { return true; }
             virtual bool adminOnly() const { return false; }
-
-            // all grid commands are designed not to lock
-            virtual LockType locktype() const { return NONE; }
 
 
             // default impl uses all shards for DB
@@ -219,11 +210,6 @@ namespace mongo {
             ReIndexCmd() :  AllShardsCollectionCommand("reIndex") {}
         } reIndexCmd;
 
-        class CollectionModCmd : public AllShardsCollectionCommand {
-        public:
-            CollectionModCmd() :  AllShardsCollectionCommand("collMod") {}
-        } collectionModCmd;
-
         class ProfileCmd : public PublicGridCommand {
         public:
             ProfileCmd() :  PublicGridCommand("profile") {}
@@ -260,11 +246,6 @@ namespace mongo {
                 output.appendBool("valid", true);
             }
         } validateCmd;
-
-        class RepairDatabaseCmd : public RunOnAllShardsCommand {
-        public:
-            RepairDatabaseCmd() :  RunOnAllShardsCommand("repairDatabase") {}
-        } repairDatabaseCmd;
 
         class DBStatsCmd : public RunOnAllShardsCommand {
         public:
@@ -427,11 +408,11 @@ namespace mongo {
             RenameCollectionCmd() : PublicGridCommand( "renameCollection" ) {}
             bool run(const string& dbName, BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
                 string fullnsFrom = cmdObj.firstElement().valuestrsafe();
-                string dbNameFrom = nsToDatabase( fullnsFrom.c_str() );
+                string dbNameFrom = nsToDatabase( fullnsFrom );
                 DBConfigPtr confFrom = grid.getDBConfig( dbNameFrom , false );
 
                 string fullnsTo = cmdObj["to"].valuestrsafe();
-                string dbNameTo = nsToDatabase( fullnsTo.c_str() );
+                string dbNameTo = nsToDatabase( fullnsTo );
                 DBConfigPtr confTo = grid.getDBConfig( dbNameTo , false );
 
                 uassert(13140, "Don't recognize source or target DB", confFrom && confTo);
@@ -785,15 +766,32 @@ namespace mongo {
 
         } DataSizeCmd;
 
-        class ConvertToCappedCmd : public NotAllowedOnShardedCollectionCmd  {
+        class NotAllowedOnShardedClusterCmd : public PublicGridCommand {
         public:
-            ConvertToCappedCmd() : NotAllowedOnShardedCollectionCmd("convertToCapped") {}
+            NotAllowedOnShardedClusterCmd(const char *n) : PublicGridCommand(n) {}
 
-            virtual string getFullNS( const string& dbName , const BSONObj& cmdObj ) {
-                return dbName + "." + cmdObj.firstElement().valuestrsafe();
+            virtual bool run(const string &, BSONObj &, int, string &errmsg, BSONObjBuilder &, bool) {
+                // TODO: Allow multi-statement transactions on databases that aren't sharded.
+                // This requires us to restrict a multi-statement transaction to a single database, which we're not sure we want to do yet.
+                errmsg = "can't do command: " + name + " on sharded cluster";
+                return false;
             }
+        };
 
-        } convertToCappedCmd;
+        class BeginTransactionCmd : public NotAllowedOnShardedClusterCmd  {
+        public:
+            BeginTransactionCmd() : NotAllowedOnShardedClusterCmd("beginTransaction") {}
+        } beginTransactionCmd;
+
+        class CommitTransactionCmd : public NotAllowedOnShardedClusterCmd  {
+        public:
+            CommitTransactionCmd() : NotAllowedOnShardedClusterCmd("commitTransaction") {}
+        } commitTransactionCmd;
+
+        class RollbackTransactionCmd : public NotAllowedOnShardedClusterCmd  {
+        public:
+            RollbackTransactionCmd() : NotAllowedOnShardedClusterCmd("rollbackTransaction") {}
+        } rollbackTransactionCmd;
 
 
         class GroupCmd : public NotAllowedOnShardedCollectionCmd  {
@@ -1379,7 +1377,22 @@ namespace mongo {
                         // points will be properly sorted using the set
                         for ( set<BSONObj>::iterator it = splitPts.begin() ; it != splitPts.end() ; ++it )
                             sortedSplitPts.push_back( *it );
-                        confOut->shardCollection( finalColLong, sortKey, true, &sortedSplitPts );
+
+                        // pre-split the collection onto all the shards for this database.
+                        // Note that it's not completely safe to pre-split onto non-primary shards
+                        // using the shardcollection method (a conflict may result if multiple
+                        // map-reduces are writing to the same output collection, for instance).
+                        // TODO: pre-split mapReduce output in a safer way.
+                        set<Shard> shardSet;
+                        confOut->getAllShards( shardSet );
+                        vector<Shard> outShards( shardSet.begin() , shardSet.end() );
+
+                        confOut->shardCollection( finalColLong ,
+                                                  sortKey ,
+                                                  true ,
+                                                  &sortedSplitPts ,
+                                                  &outShards );
+
                     }
 
                     map<BSONObj, int> chunkSizes;
@@ -1496,25 +1509,6 @@ namespace mongo {
                 return 1;
             }
         } mrCmd;
-
-        class ApplyOpsCmd : public PublicGridCommand {
-        public:
-            ApplyOpsCmd() : PublicGridCommand( "applyOps" ) {}
-            virtual bool run(const string& dbName , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
-                errmsg = "applyOps not allowed through mongos";
-                return false;
-            }
-        } applyOpsCmd;
-
-
-        class CompactCmd : public PublicGridCommand {
-        public:
-            CompactCmd() : PublicGridCommand( "compact" ) {}
-            virtual bool run(const string& dbName , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool) {
-                errmsg = "compact not allowed through mongos";
-                return false;
-            }
-        } compactCmd;
 
         class EvalCmd : public PublicGridCommand {
         public:

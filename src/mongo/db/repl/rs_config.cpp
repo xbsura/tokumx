@@ -2,6 +2,7 @@
 
 /**
 *    Copyright (C) 2008 10gen Inc.
+*    Copyright (C) 2013 Tokutek Inc.
 *
 *    This program is free software: you can redistribute it and/or  modify
 *    it under the terms of the GNU Affero General Public License, version 3,
@@ -16,17 +17,23 @@
 *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 
+
 #include "pch.h"
-#include "rs.h"
-#include "../../client/syncclusterconnection.h"
-#include "../../util/net/hostandport.h"
-#include "../dbhelpers.h"
-#include "connections.h"
-#include "../oplog.h"
-#include "../instance.h"
-#include "../../util/text.h"
-#include "mongo/db/oplog_helpers.h"
+
+#include "mongo/db/repl/rs_config.h"
+
 #include <boost/algorithm/string.hpp>
+#include <boost/static_assert.hpp>
+
+#include "mongo/client/syncclusterconnection.h"
+#include "mongo/db/dbhelpers.h"
+#include "mongo/db/instance.h"
+#include "mongo/db/oplog.h"
+#include "mongo/db/oplog_helpers.h"
+#include "mongo/db/repl/connections.h"
+#include "mongo/db/repl/rs.h"
+#include "mongo/util/net/hostandport.h"
+#include "mongo/util/text.h"
 
 using namespace bson;
 
@@ -66,7 +73,7 @@ namespace mongo {
                 cc().txn().txnIntiatingRs();
             }
             BSONObj o = asBson();
-            Helpers::putSingletonGod(rsConfigNs.c_str(), o, false/*logop=false; local db so would work regardless...*/);
+            Helpers::putSingleton(rsConfigNs.c_str(), o);
             if( !comment.isEmpty() && (!theReplSet || theReplSet->isPrimary()) ) {
                 OpLogHelpers::logComment(comment, &cc().txn());
             }
@@ -107,7 +114,7 @@ namespace mongo {
 
     bo ReplSetConfig::asBson() const {
         bob b;
-        b.append("_id", _id).append("version", version);
+        b.append("_id", _id).append("version", version).append("protocolVersion", protocolVersion);
 
         BSONArrayBuilder a;
         for( unsigned i = 0; i < members.size(); i++ )
@@ -145,6 +152,57 @@ namespace mongo {
             b << "settings" << settings.obj();
         }
 
+        return b.obj();
+    }
+
+    enum {
+        // We should maintain a list of protocol versions used by MongoDB.
+        PV_MONGODB_2_2 = 1,
+
+        // Hack to get PV_MONGODB_CURRENT easily.
+        PV_MONGODB_NEXT,
+        PV_MONGODB_CURRENT = PV_MONGODB_NEXT - 1,
+
+        // MongoDB is currently (still) at 1, but we'll give them 6 bits of head room.
+        // Add new versions here, and a comment about the changes made would be good too.
+        PV_TOKUMX_1_0 = 65,  // First release of TokuMX.
+
+        // Hack to get PV_TOKUMX_CURRENT easily.
+        PV_TOKUMX_NEXT,
+        PV_TOKUMX_CURRENT = PV_TOKUMX_NEXT - 1
+    };
+    const int ReplSetConfig::CURRENT_PROTOCOL_VERSION = PV_TOKUMX_CURRENT;
+    const int ReplSetConfig::MAX_SUPPORTED_PROTOCOL_VERSION = PV_TOKUMX_CURRENT;
+    const int ReplSetConfig::MIN_SUPPORTED_PROTOCOL_VERSION = PV_TOKUMX_1_0;
+
+    BOOST_STATIC_ASSERT(ReplSetConfig::MIN_SUPPORTED_PROTOCOL_VERSION > PV_MONGODB_CURRENT);
+    BOOST_STATIC_ASSERT(ReplSetConfig::MIN_SUPPORTED_PROTOCOL_VERSION <= ReplSetConfig::MAX_SUPPORTED_PROTOCOL_VERSION);
+    BOOST_STATIC_ASSERT(ReplSetConfig::CURRENT_PROTOCOL_VERSION <= ReplSetConfig::MAX_SUPPORTED_PROTOCOL_VERSION);
+    BOOST_STATIC_ASSERT(ReplSetConfig::CURRENT_PROTOCOL_VERSION >= ReplSetConfig::MIN_SUPPORTED_PROTOCOL_VERSION);
+
+    bool ReplSetConfig::checkProtocolVersion(int pv, string &errmsg) {
+        if (pv > MAX_SUPPORTED_PROTOCOL_VERSION) {
+            stringstream ss;
+            ss << "Replication protocol version " << pv << " is too new.  Max supported version is " << MAX_SUPPORTED_PROTOCOL_VERSION;
+            errmsg += ss.str();
+            return false;
+        }
+        if (pv < MIN_SUPPORTED_PROTOCOL_VERSION) {
+            stringstream ss;
+            ss << "Replication protocol version " << pv << " is too old.  Min supported version is " << MIN_SUPPORTED_PROTOCOL_VERSION;
+            errmsg += ss.str();
+            return false;
+        }
+        return true;
+    }
+
+    BSONObj ReplSetConfig::addProtocolVersionIfMissing(const BSONObj &config) {
+        if (config["protocolVersion"].ok()) {
+            return config;
+        }
+        BSONObjBuilder b;
+        b.appendElements(config);
+        b.append("protocolVersion", CURRENT_PROTOCOL_VERSION);
         return b.obj();
     }
 
@@ -193,20 +251,20 @@ namespace mongo {
         return result+"}";
     }
 
-    void ReplSetConfig::TagSubgroup::updateLast(const OpTime& op) {
+    void ReplSetConfig::TagSubgroup::updateLast(const GTID& gtid) {
         RACECHECK
-        if (last < op) {
-            last = op;
+        if (GTID::cmp(last, gtid) < 0) {
+            last = gtid;
 
             for (vector<TagClause*>::iterator it = clauses.begin(); it < clauses.end(); it++) {
-                (*it)->updateLast(op);
+                (*it)->updateLast(gtid);
             }
         }
     }
 
-    void ReplSetConfig::TagClause::updateLast(const OpTime& op) {
+    void ReplSetConfig::TagClause::updateLast(const GTID& gtid) {
         RACECHECK
-        if (last >= op) {
+        if (GTID::cmp(last, gtid) >= 0) {
             return;
         }
 
@@ -214,23 +272,23 @@ namespace mongo {
         int count = 0;
         map<string,TagSubgroup*>::iterator it;
         for (it = subgroups.begin(); it != subgroups.end(); it++) {
-            if ((*it).second->last >= op) {
+            if (GTID::cmp((*it).second->last, gtid) >= 0) {
                 count++;
             }
         }
 
         if (count >= actualTarget) {
-            last = op;
-            rule->updateLast(op);
+            last = gtid;
+            rule->updateLast(gtid);
         }
     }
 
-    void ReplSetConfig::TagRule::updateLast(const OpTime& op) {
-        OpTime *earliest = (OpTime*)&op;
+    void ReplSetConfig::TagRule::updateLast(const GTID& gtid) {
+        GTID *earliest = (GTID*)&gtid;
         vector<TagClause*>::iterator it;
 
         for (it = clauses.begin(); it < clauses.end(); it++) {
-            if ((*it)->last < *earliest) {
+            if ( GTID::cmp((*it)->last, *earliest) < 0 ) {
                 earliest = &(*it)->last;
             }
         }
@@ -443,7 +501,7 @@ namespace mongo {
 
                 // if all of the members of this clause involve the primary, it's always up-to-date
                 if (node->actualTarget == 0) {
-                    node->last = OpTime(INT_MAX, INT_MAX);
+                    node->last = GTID_MAX;
                     primaryOnly++;
                 }
 
@@ -454,7 +512,7 @@ namespace mongo {
 
             // if all of the clauses are satisfied by the primary, this rule is trivially true
             if (primaryOnly == r->clauses.size()) {
-                r->last = OpTime(INT_MAX, INT_MAX);
+                r->last = GTID_MAX;
             }
 
             // if we got here, this is a valid rule
@@ -464,9 +522,19 @@ namespace mongo {
     }
 
     void ReplSetConfig::from(BSONObj o) {
-        static const string legal[] = {"_id","version", "members","settings"};
-        static const set<string> legals(legal, legal + 4);
+        static const string legal[] = {"_id","version", "protocolVersion", "members","settings"};
+        static const set<string> legals(legal, legal + 5);
         assertOnlyHas(o, legals);
+
+        {
+            uassert(16815, "no protocol version provided in config " + o.toString(), o["protocolVersion"].ok());
+            int pv = o["protocolVersion"].numberInt();
+            string pverr;
+            if (!checkProtocolVersion(pv, pverr)) {
+                uasserted(16816, pverr);
+            }
+            protocolVersion = pv;
+        }
 
         md5 = o.md5();
         _id = o["_id"].String();
@@ -589,7 +657,7 @@ namespace mongo {
     }
 
     ReplSetConfig::ReplSetConfig() :
-        version(EMPTYCONFIG),_ok(false),_majority(-1)
+        version(EMPTYCONFIG),protocolVersion(CURRENT_PROTOCOL_VERSION),_ok(false),_majority(-1)
     {}
 
     ReplSetConfig::ReplSetConfig(BSONObj cfg, bool force) :
@@ -627,11 +695,9 @@ namespace mongo {
             else {
                 /* first, make sure other node is configured to be a replset. just to be safe. */
                 string setname = cmdLine.ourSetName();
-                BSONObj cmd = BSON( "replSetHeartbeat" << setname );
-                int theirVersion;
                 BSONObj info;
                 log() << "trying to contact " << h.toString() << rsLog;
-                bool ok = requestHeartbeat(setname, "", h.toString(), info, -2, theirVersion);
+                bool ok = requestHeartbeat(setname, "", h.toString(), info, -2);
                 if( info["rs"].trueValue() ) {
                     // yes, it is a replicate set, although perhaps not yet initialized
                 }

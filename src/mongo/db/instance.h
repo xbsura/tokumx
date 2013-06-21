@@ -3,6 +3,7 @@
 
 /**
 *    Copyright (C) 2008 10gen Inc.
+*    Copyright (C) 2013 Tokutek Inc.
 *
 *    This program is free software: you can redistribute it and/or  modify
 *    it under the terms of the GNU Affero General Public License, version 3,
@@ -72,7 +73,7 @@ namespace mongo {
 
     void assembleResponse( Message &m, DbResponse &dbresponse, const HostAndPort &client );
 
-    void getDatabaseNames( vector< string > &names , const string& usePath = dbpath );
+    void getDatabaseNames( vector< string > &names);
 
     /* returns true if there is no data on this server.  useful when starting replication.
        local database does NOT count.
@@ -129,7 +130,7 @@ namespace mongo {
 #ifdef _WIN32
     extern HANDLE lockFileHandle;
 #endif
-    void acquirePathLock(bool doingRepair=false); // if doingRepair=true don't consider unclean shutdown an error
+    void acquirePathLock();
     void maybeCreatePidFile();
 
     void exitCleanly( ExitCode code );

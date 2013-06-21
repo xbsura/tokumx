@@ -2,6 +2,7 @@
 
 /**
 *    Copyright (C) 2008 10gen Inc.
+*    Copyright (C) 2013 Tokutek Inc.
 *
 *    This program is free software: you can redistribute it and/or  modify
 *    it under the terms of the GNU Affero General Public License, version 3,
@@ -20,13 +21,14 @@
 
 #include "mongo/pch.h"
 #include "mongo/client/dbclientinterface.h"
-#include "mongo/db/db.h"
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/json.h"
 #include "mongo/db/cursor.h"
 #include "mongo/db/oplog.h"
 #include "mongo/db/queryoptimizercursor.h"
 #include "mongo/db/repl_block.h"
+#include "mongo/db/database.h"
+#include "mongo/db/namespace_details.h"
 #include "mongo/db/ops/count.h"
 #include "mongo/db/ops/update.h"
 #include "mongo/db/ops/delete.h"
@@ -38,163 +40,10 @@
 
 namespace mongo {
 
-    const BSONObj reverseNaturalObj = BSON( "$natural" << -1 );
-
-    void Helpers::ensureIndex(const char *ns, BSONObj keyPattern, bool unique, const char *name) {
-        NamespaceDetails *d = nsdetails(ns);
-        if( d == 0 )
-            return;
-
-        {
-            NamespaceDetails::IndexIterator i = d->ii();
-            while( i.more() ) {
-                if( i.next().keyPattern().woCompare(keyPattern) == 0 )
-                    return;
-            }
-        }
-
-        if( d->nIndexes() >= NamespaceDetails::NIndexesMax ) {
-            problem() << "Helper::ensureIndex fails, MaxIndexes exceeded " << ns << '\n';
-            return;
-        }
-
-        string system_indexes = cc().database()->name + ".system.indexes";
-
-        BSONObjBuilder b;
-        b.append("name", name);
-        b.append("ns", ns);
-        b.append("key", keyPattern);
-        b.appendBool("unique", unique);
-        BSONObj o = b.done();
-
-        insertObject(system_indexes.c_str(), o, 0, true);
-    }
-
-    /* fetch a single object from collection ns that matches query
-       set your db SavedContext first
-    */
-    bool Helpers::findOne(const char *ns, const BSONObj &query, BSONObj& result, bool requireIndex) {
-        BSONObj obj = findOne( ns, query, requireIndex );
-        if ( obj.isEmpty() )
-            return false;
-        result = obj;
-        return true;
-    }
-
-    /* fetch a single object from collection ns that matches query
-       set your db SavedContext first
-    */
-    BSONObj Helpers::findOne(const char *ns, const BSONObj &query, bool requireIndex) {
-        shared_ptr<Cursor> c =
-            NamespaceDetailsTransient::getCursor( ns , query, BSONObj(),
-                                                  requireIndex ?
-                                                  QueryPlanSelectionPolicy::indexOnly() :
-                                                  QueryPlanSelectionPolicy::any() );
-        while( c->ok() ) {
-            if ( c->currentMatches() && !c->getsetdup( c->currPK() ) ) {
-                return c->current().copy();
-            }
-            c->advance();
-        }
-        return BSONObj();
-    }
-
-
-    bool Helpers::findById( const char *ns, BSONObj query, BSONObj& result ) {
-        Lock::assertAtLeastReadLocked(ns);
-        NamespaceDetails *d = nsindex(ns)->details(ns);
-        if ( ! d ) {
-            return false;
-        } else {
-            return d->findById(query, result);
-        }
-    }
-
-    shared_ptr<Cursor> Helpers::findTableScan(const char *ns, const BSONObj &order) {
-        const int direction = order.getField("$natural").number() >= 0 ? 1 : -1;
-        NamespaceDetails *d = nsdetails(ns);
-        return shared_ptr<Cursor>( BasicCursor::make(d, direction) );
-    }
-
-    vector<BSONObj> Helpers::findAll( const string& ns , const BSONObj& query ) {
-        Lock::assertAtLeastReadLocked( ns );
-
-        vector<BSONObj> all;
-
-        Client::Context tx( ns );
-        
-        shared_ptr<Cursor> c = NamespaceDetailsTransient::getCursor( ns.c_str(), query );
-
-        while( c->ok() ) {
-            if ( c->currentMatches() && !c->getsetdup( c->currPK() ) ) {
-                all.push_back( c->current().copy() );
-            }
-            c->advance();
-        }
-
-        return all;
-    }
-
-    bool Helpers::isEmpty(const char *ns, bool doAuth) {
-        Client::Context context(ns, dbpath, doAuth);
-        shared_ptr<Cursor> c = findTableScan(ns, BSONObj());
-        return !c->ok();
-    }
-
-    /* Get the first object from a collection.  Generally only useful if the collection
-       only ever has a single object -- which is a "singleton collection.
-
-       Returns: true if object exists.
-    */
-    bool Helpers::getSingleton(const char *ns, BSONObj& result) {
-        Client::Context context(ns);
-
-        shared_ptr<Cursor> c = findTableScan(ns, BSONObj());
-        if ( !c->ok() ) {
-            context.getClient()->curop()->done();
-            return false;
-        }
-
-        result = c->current().copy();
-        context.getClient()->curop()->done();
-        return true;
-    }
-
-    bool Helpers::getFirst(const char *ns, BSONObj& result) {
-        return getSingleton(ns, result);
-    }
-
-    bool Helpers::getLast(const char *ns, BSONObj& result) {
-        Client::Context ctx(ns);
-        shared_ptr<Cursor> c = findTableScan(ns, reverseNaturalObj);
-        if( !c->ok() )
-            return false;
-        result = c->current().copy();
-        return true;
-    }
-
-    void Helpers::upsert( const string& ns , const BSONObj& o, bool fromMigrate ) {
-        msgasserted(16740, "Helpers::upsert is deprecated, it should only be used by mapreduce now anyway");
-        BSONElement e = o["_id"];
-        verify( e.type() );
-        BSONObj id = e.wrap();
-
-        OpDebug debug;
-        Client::Context context(ns);
-        updateObjects(ns.c_str(), o, /*pattern=*/id, /*upsert=*/true, /*multi=*/false , /*logtheop=*/true , debug, fromMigrate );
-    }
-
     void Helpers::putSingleton(const char *ns, BSONObj obj) {
         OpDebug debug;
         Client::Context context(ns);
         updateObjects(ns, obj, /*pattern=*/BSONObj(), /*upsert=*/true, /*multi=*/false , /*logtheop=*/true , debug );
-        context.getClient()->curop()->done();
-    }
-
-    void Helpers::putSingletonGod(const char *ns, BSONObj obj, bool logTheOp) {
-        OpDebug debug;
-        Client::Context context(ns);
-        _updateObjects(/*god=*/true, ns, obj, /*pattern=*/BSONObj(), /*upsert=*/true, /*multi=*/false , logTheOp , debug );
         context.getClient()->curop()->done();
     }
 
@@ -252,10 +101,8 @@ namespace mongo {
                                     const BSONObj& max ,
                                     const BSONObj& keyPattern ,
                                     bool maxInclusive ,
-                                    bool secondaryThrottle ,
                                     bool fromMigrate ) {
         long long numDeleted = 0;
-        long long millisWaitingForReplication = 0;
 
         Client::ReadContext ctx(ns);
         Client::Transaction txn(DB_SERIALIZABLE);
@@ -270,43 +117,16 @@ namespace mongo {
         int minOrMax = maxInclusive ? 1 : -1;
         BSONObj newMax = Helpers::modifiedRangeBound( max , keyPattern , minOrMax );
 
-        for (IndexCursor c(d, i, newMin, newMax, maxInclusive, 1); c.ok(); c.advance()) {
-            BSONObj pk = c.currPK();
-            BSONObj obj = c.current();
+        for (shared_ptr<Cursor> c(IndexCursor::make(d, i, newMin, newMax, maxInclusive, 1)); c->ok(); c->advance()) {
+            BSONObj pk = c->currPK();
+            BSONObj obj = c->current();
             OpLogHelpers::logDelete(ns.c_str(), obj, fromMigrate, &cc().txn());
             deleteOneObject(d, nsdt, pk, obj);
             numDeleted++;
-            // Let's not wait for replication for now.  TODO(leif): maybe put this back.
-#if 0
-            Timer secondaryThrottleTime;
-
-            if ( secondaryThrottle ) {
-                if ( ! waitForReplication( c.getLastOp(), 2, 60 /* seconds to wait */ ) ) {
-                    warning() << "replication to secondaries for removeRange at least 60 seconds behind" << endl;
-                }
-                millisWaitingForReplication += secondaryThrottleTime.millis();
-            }
-#endif
-        }
-
-        if ( secondaryThrottle ) {
-            log() << "Helpers::removeRangeUnlocked time spent waiting for replication: "  
-                  << millisWaitingForReplication << "ms" << endl;
         }
 
         txn.commit();
         return numDeleted;
-    }
-
-    void Helpers::emptyCollection(const char *ns) {
-        Client::Context context(ns);
-        deleteObjects(ns, BSONObj(), false);
-    }
-
-    long long Helpers::runCount(const char *ns, const BSONObj& cmd, string& err, int& errCode ) {
-        Lock::DBRead lk(ns);
-        long long r = mongo::runCount(ns, cmd, err, errCode);
-        return r;
     }
 
 } // namespace mongo

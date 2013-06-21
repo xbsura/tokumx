@@ -2,6 +2,7 @@
 
 /**
 *    Copyright (C) 2008 10gen Inc.
+*    Copyright (C) 2013 Tokutek Inc.
 *
 *    This program is free software: you can redistribute it and/or  modify
 *    it under the terms of the GNU Affero General Public License, version 3,
@@ -132,13 +133,13 @@ namespace mongo {
     // ---------- admin commands ----------
 
     // Note, this command will block until there is something to WriteBack
-    class WriteBackCommand : public Command {
+    class WriteBackCommand : public InformationCommand {
     public:
-        virtual LockType locktype() const { return NONE; }
-        virtual bool slaveOk() const { return true; }
         virtual bool adminOnly() const { return true; }
 
-        WriteBackCommand() : Command( "writebacklisten" ) {}
+        WriteBackCommand() : InformationCommand("writebacklisten") {}
+
+        virtual LockType lockType() const { return OPLOCK; }
 
         void help(stringstream& h) const { h<<"internal"; }
 
@@ -181,14 +182,10 @@ namespace mongo {
         }
     } writeBackCommand;
 
-    class WriteBacksQueuedCommand : public Command {
+    class WriteBacksQueuedCommand : public InformationCommand {
     public:
-        virtual LockType locktype() const { return NONE; }
-        virtual bool slaveOk() const { return true; }
         virtual bool adminOnly() const { return true; }
-
-        WriteBacksQueuedCommand() : Command( "writeBacksQueued" ) {}
-
+        WriteBacksQueuedCommand() : InformationCommand("writeBacksQueued") {}
         void help(stringstream& help) const {
             help << "Returns whether there are operations in the writeback queue at the time the command was called. "
                  << "This is an internal command";

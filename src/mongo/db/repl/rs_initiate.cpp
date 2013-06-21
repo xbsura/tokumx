@@ -3,6 +3,7 @@
 
 /**
 *    Copyright (C) 2008 10gen Inc.
+*    Copyright (C) 2013 Tokutek Inc.
 *
 *    This program is free software: you can redistribute it and/or  modify
 *    it under the terms of the GNU Affero General Public License, version 3,
@@ -74,12 +75,17 @@ namespace mongo {
             {
                 bool ok = false;
                 try {
-                    int theirVersion = -1000;
-                    ok = requestHeartbeat(cfg._id, "", i->h.toString(), res, -1, theirVersion, initial/*check if empty*/);
-                    if( theirVersion >= cfg.version ) {
-                        stringstream ss;
-                        ss << "replSet member " << i->h.toString() << " has too new a config version (" << theirVersion << ") to reconfigure";
-                        uasserted(13259, ss.str());
+                    ok = requestHeartbeat(cfg._id, "", i->h.toString(), res, -1, initial/*check if empty*/);
+                    if (ok) {
+                        BSONElement vElt = res["v"];
+                        if (vElt.ok()) {
+                            int theirVersion = res["v"].Int();
+                            if( theirVersion >= cfg.version ) {
+                                stringstream ss;
+                                ss << "replSet member " << i->h.toString() << " has too new a config version (" << theirVersion << ") to reconfigure";
+                                uasserted(13259, ss.str());
+                            }
+                        }
                     }
                 }
                 catch(DBException& e) {
@@ -87,6 +93,9 @@ namespace mongo {
                 }
                 catch(...) {
                     log() << "replSet cmufcc error exception in requestHeartbeat?" << rsLog;
+                }
+                if (res.getBoolField("protocolVersionMismatch")) {
+                    uasserted(16817, "member " + i->h.toString() + " has a protocol version that is incompatible with ours: " + res.toString());
                 }
                 if( res.getBoolField("mismatch") )
                     uasserted(13145, "set name does not match the set name host " + i->h.toString() + " expects");
@@ -146,6 +155,7 @@ namespace mongo {
         virtual LockType locktype() const { return NONE; }
         virtual bool needsTxn() const { return false; }
         CmdReplSetInitiate() : ReplSetCommand("replSetInitiate") { }
+        virtual bool canRunInMultiStmtTxn() const { return false; }
         virtual void help(stringstream& h) const {
             h << "Initiate/christen a replica set.";
             h << "\nhttp://dochub.mongodb.org/core/replicasetcommands";
@@ -177,11 +187,13 @@ namespace mongo {
                 /* check that we don't already have an oplog.  that could cause issues.
                    it is ok if the initiating member has *other* data than that.
                    */
-                BSONObj o;
-                if( Helpers::getFirst(rsoplog, o) ) {
+                Client::Transaction transaction(DB_SERIALIZABLE);
+                BSONObj o = getLastEntryInOplog();
+                if( !o.isEmpty() ) {
                     errmsg = rsoplog + string(" is not empty on the initiating member.  cannot initiate.");
                     return false;
                 }
+                transaction.commit();
             }
 
             if( ReplSet::startupStatus == ReplSet::BADCONFIG ) {
@@ -209,6 +221,7 @@ namespace mongo {
 
                 bob b;
                 b.append("_id", name);
+                b.append("protocolVersion", ReplSetConfig::CURRENT_PROTOCOL_VERSION);
                 bob members;
                 members.append("0", BSON( "_id" << 0 << "host" << HostAndPort::me().toString() ));
                 result.append("me", HostAndPort::me().toString());
@@ -219,7 +232,7 @@ namespace mongo {
                 log() << "replSet created this configuration for initiation : " << configObj.toString() << rsLog;
             }
             else {
-                configObj = cmdObj["replSetInitiate"].Obj();
+                configObj = ReplSetConfig::addProtocolVersionIfMissing(cmdObj["replSetInitiate"].Obj());
             }
 
             bool parsed = false;

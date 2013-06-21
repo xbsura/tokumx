@@ -1,5 +1,6 @@
 /**
 *    Copyright (C) 2008 10gen Inc.
+*    Copyright (C) 2013 Tokutek Inc.
 *
 *    This program is free software: you can redistribute it and/or  modify
 *    it under the terms of the GNU Affero General Public License, version 3,
@@ -22,20 +23,33 @@
    Cursor -- and its derived classes -- are our internal cursors.
 */
 
-#include "pch.h"
-#include "clientcursor.h"
-#include "introspect.h"
+#include "mongo/pch.h"
+
 #include <time.h>
-#include "db.h"
-#include "commands.h"
-#include "repl_block.h"
-#include "../util/processinfo.h"
-#include "../util/timer.h"
+
 #include "mongo/client/dbclientinterface.h"
+#include "mongo/db/database.h"
+#include "mongo/db/clientcursor.h"
+#include "mongo/db/introspect.h"
+#include "mongo/db/commands.h"
+#include "mongo/db/repl_block.h"
 #include "mongo/db/scanandorder.h"
 #include "mongo/db/repl/rs.h"
+#include "mongo/util/processinfo.h"
+#include "mongo/util/timer.h"
 
 namespace mongo {
+
+    bool opForSlaveTooOld(uint64_t ts) {
+        const uint64_t expireMillis = expireOplogMilliseconds();
+        if (ts && expireMillis) {
+            const uint64_t minTime = curTimeMillis64() - expireMillis;
+            if (ts < minTime) {
+                return true;
+            }
+        }
+        return false;
+    }
 
     CCById ClientCursor::clientCursorsById;
     boost::recursive_mutex& ClientCursor::ccmutex( *(new boost::recursive_mutex()) );
@@ -52,27 +66,27 @@ namespace mongo {
         }
     }
 
+    void ClientCursor::invalidateAllCursors() {
+        verify(Lock::isW());
+        for( LockedIterator i; i.ok(); ) {
+            i.deleteAndAdvance();
+        }
+    }
 
     /* ------------------------------------------- */
 
-    /* must call this when a btree node is updated */
-    //void removedKey(const DiskLoc& btreeLoc, int keyPos) {
-    //}
-
     // ns is either a full namespace or "dbname." when invalidating for a whole db
-    void ClientCursor::invalidate(const char *ns) {
+    void ClientCursor::invalidate(const StringData &ns) {
         Lock::assertWriteLocked(ns);
-        int len = strlen(ns);
-        const char* dot = strchr(ns, '.');
-        verify( len > 0 && dot);
-
-        bool isDB = (dot == &ns[len-1]); // first (and only) dot is the last char
+        size_t dotpos = ns.find('.');
+        verify(dotpos != string::npos);
+        bool isDB = (dotpos + 1) == ns.size(); // first (and only) dot is the last char
 
         {
             //cout << "\nTEMP invalidate " << ns << endl;
             Database *db = cc().database();
             verify(db);
-            verify( str::startsWith(ns, db->name) );
+            verify( ns.startsWith(db->name()) );
 
             for( LockedIterator i; i.ok(); ) {
                 ClientCursor *cc = i.current();
@@ -81,11 +95,11 @@ namespace mongo {
                 if ( cc->_db == db ) {
                     if (isDB) {
                         // already checked that db matched above
-                        dassert( str::startsWith(cc->_ns.c_str(), ns) );
+                        dassert( StringData(cc->_ns).startsWith(ns) );
                         shouldDelete = true;
                     }
                     else {
-                        if ( str::equals(cc->_ns.c_str(), ns) )
+                        if ( ns == cc->_ns )
                             shouldDelete = true;
                     }
                 }
@@ -97,26 +111,6 @@ namespace mongo {
                     i.advance();
                 }
             }
-
-            /*
-            note : we can't iterate byloc because clientcursors may exist with a loc of null in which case
-                   they are not in the map.  perhaps they should not exist though in the future?  something to
-                   change???
-
-            CCByLoc& bl = db->ccByLoc;
-            for ( CCByLoc::iterator i = bl.begin(); i != bl.end(); ++i ) {
-                ClientCursor *cc = i->second;
-                if ( strncmp(ns, cc->ns.c_str(), len) == 0 ) {
-                    verify( cc->_db == db );
-                    toDelete.push_back(i->second);
-                }
-            }*/
-
-            /*cout << "TEMP after invalidate " << endl;
-            for( auto i = clientCursorsById.begin(); i != clientCursorsById.end(); ++i ) {
-                cout << "  " << i->second->ns << endl;
-            }
-            cout << "TEMP after invalidate done" << endl;*/
         }
     }
 
@@ -177,21 +171,32 @@ namespace mongo {
         _i = clientCursorsById.upper_bound( id );
     }
     
-    ClientCursor::ClientCursor(int queryOptions, const shared_ptr<Cursor>& c, const string& ns, BSONObj query ) :
+    ClientCursor::ClientCursor(int queryOptions, const shared_ptr<Cursor>& c, const string& ns,
+                               BSONObj query, const bool inMultiStatementTxn ) :
         _ns(ns), _db( cc().database() ),
         _c(c), _pos(0),
         _query(query),  _queryOptions(queryOptions),
-        _idleAgeMillis(0), _pinValue(0) {
+        _slaveReadTillTS(0),
+        _idleAgeMillis(0), _pinValue(0),
+        _partOfMultiStatementTxn(inMultiStatementTxn) {
 
         Lock::assertAtLeastReadLocked(ns);
 
         verify( _db );
-        verify( str::startsWith(_ns, _db->name) );
+        verify( str::startsWith(_ns, _db->name()) );
         if( queryOptions & QueryOption_NoCursorTimeout )
             noTimeout();
         recursive_scoped_lock lock(ccmutex);
         _cursorid = allocCursorId_inlock();
         clientCursorsById.insert( make_pair(_cursorid, this) );
+
+        if (_partOfMultiStatementTxn) {
+            transactions = cc().txnStack();
+            // This cursor is now part of a multi-statement transaction and must be
+            // closed before that txn commits or aborts. Note it in the rollback.
+            ClientCursorRollback &rollback = cc().txn().clientCursorRollback();
+            rollback.noteClientCursor(_cursorid);
+        }
 
         if ( ! _c->modifiedKeys() ) {
             // store index information so we can decide if we can
@@ -210,7 +215,6 @@ namespace mongo {
         }
 
     }
-
 
     ClientCursor::~ClientCursor() {
         if( _pos == -2 ) {
@@ -313,7 +317,7 @@ namespace mongo {
     void ClientCursor::fillQueryResultFromObj( BufBuilder &b, const MatchDetails* details ) const {
         const Projection::KeyOnly *keyFieldsOnly = c()->keyFieldsOnly();
         if ( keyFieldsOnly ) {
-            mongo::fillQueryResultFromObj( b, 0, keyFieldsOnly->hydrate( c()->currKey() ), details );
+            mongo::fillQueryResultFromObj( b, 0, keyFieldsOnly->hydrate( c()->currKey(), c()->currPK() ), details );
         }
         else {
             mongo::fillQueryResultFromObj( b, fields.get(), c()->current(), details );
@@ -336,26 +340,26 @@ namespace mongo {
         return x;
     }
 
-#if 0
-    void ClientCursor::storeOpForSlave( DiskLoc last ) {
+    void ClientCursor::storeOpForSlave( BSONObj curr ) {
         if ( ! ( _queryOptions & QueryOption_OplogReplay ))
             return;
 
-        if ( last.isNull() )
-            return;
-
-        BSONElement e = last.obj()["ts"];
-        if ( e.type() == Date || e.type() == Timestamp )
-            _slaveReadTill = e._opTime();
+        BSONElement e = curr["_id"];
+        if ( e.type() == BinData ) {
+            _slaveReadTill = getGTIDFromBSON("_id", curr);
+            _slaveReadTillTS = curr["ts"]._numberLong();
+        }
     }
-#endif
 
     void ClientCursor::updateSlaveLocation( CurOp& curop ) {
-        if ( _slaveReadTill.isNull() )
+        if ( _slaveReadTill.isInitial() )
             return;
         mongo::updateSlaveLocation( curop , _ns.c_str() , _slaveReadTill );
     }
 
+    bool ClientCursor::lastOpForSlaveTooOld() {
+        return opForSlaveTooOld(_slaveReadTillTS);
+    }
 
     void ClientCursor::appendStats( BSONObjBuilder& result ) {
         recursive_scoped_lock lock(ccmutex);
@@ -379,74 +383,17 @@ namespace mongo {
 
     // QUESTION: Restrict to the namespace from which this command was issued?
     // Alternatively, make this command admin-only?
-    class CmdCursorInfo : public Command {
+    class CmdCursorInfo : public InformationCommand {
     public:
-        CmdCursorInfo() : Command( "cursorInfo", true ) {}
-        virtual bool slaveOk() const { return true; }
-        virtual bool needsTxn() const { return false; }
-        virtual bool canRunInMultiStmtTxn() const { return true; }
+        CmdCursorInfo() : InformationCommand("cursorInfo") {}
         virtual void help( stringstream& help ) const {
             help << " example: { cursorInfo : 1 }";
         }
-        virtual LockType locktype() const { return NONE; }
         bool run(const string& dbname, BSONObj& jsobj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl ) {
             ClientCursor::appendStats( result );
             return true;
         }
     } cmdCursorInfo;
-
-    struct Mem { 
-        Mem() { res = virt = mapped = 0; }
-        long long res;
-        long long virt;
-        long long mapped;
-        bool grew(const Mem& r) { 
-            return (r.res && (((double)res)/r.res)>1.1 ) ||
-              (r.virt && (((double)virt)/r.virt)>1.1 ) ||
-              (r.mapped && (((double)mapped)/r.mapped)>1.1 );
-        }
-    };
-
-    /** called once a minute from killcursors thread */
-    void sayMemoryStatus() { 
-        // TODO: What should TokuDB do here?
-#if 0
-        static time_t last;
-        static Mem mlast;
-        try {
-            ProcessInfo p;
-            if ( !cmdLine.quiet && p.supported() ) {
-                Mem m;
-                m.res = p.getResidentSize();
-                m.virt = p.getVirtualMemorySize();
-                m.mapped = MemoryMappedFile::totalMappedLength() / (1024 * 1024);
-                time_t now = time(0);
-                if( now - last >= 300 || m.grew(mlast) ) { 
-                    log() << "mem (MB) res:" << m.res << " virt:" << m.virt;
-                    long long totalMapped = m.mapped;
-                    if (cmdLine.dur) {
-                        totalMapped *= 2;
-                        log() << " mapped (incl journal view):" << totalMapped;
-                    }
-                    else {
-                        log() << " mapped:" << totalMapped;
-                    }
-                    log() << " connections:" << connTicketHolder.used();
-                    if (theReplSet) {
-                        log() << " replication threads:" << 
-                            ReplSetImpl::replWriterThreadCount + 
-                            ReplSetImpl::replPrefetcherThreadCount;
-                    }
-                    last = now;
-                    mlast = m;
-                }
-            }
-        }
-        catch(const std::exception&) {
-            log() << "ProcessInfo exception" << endl;
-        }
-#endif
-    }
 
     /** thread for timing out old cursors */
     void ClientCursorMonitor::run() {
@@ -454,13 +401,9 @@ namespace mongo {
         Client& client = cc();
         Timer t;
         const int Secs = 4;
-        unsigned n = 0;
         while ( ! inShutdown() ) {
             ClientCursor::idleTimeReport( t.millisReset() );
             sleepsecs(Secs);
-            if( ++n % (60/4) == 0 /*once a minute*/ ) { 
-                sayMemoryStatus();
-            }
         }
         client.shutdown();
     }
@@ -505,35 +448,14 @@ namespace mongo {
 
     }
 
-#if 0
-    ClientCursor::YieldLock::YieldLock( ptr<ClientCursor> cc )
-        : _canYield(cc->_c->supportYields()) {
-     
-        if ( _canYield ) {
-            cc->prepareToYield( _data );
-            _unlock.reset(new dbtempreleasecond());
+    bool ClientCursor::checkMultiStatementTxn() {
+        verify(transactions.get() != NULL);
+        if (_partOfMultiStatementTxn) {
+            uassert(16811, "Cannot use a client cursor belonging to a different multi-statement transaction",
+                       cc().txnStack() == transactions);
         }
-
+        return _partOfMultiStatementTxn;
     }
-    
-    ClientCursor::YieldLock::~YieldLock() {
-        if ( _unlock ) {
-            warning() << "ClientCursor::YieldLock not closed properly" << endl;
-            relock();
-        }
-    }
-    
-    bool ClientCursor::YieldLock::stillOk() {
-        if ( ! _canYield )
-            return true;
-        relock();
-        return ClientCursor::recoverFromYield( _data );
-    }
-    
-    void ClientCursor::YieldLock::relock() {
-        _unlock.reset();
-    }
-#endif
 
     ClientCursorMonitor clientCursorMonitor;
 

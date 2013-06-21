@@ -2,6 +2,7 @@
 
 /**
 *    Copyright (C) 2008 10gen Inc.
+*    Copyright (C) 2013 Tokutek Inc.
 *
 *    This program is free software: you can redistribute it and/or  modify
 *    it under the terms of the GNU Affero General Public License, version 3,
@@ -23,7 +24,11 @@
 
 namespace mongo {
 
-    void deleteOneObject(NamespaceDetails *details, NamespaceDetailsTransient *nsdt, const BSONObj &pk, const BSONObj &obj);
+    class NamespaceDetails;
+    class NamespaceDetailsTransient;
+
+    void deleteOneObject(NamespaceDetails *details, NamespaceDetailsTransient *nsdt,
+                         const BSONObj &pk, const BSONObj &obj, uint64_t flags = 0);
 
     // System-y version of deleteObjects that allows you to delete from the system collections, used to be god = true.
     long long _deleteObjects(const char *ns, BSONObj pattern, bool justOne, bool logop);

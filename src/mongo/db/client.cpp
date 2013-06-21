@@ -2,6 +2,7 @@
 
 /**
 *    Copyright (C) 2009 10gen Inc.
+*    Copyright (C) 2013 Tokutek Inc.
 *
 *    This program is free software: you can redistribute it and/or  modify
 *    it under the terms of the GNU Affero General Public License, version 3,
@@ -20,26 +21,28 @@
    to an open socket (or logical connection if pooling on sockets) from a client.
 */
 
-#include "pch.h"
-#include "db.h"
-#include "client.h"
-#include "curop.h"
-#include "json.h"
-#include "security.h"
-#include "commands.h"
-#include "instance.h"
-#include "../s/d_logic.h"
-#include "dbwebserver.h"
-#include "../util/mongoutils/html.h"
-#include "../util/mongoutils/checksum.h"
-#include "../util/file_allocator.h"
-#include "repl/rs.h"
-#include "../scripting/engine.h"
+#include "mongo/pch.h"
+#include "mongo/db/client.h"
+#include "mongo/db/curop.h"
+#include "mongo/db/databaseholder.h"
+#include "mongo/db/json.h"
+#include "mongo/db/security.h"
+#include "mongo/db/commands.h"
+#include "mongo/db/instance.h"
+#include "mongo/db/dbwebserver.h"
+#include "mongo/db/repl/rs.h"
+#include "mongo/s/d_logic.h"
+#include "mongo/scripting/engine.h"
+#include "mongo/util/mongoutils/html.h"
+#include "mongo/util/mongoutils/checksum.h"
 
 namespace mongo {
   
     mongo::mutex& Client::clientsMutex = *(new mutex("clientsMutex"));
     set<Client*>& Client::clients = *(new set<Client*>); // always be in clientsMutex when manipulating this
+
+    RWLockRecursive operationLock("operationLock");
+
 
     TSP_DEFINE(Client, currentClient)
 
@@ -71,7 +74,6 @@ namespace mongo {
         _shutdown(false),
         _desc(desc),
         _god(0),
-        _lastOp(0),
         _mp(p)
     {
         _hasWrittenThisPass = false;
@@ -118,6 +120,19 @@ namespace mongo {
         }
     }
 
+    // called when we transition from primary to secondary
+    // a global write lock is held while this is happening
+    void Client::abortLiveTransactions() {
+        verify(Lock::isW());
+        scoped_lock bl(Client::clientsMutex);
+        for( set<Client*>::iterator i = Client::clients.begin(); i != Client::clients.end(); i++ ) {
+            Client *c = *i;
+            while (c->hasTxn()) {
+                c->abortTopTxn();
+            }
+        }
+    }
+
     bool Client::shutdown() {
         _shutdown = true;
         // client is being destroyed, if there are any transactions on our stack,
@@ -140,13 +155,12 @@ namespace mongo {
     }
 
     BSONObj CachedBSONObj::_tooBig = fromjson("{\"$msg\":\"query not recording (too large)\"}");
-    Client::Context::Context( string ns , Database * db, bool doauth ) :
+    Client::Context::Context( const StringData &ns , Database * db, bool doauth ) :
         _client( currentClient.get() ), 
         _oldContext( _client->_context ),
         _path( mongo::dbpath ), // is this right? could be a different db? may need a dassert for this
-        _justCreated(false),
         _doVersion( true ),
-        _ns( ns ), 
+        _ns( ns.toString() ),
         _db(db)
     {
         verify( db == 0 || db->isOk() );
@@ -154,13 +168,12 @@ namespace mongo {
         checkNsAccess( doauth );
     }
 
-    Client::Context::Context(const string& ns, string path , bool doauth, bool doVersion) :
-        _client( currentClient.get() ), 
+    Client::Context::Context(const StringData &ns, const StringData &path , bool doauth, bool doVersion ) :
+        _client( currentClient.get() ),
         _oldContext( _client->_context ),
-        _path( path ), 
-        _justCreated(false), // set for real in finishInit
+        _path( path.toString() ),
         _doVersion(doVersion),
-        _ns( ns ), 
+        _ns( ns.toString() ),
         _db(0)
     {
         _finishInit( doauth );
@@ -169,57 +182,12 @@ namespace mongo {
     /** "read lock, and set my context, all in one operation" 
      *  This handles (if not recursively locked) opening an unopened database.
      */
-    Client::ReadContext::ReadContext(const string& ns, string path, bool doauth) {
-        // TODO: What did I do here to get runQuery operate on a null database object?
-
-        {
-            lk.reset( new Lock::DBRead(ns) );
-            Database *db = dbHolder().get(ns, path);
-            if( db ) {
-                c.reset( new Context(path, ns, db, doauth) );
-                try {
-                    nsdetails(ns.c_str());
-                } catch (RetryWithWriteLock &e) {
-                    lk.reset(0);
-                    {
-                        Lock::GlobalWrite w;
-                        nsdetails(ns.c_str()); // open the nsdetails now that we have a write lock, which must succeed.
-                    }
-                    lk.reset( new Lock::DBRead(ns) );
-                }
-                return;
-            }
-        }
-
-        // we usually don't get here, so doesn't matter how fast this part is
-        {
-            DEV log() << "_DEBUG ReadContext db wasn't open, will try to open " << ns << endl;
-            if( Lock::isW() ) { 
-                // write locked already, so we should have have failed to open the NS
-                DEV RARELY log() << "write locked on ReadContext construction " << ns << endl;
-                c.reset( new Context(ns, path, doauth) );
-            }
-            else if( !Lock::nested() ) { 
-                lk.reset(0);
-                {
-                    Lock::GlobalWrite w;
-                    Context c(ns, path, doauth);
-                }
-                // db could be closed at this interim point -- that is ok, we will throw, and don't mind throwing.
-                lk.reset( new Lock::DBRead(ns) );
-                c.reset( new Context(ns, path, doauth) );
-            }
-            else {
-                throw RetryWithWriteLock(str::stream() << "opening database for ns " << ns);
-            }
-        }
-
-        // todo: are receipts of thousands of queries for a nonexisting database a potential 
-        //       cause of bad performance due to the write lock acquisition above?  let's fix that.
-        //       it would be easy to first check that there is at least a .ns file, or something similar.
+    Client::ReadContext::ReadContext(const StringData &ns, const StringData &path, bool doauth)
+        : _lk( ns ) ,
+          _c( ns , path , doauth ) {
     }
 
-    Client::WriteContext::WriteContext(const string& ns, string path , bool doauth ) 
+    Client::WriteContext::WriteContext(const StringData &ns, const StringData &path , bool doauth ) 
         : _lk( ns ) ,
           _c( ns , path , doauth ) {
     }
@@ -245,13 +213,12 @@ namespace mongo {
     }
 
     // invoked from ReadContext
-    Client::Context::Context(const string& path, const string& ns, Database *db , bool doauth) :
-        _client( currentClient.get() ), 
+    Client::Context::Context(const StringData &path, const StringData &ns, Database *db , bool doauth) :
+        _client( currentClient.get() ),
         _oldContext( _client->_context ),
-        _path( path ), 
-        _justCreated(false),
+        _path( path.toString() ),
         _doVersion( true ),
-        _ns( ns ), 
+        _ns( ns.toString() ),
         _db(db)
     {
         verify(_db);
@@ -264,11 +231,8 @@ namespace mongo {
     void Client::Context::_finishInit( bool doauth ) {
         dassert( Lock::isLocked() );
         int writeLocked = Lock::somethingWriteLocked();
-        if ( writeLocked && FileAllocator::get()->hasFailed() ) {
-            uassert(14031, "Can't take a write lock while out of disk space", false);
-        }
-        
-        _db = dbHolderUnchecked().getOrCreate( _ns , _path , _justCreated );
+
+        _db = dbHolderUnchecked().getOrCreate( _ns , _path );
         verify(_db);
         if( _doVersion ) checkNotStale();
         massert( 16107 , str::stream() << "Don't have a lock on: " << _ns , Lock::atLeastReadLocked( _ns ) );
@@ -281,14 +245,14 @@ namespace mongo {
         if (lockState <= 0 && str::endsWith(_ns, ".system.users"))
             lockState = 1; // we don't want read-only users to be able to read system.users SERVER-4692
 
-        if ( _client->_ai.isAuthorizedForLock( _db->name , lockState ) )
+        if ( _client->_ai.isAuthorizedForLock( _db->name() , lockState ) )
             return;
 
         // before we assert, do a little cleanup
         _client->_context = _oldContext; // note: _oldContext may be null
 
         stringstream ss;
-        ss << "unauthorized db:" << _db->name << " ns:" << _ns << " lock type:" << lockState << " client:" << _client->clientAddress();
+        ss << "unauthorized db:" << _db->name() << " ns:" << _ns << " lock type:" << lockState << " client:" << _client->clientAddress();
         uasserted( 10057 , ss.str() );
     }
     
@@ -299,14 +263,14 @@ namespace mongo {
         _client->_context = _oldContext; // note: _oldContext may be null
     }
 
-    bool Client::Context::inDB( const string& db , const string& path ) const {
+    bool Client::Context::inDB( const StringData& db , const StringData& path ) const {
         if ( _path != path )
             return false;
 
         if ( db == _ns )
             return true;
 
-        string::size_type idx = _ns.find( db );
+        size_t idx = _ns.find( db.toString() );
         if ( idx != 0 )
             return false;
 
@@ -325,10 +289,10 @@ namespace mongo {
         checkNsAccess( doauth, Lock::somethingWriteLocked() ? 1 : 0 );
     }
 
-    void Client::appendLastOp( BSONObjBuilder& b ) const {
-        // _lastOp is never set if replication is off
-        if( theReplSet || ! _lastOp.isNull() ) {
-            b.appendTimestamp( "lastOp" , _lastOp.asDate() );
+    void Client::appendLastGTID( BSONObjBuilder& b ) const {
+        // _lastGTID is never set if replication is off
+        if( theReplSet || ! _lastGTID.isInitial()) {
+            addGTIDToBSON("lastGTID", _lastGTID, b);
         }
     }
 
@@ -389,6 +353,7 @@ namespace mongo {
         }
     }
 
+    // used to establish a slave for 'w' write concern
     void Client::gotHandshake( const BSONObj& o ) {
         BSONObjIterator i(o);
 
@@ -407,7 +372,7 @@ namespace mongo {
         _handshake = b.obj();
 
         if (theReplSet && o.hasField("member")) {
-            theReplSet->ghost->associateSlave(_remoteId, o["member"].Int());
+            theReplSet->registerSlave(_remoteId, o["member"].Int());
         }
     }
 
@@ -419,20 +384,16 @@ namespace mongo {
         return currentClient.get();
     }
 
-    class HandshakeCmd : public Command {
-    public:
+    class HandshakeCmd : public InformationCommand {
+      public:
         void help(stringstream& h) const { h << "internal"; }
-        HandshakeCmd() : Command( "handshake" ) {}
-        virtual LockType locktype() const { return NONE; }
-        virtual bool slaveOk() const { return true; }
+        HandshakeCmd() : InformationCommand("handshake", false) {}
         virtual bool adminOnly() const { return false; }
-        virtual bool needsTxn() const { return false; }
         virtual bool run(const string& , BSONObj& cmdObj, int, string& errmsg, BSONObjBuilder& result, bool fromRepl) {
             Client& c = cc();
             c.gotHandshake( cmdObj );
-            return 1;
+            return true;
         }
-
     } handshakeCmd;
 
     class ClientListPlugin : public WebStatusPlugin {
@@ -493,7 +454,7 @@ namespace mongo {
 
     } clientListPlugin;
 
-    int Client::recommendedYieldMicros( int * writers , int * readers, bool needExact ) {
+    void Client::getReaderWriterClientCount( int *readers , int *writers ) {
         int num = 0;
         int w = 0;
         int r = 0;
@@ -508,28 +469,13 @@ namespace mongo {
                     else
                         r++;
                 }
-                if (num > 100 && !needExact)
-                    break;
             }
         }
 
-        if ( writers )
-            *writers = w;
-        if ( readers )
-            *readers = r;
-
-        int time = r * 10; // we have to be nice to readers since they don't have priority
-        time += w; // writers are greedy, so we can be mean tot hem
-
-        time = min( time , 1000000 );
-
-        // if there has been a kill request for this op - we should yield to allow the op to stop
-        // This function returns empty string if we aren't interrupted
-        if ( *killCurrentOp.checkForInterruptNoAssert() ) {
-            return 100;
-        }
-
-        return time;
+        verify(writers);
+        verify(readers);
+        *writers = w;
+        *readers = r;
     }
 
     int Client::getActiveClientCount( int& writers, int& readers ) {
@@ -582,6 +528,19 @@ namespace mongo {
         responseLength = -1;
     }
 
+    bool OpDebug::vetoLog( const CurOp& curop ) const {
+        // this is causing many tests to output lots of logs
+        // we don't need it.
+        // Basically, this is the case of oplog cursors still trying
+        // to connect to a machine even though the machine is shutting
+        // down. We should find a way for the oplog to veto
+        // that machine, but can't find method to do it now
+        if (exceptionInfo.code == 11600 && ns == "local.oplog.rs" ) {
+            return true;
+        }
+        return false;
+    }
+
 
 #define OPDEBUG_TOSTRING_HELP(x) if( x >= 0 ) s << " " #x ":" << (x)
 #define OPDEBUG_TOSTRING_HELP_BOOL(x) if( x ) s << " " #x ":" << (x)
@@ -591,14 +550,14 @@ namespace mongo {
             s << "command ";
         else
             s << opToString( op ) << ' ';
-        s << ns.toString();
+        s << ns;
 
         if ( ! query.isEmpty() ) {
             if ( iscommand )
                 s << " command: ";
             else
                 s << " query: ";
-            s << query.toString();
+            s << query.toString(false, true);
         }
         
         if ( ! updateobj.isEmpty() ) {
@@ -645,7 +604,7 @@ namespace mongo {
 #define OPDEBUG_APPEND_BOOL(x) if( x ) b.appendBool( #x , (x) )
     void OpDebug::append( const CurOp& curop, BSONObjBuilder& b ) const {
         b.append( "op" , iscommand ? "command" : opToString( op ) );
-        b.append( "ns" , ns.toString() );
+        b.append( "ns" , ns );
         if ( ! query.isEmpty() )
             b.append( iscommand ? "command" : "query" , query );
         else if ( ! iscommand && curop.haveQuery() )

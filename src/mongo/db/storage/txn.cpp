@@ -1,5 +1,5 @@
 /**
-*    Copyright (C) 2012 Tokutek Inc.
+*    Copyright (C) 2013 Tokutek Inc.
 *
 *    This program is free software: you can redistribute it and/or  modify
 *    it under the terms of the GNU Affero General Public License, version 3,
@@ -38,9 +38,7 @@ namespace mongo {
         }
 
         static void commit_txn(DB_TXN *db_txn, int flags) {
-            // TODO: move to only where we need it
-            const int extra_flags = (cmdLine.logFlushPeriod == 0) ? 0 : DB_TXN_NOSYNC;
-            int r = db_txn->commit(db_txn, flags | extra_flags);
+            int r = db_txn->commit(db_txn, flags);
             if (r != 0) {
                 handle_ydb_error(r);
             }
@@ -59,7 +57,10 @@ namespace mongo {
                                      : parent->_db_txn),
                                     (parent == NULL
                                      ? flags
-                                     : DB_INHERIT_ISOLATION)))
+                                     : DB_INHERIT_ISOLATION))),
+                 _flags(parent == NULL
+                        ? flags
+                        : parent->_flags)
         {
             DEV {
                 LOG(3) << "begin txn " << _db_txn << " (" << (parent == NULL ? NULL : parent->_db_txn)
