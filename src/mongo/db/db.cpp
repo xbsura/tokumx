@@ -1046,7 +1046,7 @@ namespace mongo {
         while (true) {
             int actualSignal = 0;
             int status = sigwait( &asyncSignals, &actualSignal );
-            fassert(16854, status == 0);
+            fassert(16862, status == 0);
             switch (actualSignal) {
             case SIGUSR1:
                 // log rotate signal
