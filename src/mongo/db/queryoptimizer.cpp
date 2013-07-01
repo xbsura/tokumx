@@ -249,8 +249,7 @@ doneCheckOrder:
         }
     }
 
-    shared_ptr<Cursor> QueryPlan::newCursor( const DiskLoc& startLoc,
-                                             bool requestIntervalCursor ) const {
+    shared_ptr<Cursor> QueryPlan::newCursor() const {
 
         if ( _type ) {
             // hopefully safe to use original query in these contexts - don't think we can mix type with $or clause separation yet
@@ -269,7 +268,9 @@ doneCheckOrder:
 
         if ( willScanTable() ) {
             checkTableScanAllowed();
-            return findTableScan( _frs.ns(), _order, startLoc );
+            const int direction = _order.getField("$natural").number() >= 0 ? 1 : -1;
+            NamespaceDetails *d = nsdetails( _frs.ns() );
+            return shared_ptr<Cursor>( BasicCursor::make( d, direction ) );
         }
                 
         massert( 10363 ,  "newCursor() with start location not implemented for indexed plans", startLoc.isNull() );
@@ -323,10 +324,10 @@ doneCheckOrder:
 
     shared_ptr<Cursor> QueryPlan::newReverseCursor() const {
         if ( willScanTable() ) {
-            int orderSpec = _order.getIntField( "$natural" );
-            if ( orderSpec == INT_MIN )
-                orderSpec = 1;
-            return findTableScan( _frs.ns(), BSON( "$natural" << -orderSpec ) );
+            const int orderSpec = _order.getIntField( "$natural" );
+            const int direction = orderSpec == INT_MIN ? -1 : -orderSpec;
+            NamespaceDetails *d = nsdetails( _frs.ns() );
+            return shared_ptr<Cursor>( BasicCursor::make( d, direction ) );
         }
         massert( 10364 ,  "newReverseCursor() not implemented for indexed plans", false );
         return shared_ptr<Cursor>();
@@ -519,7 +520,6 @@ doneCheckOrder:
         }
     }
 
->>>>>>> 6b46f88... SERVER-5848 determine index suitability using a FieldRangeSet
     CachedMatchCounter::CachedMatchCounter( long long& aggregateNscanned,
                                             int cumulativeCount ) :
         _aggregateNscanned( aggregateNscanned ),

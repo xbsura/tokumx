@@ -104,6 +104,8 @@ namespace mongo {
         }
 
         _index = &_d->idx(_idxNo);
+        const BSONObj keyPattern = _index->keyPattern();
+        const BSONObj pkPattern = _d->pkPattern();
 
         // If the parsing or index indicates this is a special query, don't continue the processing
         if (!_special.empty() ||
@@ -113,7 +115,7 @@ namespace mongo {
             _type  = _index->getSpec().getType();
             if (_special.empty()) _special = _index->getSpec().getType()->getPlugin()->getName();
 
-            massert( 13040 , (string)"no type for special: " + _special , _type );
+            massert( 16859 , (string)"no type for special: " + _special , _type );
             // hopefully safe to use original query in these contexts;
             // don't think we can mix special with $or clause separation yet
             _scanAndOrderRequired = _type->scanAndOrderRequired( _originalQuery , _order );
@@ -228,7 +230,7 @@ doneCheckOrder:
 
         if ( _parsedQuery && _parsedQuery->getFields() && !_d->isMultikey( _idxNo ) ) {
             // Does not check modifiedKeys()
-            _keyFieldsOnly.reset( _parsedQuery->getFields()->checkKey( _index->keyPattern() ) );
+            _keyFieldsOnly.reset( _parsedQuery->getFields()->checkKey( keyPattern, pkPattern ) );
         }
     }
 
@@ -252,12 +254,14 @@ doneCheckOrder:
 
         if ( willScanTable() ) {
             checkTableScanAllowed();
-            return findTableScan( _frs.ns(), _order );
+            const int direction = _order.getField("$natural").number() >= 0 ? 1 : -1;
+            NamespaceDetails *d = nsdetails( _frs.ns() );
+            return shared_ptr<Cursor>( BasicCursor::make( d, direction ) );
         }
                 
         if ( _startOrEndSpec ) {
             // we are sure to spec _endKeyInclusive
-            return shared_ptr<Cursor>( BtreeCursor::make( _d,
+            return shared_ptr<Cursor>( IndexCursor::make( _d,
                                                           *_index,
                                                           _startKey,
                                                           _endKey,
@@ -266,7 +270,7 @@ doneCheckOrder:
         }
 
         if ( _index->getSpec().getType() ) {
-            return shared_ptr<Cursor>( BtreeCursor::make( _d,
+            return shared_ptr<Cursor>( IndexCursor::make( _d,
                                                           *_index,
                                                           _frv->startKey(),
                                                           _frv->endKey(),
@@ -274,28 +278,7 @@ doneCheckOrder:
                                                           _direction >= 0 ? 1 : -1 ) );
         }
 
-        // An IntervalBtreeCursor is returned if explicitly requested AND _frv is exactly
-        // represented by a single interval within the btree.
-        if ( // If an interval cursor is requested and ...
-             requestIntervalCursor &&
-             // ... equalities come before ranges (a requirement of Optimal) and ...
-             _utility == Optimal &&
-             // ... the field range vector exactly represents a single interval ...
-             _frv->isSingleInterval() ) {
-            // ... and an interval cursor can be created ...
-            shared_ptr<Cursor> ret( IntervalBtreeCursor::make( _d,
-                                                               *_index,
-                                                               _frv->startKey(),
-                                                               _frv->startKeyInclusive(),
-                                                               _frv->endKey(),
-                                                               _frv->endKeyInclusive() ) );
-            if ( ret ) {
-                // ... then return the interval cursor.
-                return ret;
-            }
-        }
-
-        return shared_ptr<Cursor>( BtreeCursor::make( _d,
+        return shared_ptr<Cursor>( IndexCursor::make( _d,
                                                       *_index,
                                                       _frv,
                                                       independentRangesSingleIntervalLimit(),
@@ -304,12 +287,12 @@ doneCheckOrder:
 
     shared_ptr<Cursor> QueryPlan::newReverseCursor() const {
         if ( willScanTable() ) {
-            int orderSpec = _order.getIntField( "$natural" );
-            if ( orderSpec == INT_MIN )
-                orderSpec = 1;
-            return findTableScan( _frs.ns(), BSON( "$natural" << -orderSpec ) );
+            const int orderSpec = _order.getIntField( "$natural" );
+            const int direction = orderSpec == INT_MIN ? -1 : -orderSpec;
+            NamespaceDetails *d = nsdetails( _frs.ns() );
+            return shared_ptr<Cursor>( BasicCursor::make( d, direction ) );
         }
-        massert( 10364, "newReverseCursor() not implemented for indexed plans", false );
+        massert( 16860, "newReverseCursor() not implemented for indexed plans", false );
         return shared_ptr<Cursor>();
     }
 
@@ -351,7 +334,7 @@ doneCheckOrder:
         if ( !nsdetails( ns() ) )
             return;
 
-        uassert( 10111, (string)"table scans not allowed:" + ns(), !cmdLine.noTableScan );
+        uassert( 16861, (string)"table scans not allowed:" + ns(), !cmdLine.noTableScan );
     }
 
     int QueryPlan::independentRangesSingleIntervalLimit() const {
