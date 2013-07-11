@@ -43,22 +43,26 @@ def main():
     # and replay each oplog entry on the to host connection
     db = fromc.local
     oplog = db.oplog.rs
-    while 1:
-        if ts is None:
-            qs = {}
-        else:
-            qs = { 'ts': { '$gt': ts }}
-        if verbose: print(qs)
-        c = oplog.find(qs, tailable=True, await_data=True)
-        if verbose: print(c)
-        if c.count() == 0:
-            time.sleep(1)
-        else:
-            for oploge in c:
-                if verbose: print(oploge)
-                op = oploge['op']
-                ts = oploge['ts']
-                replay(toc, op, oploge, verbose)
+    try:
+        while 1:
+            if ts is None:
+                qs = {}
+            else:
+                qs = { 'ts': { '$gt': ts }}
+            if verbose: print(qs)
+            c = oplog.find(qs, tailable=True, await_data=True)
+            if verbose: print(c)
+            if c.count() == 0:
+                time.sleep(1)
+            else:
+                for oploge in c:
+                    if verbose: print(oploge)
+                    op = oploge['op']
+                    ts = oploge['ts']
+                    replay(toc, op, oploge, verbose)
+    finally:
+        if ts is not None:
+            print('caught up to %d:%d' % (ts.time, ts.inc))
     return 0
 def replay(toc, op, oploge, verbose):
     if op == 'i':
