@@ -2,11 +2,49 @@
 
 # read a mongodb oplog, translate oplog entries to pymongo calls on another mongodb or tokumx database
 
-import sys
+import os
 import re
+import signal
+import sys
 import time
-from pymongo import MongoClient
+import traceback
+
 import bson
+from bson import son
+from pymongo import MongoClient, errors
+
+class SignalError(Exception):
+    def __init__(self, sig):
+        self.sig = sig
+    def __str__(self):
+        return 'SignalError(%d)' % self.sig
+
+class block_signals(object):
+    '''block_signals is a way to block signal processing during a critical section.
+
+    It should be used in a with statement:
+
+        with block_signals(signal.SIGINT, signal.SIGTERM):
+            dont_interrupt_me()
+    '''
+
+    def __init__(self, *args):
+        self.signals = args
+        self.signaled = None
+    def __enter__(self):
+        print "enter"
+        for s in self.signals:
+            signal.signal(s, self)
+        return None
+    def __call__(self, sig, unused_frame):
+        self.signaled = sig
+    def __exit__(self, type, value, traceback):
+        print "exit"
+        for s in self.signals:
+            signal.signal(s, signal.SIG_DFL)
+        if self.signaled is not None:
+            raise SignalError(self.signaled)
+        return False # propogate exceptions
 
 def main():
     ts = None
@@ -40,7 +78,7 @@ def main():
         return 1
     try:
         tov = tohost.split(':')
-        toc = MongoClient(tov[0], int(tov[1]))
+        toc = MongoClient(tov[0], int(tov[1]), w=1)
     except:
         print(tov, sys.exc_info())
         return 1
@@ -64,9 +102,20 @@ def main():
                 for oploge in c:
                     if verbose: print(oploge)
                     op = oploge['op']
-                    this_ts = oploge['ts']
-                    replay(toc, op, oploge, verbose)
-                    ts = this_ts
+                    with block_signals(signal.SIGHUP, signal.SIGINT, signal.SIGQUIT, signal.SIGTERM, signal.SIGCHLD):
+                        last_ts = ts
+                        ts = oploge['ts']
+                        try:
+                            replay(toc, op, oploge, verbose)
+                        except errors.AutoReconnect, e:
+                            print "tried to apply OpTime %d:%d but I'm not sure if it worked" % (ts.time, ts.inc)
+                            ts = last_ts
+                            raise
+                        except errors.PyMongoError:
+                            # whoops, that didn't work
+                            print traceback.print_exc()
+                            ts = last_ts
+                            raise
     finally:
         if ts is not None:
             print('caught up to %d:%d' % (ts.time, ts.inc))
