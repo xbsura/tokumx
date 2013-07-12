@@ -71,6 +71,15 @@ namespace mongo {
     // (Arguments should include db name)
     void renameNamespace( const StringData& from, const StringData& to, bool stayTemp);
 
+    // Manage bulk loading into a namespace
+    //
+    // To begin a load, the ns must exist and be empty.
+    // TODO: Any other documentation to put here?
+    void beginBulkLoad(const StringData &ns, const vector<BSONObj> &indexes,
+                       const BSONObj &options);
+    void commitBulkLoad(const StringData &ns);
+    void abortBulkLoad(const StringData &ns);
+
     // struct for storing the accumulated states of a NamespaceDetails
     // all values, except for nIndexes, are estiamtes
     // note that the id index is used as the main store.
@@ -96,13 +105,23 @@ namespace mongo {
 
         // Creates the appropriate NamespaceDetails implementation based on options.
         static shared_ptr<NamespaceDetails> make(const StringData &ns, const BSONObj &options);
-        static shared_ptr<NamespaceDetails> make(const BSONObj &serialized);
+        // The bulkLoad parameter is used by beginBulkLoad to open an existing
+        // IndexedCollection using a BulkLoadedCollection interface.
+        static shared_ptr<NamespaceDetails> make(const BSONObj &serialized, const bool bulkLoad = false);
 
         virtual ~NamespaceDetails() {
         }
 
-        // Closes all the underlying IndexDetails (in case one of them throws, we can't be doing this in a destructor).
-        void close();
+        // Close the collection. For regular collections, closes the underlying IndexDetails
+        // (and their underlying dictionaries). For bulk loaded collections, closes the
+        // loader first and then closes dictionaries. The caller may wish to advise the 
+        // implementation that the close() is getting called due to an aborting transaction.
+        virtual void close(const bool aborting = false);
+
+        // Ensure that the given index exists, or build it if it doesn't.
+        // @param obj is the index spec (ie: { ns: "test.foo", key: { a: 1 }, name: "a_1", clustering: true })
+        // @return whether or the the index was just built.
+        bool ensureIndex(const BSONObj &obj);
 
         int nIndexes() const {
             return _nIndexes;
@@ -236,12 +255,24 @@ namespace mongo {
         // Find the first object that matches the query. Force index if requireIndex is true.
         bool findOne(const BSONObj &query, BSONObj &result, const bool requireIndex = false) const;
 
+        // @return true if the collection appears to be empty. Only 100% accurate
+        //         (because of MVCC) if the calling transaction has a table lock.
+        bool isEmpty() const {
+            BSONObj result;
+            return !findOne(BSONObj(), result);
+        }
+
         // Find by primary key (single element bson object, no field name).
         bool findByPK(const BSONObj &pk, BSONObj &result) const;
 
         // return true if this namespace has an index on the _id field.
         bool hasIdIndex() const {
             return findIdIndex() >= 0;
+        }
+
+        virtual void validateConnectionId(const ConnectionId &id) {
+            // By default, the calling connection id is valid.
+            // Other implementations may decide otherwise.
         }
         
         // optional to implement, populate the obj builder with collection specific stats
@@ -561,7 +592,7 @@ namespace mongo {
         void init(bool may_create = false);
 
         // @return true if the ns existed and was closed, false otherwise.
-        bool close_ns(const StringData& ns);
+        bool close_ns(const StringData& ns, const bool aborting = false);
 
         // The index entry for ns is removed and brought up-to-date with the nsdb on txn abort.
         void add_ns(const StringData& ns, shared_ptr<NamespaceDetails> details);
@@ -595,20 +626,21 @@ namespace mongo {
                 return NULL;
             }
 
+            NamespaceDetails *d = NULL;
             {
                 // Try to find the ns in a shared lock. If it's there, we're done.
                 SimpleRWLock::Shared lk(_openRWLock);
-                NamespaceDetails *d = find_ns_locked(ns);
-                if (d != NULL) {
-                    return d;
-                }
+                d = find_ns_locked(ns);
             }
 
             // The ns doesn't exist, or it's not opened. Grab an exclusive lock
             // and do the open if we still can't find it.
-            SimpleRWLock::Exclusive lk(_openRWLock);
-            NamespaceDetails *d = find_ns_locked(ns);
-            return d != NULL ? d : open_ns(ns);
+            if (d == NULL) {
+                SimpleRWLock::Exclusive lk(_openRWLock);
+                d = find_ns_locked(ns);
+            }
+            return d != NULL ? d->validateConnectionId(cc().getConnectionId()), d :
+                               open_ns(ns);
         }
 
         bool allocated() const { return _nsdb != NULL; }
@@ -638,7 +670,9 @@ namespace mongo {
 
         // @return NamespaceDetails object if the ns existed and is now open, NULL otherwise.
         // requires: _openRWLock is locked, exclusively.
-        NamespaceDetails *open_ns(const StringData& ns);
+        NamespaceDetails *open_ns(const StringData& ns, const bool bulkLoad = false);
+        // Only beginBulkLoad may call open_ns with bulkLoad = true.
+        friend void beginBulkLoad(const StringData &ns, const vector<BSONObj> &indexes, const BSONObj &options);
 
         DB *_nsdb;
         NamespaceDetailsMap _namespaces;

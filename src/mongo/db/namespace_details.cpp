@@ -173,6 +173,10 @@ namespace mongo {
         OplogCollection(const StringData &ns, const BSONObj &options) :
             IndexedCollection(ns, options) {
         } 
+        // Important: BulkLoadedCollection relies on this constructor
+        // doing nothing more than calling the parent IndexedCollection
+        // constructor. If this constructor ever does more, we need to
+        // modify BulkLoadedCollection to match behavior for the oplog.
         OplogCollection(const BSONObj &serialized) :
             IndexedCollection(serialized) {
         }
@@ -684,6 +688,72 @@ namespace mongo {
         }
     };
 
+    // A BulkLoadedCollection is a facade for an IndexedCollection that
+    // utilizes a namespace builder for faster insertions. Other flavors
+    // of writes are not allowed.
+    //
+    // The underlying indexes must be fully write locked, and they must be empty.
+    // Other threads that read this collection will see nothing while it is
+    // under-going load, due to MVCC. Due to the implementation, the _calling_
+    // transaction will also see nothing if this collection is queried, because
+    // the bulk insertions going through a loader are not immediately applied to
+    // the underlying dictionaries (this specific behavior is implementation-specific).
+    // Because of this, the result of querying an indexed collection on the same
+    // transaction that initiated it is undefined (though non-crashing / corrupting).
+    class BulkLoadedCollection : public IndexedCollection {
+    public:
+        BulkLoadedCollection(const BSONObj &serialized) :
+            IndexedCollection(serialized),
+            _bulkLoadConnectionId(cc().getConnectionId()) {
+            // By noting this ns in the nsindex rollback, we will automatically
+            // abort the load if the calling transaction aborts, because close()
+            // will be called with aborting = true. See BulkLoadedCollection::close()
+            NamespaceIndexRollback &rollback = cc().txn().nsIndexRollback();
+            rollback.noteNs(_ns);
+        }
+
+        void close(const bool abortingLoad) {
+            if (abortingLoad) {
+                // TODO: This is where we call _loader->abort()
+            } else {
+                // TODO: This is where we call _loader->close()
+            }
+        }
+
+        virtual void validateConnectionId(const ConnectionId &id) {
+            uassert( 16878, str::stream() << "This connection cannot use ns " << _ns <<
+                            ", it is currently under-going bulk load by connection id "
+                            << _bulkLoadConnectionId,
+                            _bulkLoadConnectionId == id );
+        }
+
+        void insertObject(BSONObj &obj, uint64_t flags = 0) {
+            // Simple bulk load implementation utilizes no loader, just inserts.
+            IndexedCollection::insertObject(obj, flags);
+        }
+
+        void deleteObject(const BSONObj &pk, const BSONObj &obj, uint64_t flags = 0) {
+            uasserted( 16865, "Cannot delete from a collection under-going bulk load." );
+        }
+        void updateObject(const BSONObj &pk, const BSONObj &oldObj, BSONObj &newObj, uint64_t flags = 0) {
+            uasserted( 16866, "Cannot update a collection under-going bulk load." );
+        }
+        void createIndex(const BSONObj &info) {
+            uasserted( 16867, "Cannot create an index on a collection under-going bulk load." );
+        }
+        void empty() {
+            uasserted( 16868, "Cannot empty a collection under-going bulk load." );
+        }
+        // TODO: We need to prevent other things too, like drop and dropIndexes. Virtualize
+        //       them and put the uassert implementations here.
+    private:
+        // The connection that started the bulk load is the only one that can
+        // do anything with the namespace until the load is complete and this
+        // namespace has been closed / re-opened.
+        ConnectionId _bulkLoadConnectionId;
+    };
+
+
     /* ------------------------------------------------------------------------- */
 
     BSONObj NamespaceDetails::indexInfo(const BSONObj &keyPattern, bool unique, bool clustering) const {
@@ -778,8 +848,8 @@ namespace mongo {
     // Construct an existing NamespaceDetails given its serialized from (generated via serialize()).
     NamespaceDetails::NamespaceDetails(const BSONObj &serialized) :
         _ns(serialized["ns"].String()),
-        _options(serialized["options"].embeddedObject().copy()),
-        _pk(serialized["pk"].embeddedObject().copy()),
+        _options(serialized["options"].Obj().copy()),
+        _pk(serialized["pk"].Obj().copy()),
         _indexBuildInProgress(false),
         _nIndexes(serialized["indexes"].Array().size()),
         _multiKeyIndexBits(static_cast<uint64_t>(serialized["multiKeyIndexBits"].Long())) {
@@ -790,24 +860,33 @@ namespace mongo {
             _indexes.push_back(idx);
         }
     }
-    shared_ptr<NamespaceDetails> NamespaceDetails::make(const BSONObj &serialized) {
+    shared_ptr<NamespaceDetails> NamespaceDetails::make(const BSONObj &serialized, const bool bulkLoad) {
         const string ns = serialized["ns"].String();
         if (isOplogCollection(ns)) {
-            return shared_ptr<NamespaceDetails>(new OplogCollection(serialized));
+            // We may bulk load the oplog since it's an IndexedCollection
+            return bulkLoad ? shared_ptr<NamespaceDetails>(new BulkLoadedCollection(serialized)) :
+                              shared_ptr<NamespaceDetails>(new OplogCollection(serialized));
         } else if (isSystemCatalog(ns)) {
+            uassert( 16869, "Cannot bulk load any system collection. ", !bulkLoad );
             return shared_ptr<NamespaceDetails>(new SystemCatalogCollection(serialized));
         } else if (isProfileCollection(ns)) {
+            uassert( 16870, "Cannot bulk load the profile collection. ", !bulkLoad );
             return shared_ptr<NamespaceDetails>(new ProfileCollection(serialized));
         } else if (serialized["options"]["capped"].trueValue()) {
+            uassert( 16871, "Cannot bulk load capped collections. ", !bulkLoad );
             return shared_ptr<NamespaceDetails>(new CappedCollection(serialized));
         } else if (serialized["options"]["natural"].trueValue()) {
+            uassert( 16872, "Cannot bulk load natural order collections (yet). ", !bulkLoad );
             return shared_ptr<NamespaceDetails>(new NaturalOrderCollection(serialized));
         } else {
-            return shared_ptr<NamespaceDetails>(new IndexedCollection(serialized));
+            // We only know how to bulk load indexed collections.
+            return bulkLoad ? shared_ptr<NamespaceDetails>(new BulkLoadedCollection(serialized)) :
+                              shared_ptr<NamespaceDetails>(new IndexedCollection(serialized));
         }
     }
 
-    void NamespaceDetails::close() {
+    void NamespaceDetails::close(const bool aborting) {
+        // The default implementation doesn't care if the caller is closing for abort.
         for (IndexVector::iterator it = _indexes.begin(); it != _indexes.end(); ++it) {
             IndexDetails *idx = it->get();
             idx->close();
@@ -1290,6 +1369,16 @@ namespace mongo {
         }
     }
 
+    bool NamespaceDetails::ensureIndex(const BSONObj &index) {
+        const BSONObj keyPattern = index["key"].Obj();
+        const int i = findIndexByKeyPattern(keyPattern);
+        if (i >= 0) {
+            return false;
+        }
+        createIndex(index);
+        return true;
+    }
+
     /* ------------------------------------------------------------------------- */
 
     SimpleRWLock NamespaceDetailsTransient::_qcRWLock("qc");
@@ -1623,6 +1712,45 @@ namespace mongo {
             verify( nsdetails(to) != NULL );
             verify( nsdetails(from) == NULL );
         }
+    }
+
+    void beginBulkLoad(const StringData &ns, const vector<BSONObj> &indexes,
+                       const BSONObj &options) {
+        uassert( 16873, "Cannot bulk load a collection that alreadly exists.", nsdetails(ns) == NULL );
+
+        string errmsg;
+        const bool created = userCreateNS(ns, options, errmsg, true);
+        verify(created);
+
+        NamespaceIndex *ni = nsindex(ns);
+        NamespaceDetails *d = ni->details(ns);
+        for (vector<BSONObj>::const_iterator i = indexes.begin(); i != indexes.end(); i++) {
+            const BSONObj index = *i;
+            uassert( 16881, str::stream() << "Index spec contains the wrong ns: "
+                            << index["ns"].String(),
+                            index["ns"].Stringdata() == ns );
+            d->ensureIndex(*i);
+        }
+
+        // Now the ns exists. Close it and re-open it in "bulk load" mode.
+        const bool closed = ni->close_ns(ns);
+        verify(closed);
+        const bool opened = ni->open_ns(ns, true);
+        verify(opened);
+    }
+
+    void commitBulkLoad(const StringData &ns) {
+        NamespaceIndex *ni = nsindex(ns);
+        const bool closed = ni->close_ns(ns);
+        verify(closed);
+    }
+
+    void abortBulkLoad(const StringData &ns) {
+        NamespaceIndex *ni = nsindex(ns);
+        // This is the one instance where we pass abortingLoad = true to nsindex->close().
+        // When the BulkLoadedCollection closes, it will abort the load instead of committing.
+        const bool closed = ni->close_ns(ns, true);
+        verify(closed);
     }
 
     bool legalClientSystemNS( const StringData& ns , bool write ) {

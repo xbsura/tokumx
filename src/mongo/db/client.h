@@ -268,6 +268,16 @@ namespace mongo {
             }
         };
 
+        /** Enter load mode for a particular namespace, given indexes and options. */
+        void beginClientLoad(const StringData &ns, const vector<BSONObj> &indexes,
+                             const BSONObj &options);
+
+        /** Commit any load in progress. */
+        void commitClientLoad();
+
+        /** Abort any load in progress. */
+        void abortClientLoad();
+
     private:
         Client(const char *desc, AbstractMessagingPort *p = 0);
         friend class CurOp;
@@ -276,6 +286,7 @@ namespace mongo {
         CurOp * _curOp;
         Context * _context;
         shared_ptr<TransactionStack> _transactions;
+        string _bulkLoadNS; // the ns currently under-going bulk load by this client
         bool _shutdown; // to track if Client::shutdown() gets called
         std::string _desc;
         bool _god;
