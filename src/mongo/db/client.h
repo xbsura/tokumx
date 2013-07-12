@@ -275,9 +275,6 @@ namespace mongo {
         /** Commit any load in progress. */
         void commitClientLoad();
 
-        /** Abort any load in progress. */
-        void abortClientLoad();
-
     private:
         Client(const char *desc, AbstractMessagingPort *p = 0);
         friend class CurOp;

@@ -718,6 +718,7 @@ namespace mongo {
             } else {
                 // TODO: This is where we call _loader->close()
             }
+            NamespaceDetails::close();
         }
 
         virtual void validateConnectionId(const ConnectionId &id) {
@@ -1369,13 +1370,14 @@ namespace mongo {
         }
     }
 
-    bool NamespaceDetails::ensureIndex(const BSONObj &index) {
-        const BSONObj keyPattern = index["key"].Obj();
+    bool NamespaceDetails::ensureIndex(const BSONObj &info) {
+        const BSONObj keyPattern = info["key"].Obj();
         const int i = findIndexByKeyPattern(keyPattern);
         if (i >= 0) {
             return false;
         }
-        createIndex(index);
+        createIndex(info);
+        addIndexToCatalog(info);
         return true;
     }
 
@@ -1725,11 +1727,21 @@ namespace mongo {
         NamespaceIndex *ni = nsindex(ns);
         NamespaceDetails *d = ni->details(ns);
         for (vector<BSONObj>::const_iterator i = indexes.begin(); i != indexes.end(); i++) {
-            const BSONObj index = *i;
-            uassert( 16881, str::stream() << "Index spec contains the wrong ns: "
-                            << index["ns"].String(),
-                            index["ns"].Stringdata() == ns );
-            d->ensureIndex(*i);
+            BSONObj index = *i;
+            const BSONElement &e = index["ns"];
+            if (e.ok()) {
+                uassert( 16886, "Each index spec's ns field, if provided, must match the loaded ns.",
+                                e.type() == mongo::String && e.Stringdata() == ns );
+            } else {
+                // Add the ns field if it wasn't provided.
+                BSONObjBuilder b;
+                b.append("ns", ns);
+                b.appendElements(index);
+                index = b.obj();
+            }
+            uassert( 16887, "Each index spec must have a string name field.",
+                            index["name"].ok() && index["name"].type() == mongo::String );
+            d->ensureIndex(index);
         }
 
         // Now the ns exists. Close it and re-open it in "bulk load" mode.
@@ -1742,14 +1754,6 @@ namespace mongo {
     void commitBulkLoad(const StringData &ns) {
         NamespaceIndex *ni = nsindex(ns);
         const bool closed = ni->close_ns(ns);
-        verify(closed);
-    }
-
-    void abortBulkLoad(const StringData &ns) {
-        NamespaceIndex *ni = nsindex(ns);
-        // This is the one instance where we pass abortingLoad = true to nsindex->close().
-        // When the BulkLoadedCollection closes, it will abort the load instead of committing.
-        const bool closed = ni->close_ns(ns, true);
         verify(closed);
     }
 

@@ -27,12 +27,17 @@
 
 namespace mongo {
 
+    // The client begin/commit/abort load functions handles locking, context,
+    // and ensuring that only one load exists at a time for this client.
+
     void Client::beginClientLoad(const StringData &ns, const vector<BSONObj> &indexes,
                                  const BSONObj &options) {
         uassert( 16864, "Cannot begin load, one is already in progress",
-                        ns.empty() );
-        _bulkLoadNS = ns.toString();
+                        _bulkLoadNS.empty() );
+
+        Client::WriteContext ctx(ns);
         beginBulkLoad(ns, indexes, options);
+        _bulkLoadNS = ns.toString();
     }
 
     void Client::commitClientLoad() {
@@ -40,15 +45,10 @@ namespace mongo {
                         !_bulkLoadNS.empty() );
         const string ns = _bulkLoadNS;
         _bulkLoadNS.clear();
-        commitBulkLoad(ns);
-    }
 
-    void Client::abortClientLoad() {
-        uassert( 16877, "Cannot abort client load, none in progress.",
-                        !_bulkLoadNS.empty() );
-        const string ns = _bulkLoadNS;
-        _bulkLoadNS.clear();
-        abortBulkLoad(ns);
+        verify(cc().hasTxn());
+        Client::WriteContext ctx(ns);
+        commitBulkLoad(ns);
     }
 
 } // namespace mongo

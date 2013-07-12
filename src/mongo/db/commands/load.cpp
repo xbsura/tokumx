@@ -22,17 +22,21 @@
 namespace mongo {
 
     // TODO: Do we need to catch uasserts, set ok = false, and then rethrow?
+    // TODO: Is InformationCommand the interface we want to inherit from?
 
     class BeginLoadCmd : public InformationCommand {
     public:
         virtual bool adminOnly() const { return false; }
         virtual bool requiresAuth() { return true; }
-        virtual LockType locktype() const { return WRITE; }
+        virtual LockType locktype() const { return OPLOCK; }
+        virtual bool needsTxn() const { return false; }
+        virtual bool logTheOp() { return true; }
+        virtual bool slaveOk() const { return false; }
         virtual void help( stringstream& help ) const {
             help << "begin load" << endl << 
                 "Begin a bulk load into a collection." << endl <<
                 "Must be inside an existing multi-statement transaction." << endl <<
-                "{ beginLoad: ns, indexes: [ { ... }, ... ], options: { ... }  }" << endl;
+                "{ beginLoad: 1, ns : collName, indexes: [ { ... }, ... ], options: { ... }  }" << endl;
         }
         BeginLoadCmd() : InformationCommand("beginLoad") {}
 
@@ -45,17 +49,30 @@ namespace mongo {
         {
             uassert( 16863, "Must be in a multi-statement transaction to begin a load.",
                             cc().hasTxn());
+            uassert( 16882, "The ns field must be a string.",
+                            cmdObj["ns"].type() == mongo::String );
+            uassert( 16883, "The indexes field must be an array of index objects.",
+                            cmdObj["indexes"].type() == mongo::Array );
+            uassert( 16884, "The options field must be an object.",
+                            !cmdObj["options"].ok() || cmdObj["options"].type() == mongo::Object );
+            LOG(0) << "Beginning bulk load, cmd: " << cmdObj << endl;
 
-            const string ns = cmdObj["beginLoad"].String(); 
-            vector<BSONObj> indexes;
             vector<BSONElement> indexElements = cmdObj["indexes"].Array();
+            vector<BSONObj> indexes;
             for (vector<BSONElement>::const_iterator i = indexElements.begin(); i != indexElements.end(); i++) {
+                uassert( 16885, "Each index spec must be an object describing the index to be built",
+                                i->type() == mongo::Object );
+
                 BSONObj obj = i->Obj();
                 indexes.push_back(obj.copy());
             }
+
+            Client::Transaction transaction(DB_SERIALIZABLE);
+            const string ns = db + "." + cmdObj["ns"].String();
             cc().beginClientLoad(ns, indexes, cmdObj["options"].Obj());
             result.append("status", "load began");
             result.append("ok", true);
+            transaction.commit();
             return true;
         }
     } beginLoadCmd;
@@ -64,7 +81,10 @@ namespace mongo {
     public:
         virtual bool adminOnly() const { return false; }
         virtual bool requiresAuth() { return true; }
-        virtual LockType locktype() const { return WRITE; }
+        virtual LockType locktype() const { return OPLOCK; }
+        virtual bool needsTxn() const { return false; }
+        virtual bool logTheOp() { return true; }
+        virtual bool slaveOk() const { return false; }
         virtual void help( stringstream& help ) const {
             help << "commit load" << endl <<
                 "Commits a load in progress." << endl <<
@@ -85,30 +105,4 @@ namespace mongo {
             return true;
         }
     } commitLoadCmd;
-
-    class AbortLoadCmd : public InformationCommand {
-    public:
-        virtual bool adminOnly() const { return false; }
-        virtual bool requiresAuth() { return true; }
-        virtual LockType locktype() const { return WRITE; }
-        virtual void help( stringstream& help ) const {
-            help << "abort load" << endl <<
-                "Aborts a load in progress." << endl <<
-                "{ abortLoad }" << endl;
-        }
-        AbortLoadCmd() : InformationCommand("abortLoad") {}
-
-        virtual bool run(const string& db, 
-                         BSONObj& cmdObj, 
-                         int options, 
-                         string& errmsg, 
-                         BSONObjBuilder& result, 
-                         bool fromRepl) 
-        {
-            cc().abortClientLoad();
-            result.append("status", "load aborted");
-            result.append("ok", true);
-            return true;
-        }
-    } abortLoadCmd;
 }

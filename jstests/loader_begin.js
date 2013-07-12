@@ -1,0 +1,73 @@
+// Test that the beginLoadShouldFail interface validates parameters
+// and enforces the rules of beginning a bulk load.
+
+load("jstests/loader_helpers.js");
+
+var testNSAlreadyExists = function() {
+    t = db.loadnsexists;
+    t.drop();
+    t.insert({});
+    assert(!db.getLastError());
+    assert.eq(1, db.system.namespaces.count({ "name" : "test.loadnsexists" }));
+
+    begin();
+    beginLoadShouldFail('loadnsexists', [ ] , { });
+    commit();
+    assert.eq(1, db.system.namespaces.count({ "name" : "test.loadnsexists" }));
+}();
+
+var testBadIndexes = function() {
+    t = db.loadbadindexes;
+    t.drop();
+
+    begin();
+    beginLoadShouldFail('loadbadindexes', "xyz" , { });
+    commit();
+    assert.eq(0, db.system.namespaces.count({ "name" : "test.loadbadindexes" }));
+
+    begin();
+    beginLoadShouldFail('loadbadindexes', [ { ns: "test.loadbadindexes", key: { a: 1 }, name: "a_1" }, "xyz" ] , { });
+    commit();
+    assert.eq(0, db.system.namespaces.count({ "name" : "test.loadbadindexes" }));
+
+    begin();
+    beginLoadShouldFail('loadbadindexes', [ "xyz", { ns: "test.loadbadindexes", key: { a: 1 }, name: "a_1" } ] , { });
+    commit();
+    assert.eq(0, db.system.namespaces.count({ "name" : "test.loadbadindexes" }));
+
+    begin();
+    beginLoadShouldFail('loadbadindexes', [ { ns: "test.thisisntright", key: { a: 1 }, name: "a_1" } ] , { });
+    commit();
+    assert.eq(0, db.system.namespaces.count({ "name" : "test.loadbadindexes" }));
+    assert.eq(0, db.system.namespaces.count({ "name" : "test.thisisntright" }));
+
+    begin();
+    beginLoadShouldFail('loadbadindexes', [ { ns: "test.loadbadindexes", key: "xyz", name: "xyz_1" } ] , { });
+    commit();
+    assert.eq(0, db.system.namespaces.count({ "name" : "test.loadbadindexes" }));
+
+    begin();
+    beginLoadShouldFail('loadbadindexes', [ { ns: "test.loadbadindexes", key: { a: 1 }, name: { thisisntright: 1 } } ] , { });
+    commit();
+    assert.eq(0, db.system.namespaces.count({ "name" : "test.loadbadindexes" }));
+}();
+
+var testBadOptions = function() {
+    t = db.loadbadoptions;
+    t.drop();
+
+    begin();
+    beginLoadShouldFail('loadbadoptions', [ ] , "xyz");
+    commit();
+    assert.eq(0, db.system.namespaces.count({ "name" : "test.loadbadoptions" }));
+
+    begin();
+    beginLoadShouldFail('loadbadoptions', [ ] , 123);
+    commit();
+    assert.eq(0, db.system.namespaces.count({ "name" : "test.loadbadoptions" }));
+
+    begin();
+    beginLoadShouldFail('loadbadoptions', [ ] , [ { clustering: true } ]);
+    commit();
+    assert.eq(0, db.system.namespaces.count({ "name" : "test.loadbadoptions" }));
+}();

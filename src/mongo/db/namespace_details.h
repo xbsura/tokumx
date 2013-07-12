@@ -119,9 +119,9 @@ namespace mongo {
         virtual void close(const bool aborting = false);
 
         // Ensure that the given index exists, or build it if it doesn't.
-        // @param obj is the index spec (ie: { ns: "test.foo", key: { a: 1 }, name: "a_1", clustering: true })
+        // @param info is the index spec (ie: { ns: "test.foo", key: { a: 1 }, name: "a_1", clustering: true })
         // @return whether or the the index was just built.
-        bool ensureIndex(const BSONObj &obj);
+        bool ensureIndex(const BSONObj &info);
 
         int nIndexes() const {
             return _nIndexes;
@@ -631,14 +631,16 @@ namespace mongo {
                 // Try to find the ns in a shared lock. If it's there, we're done.
                 SimpleRWLock::Shared lk(_openRWLock);
                 d = find_ns_locked(ns);
+                if (d != NULL) {
+                    d->validateConnectionId(cc().getConnectionId());
+                    return d;
+                }
             }
 
             // The ns doesn't exist, or it's not opened. Grab an exclusive lock
             // and do the open if we still can't find it.
-            if (d == NULL) {
-                SimpleRWLock::Exclusive lk(_openRWLock);
-                d = find_ns_locked(ns);
-            }
+            SimpleRWLock::Exclusive lk(_openRWLock);
+            d = find_ns_locked(ns);
             return d != NULL ? d->validateConnectionId(cc().getConnectionId()), d :
                                open_ns(ns);
         }
