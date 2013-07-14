@@ -156,3 +156,26 @@ var testAbortCommit = function() {
     assert.eq(0, db.system.namespaces.count({ "name" : "test.loadabortcommit1" }));
     assert.eq(0, db.system.namespaces.count({ "name" : "test.loadabortcommit2" }));
 }();
+
+var testSimpleInsert = function() {
+    t = db.loadsimpleinsert;
+    t.drop();
+    begin();
+    beginLoad('loadsimpleinsert', [ ], { });
+    t.insert({ bulkLoaded: 1 });
+    commitLoad();
+    commit();
+    assert.eq(1, t.count());
+    assert.eq(1, t.count({ bulkLoaded: 1 }));
+    
+    // Test rollback
+    t.drop();
+    begin();
+    beginLoad('loadsimpleinsert', [ ], { });
+    t.insert({ bulkLoaded: 1 });
+    commitLoad();
+    rollback();
+    assert.eq(0, t.count());
+    assert.eq(0, t.count({ bulkLoaded: 1 }));
+}();
+

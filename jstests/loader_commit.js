@@ -40,6 +40,39 @@ var testValidIndexes = function() {
     commit();
 }();
 
+var testValidIndexes = function() {
+    t = db.loadvalidindexes;
+    t.drop();
+    begin();
+    beginLoad('loadvalidindexes',
+            [
+                { key: { a: 1 }, ns: 'test.loadvalidindexes', name: 'a_1' },
+                { key: { c: 1 }, ns: 'test.loadvalidindexes', name: 'c_1', clustering: true },
+                { key: { a: 'hashed' }, ns: 'test.loadvalidindexes', name: 'a_hashed' },
+                { key: { a: -1, b: -1, c: 1 }, ns: 'test.loadvalidindexes', name: 'a_-1_b-1_c_1', basement_size: 1024 }
+            ], { });
+    commitLoad();
+    commit();
+    assert.eq({ _id: 1 }, t.getIndexes()[0].key);
+    assert.eq({ a: 1 }, t.getIndexes()[1].key);
+    assert.eq('test.loadvalidindexes', t.getIndexes()[1].ns);
+    assert.eq('a_1', t.getIndexes()[1].name);
+
+    assert.eq({ c: 1 }, t.getIndexes()[2].key);
+    assert.eq('test.loadvalidindexes', t.getIndexes()[2].ns);
+    assert.eq('c_1', t.getIndexes()[2].name);
+    assert.eq(true, t.getIndexes()[2].clustering);
+
+    assert.eq({ a: 'hashed' }, t.getIndexes()[3].key);
+    assert.eq('test.loadvalidindexes', t.getIndexes()[3].ns);
+    assert.eq('a_hashed', t.getIndexes()[3].name);
+
+    assert.eq({ a: -1, b: -1, c: 1 }, t.getIndexes()[4].key);
+    assert.eq('test.loadvalidindexes', t.getIndexes()[4].ns);
+    assert.eq('a_-1_b-1_c_1', t.getIndexes()[4].name);
+    assert.eq(1024, t.getIndexes()[4].basement_size);
+}();
+
 // Test that the ns field gets inherited in each index spec object
 // when it isn't provided.
 var testIndexSpecNs = function() {
@@ -52,28 +85,6 @@ var testIndexSpecNs = function() {
     assert.eq('test.loadindexspecns', t.getIndexes()[0].ns);
     assert.eq('test.loadindexspecns', t.getIndexes()[1].ns);
     assert.eq('test.loadindexspecns', t.getIndexes()[2].ns);
-}();
-
-var testSimpleInsert = function() {
-    t = db.loadsimpleinsert;
-    t.drop();
-    begin();
-    beginLoad('loadsimpleinsert', [ ], { });
-    t.insert({ bulkLoaded: 1 });
-    commitLoad();
-    commit();
-    assert.eq(1, t.count());
-    assert.eq(1, t.count({ bulkLoaded: 1 }));
-    
-    // Test rollback
-    t.drop();
-    begin();
-    beginLoad('loadsimpleinsert', [ ], { });
-    t.insert({ bulkLoaded: 1 });
-    commitLoad();
-    rollback();
-    assert.eq(0, t.count());
-    assert.eq(0, t.count({ bulkLoaded: 1 }));
 }();
 
 var testIndexedInsert = function() {
