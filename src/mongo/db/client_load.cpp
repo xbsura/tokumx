@@ -20,8 +20,7 @@
  * Implements collection loading for a client.
  */
 
-#include "pch.h"
-
+#include "mongo/pch.h"
 #include "mongo/db/client.h"
 #include "mongo/db/namespace_details.h"
 
@@ -30,6 +29,10 @@ namespace mongo {
     // The client begin/commit/abort load functions handle locking/context,
     // creating a child transaction for the load, and ensuring that this client
     // only loads one ns at a time.
+
+    // The try pattern used here isn't pretty.
+    // Maybe there's an RAII solution to this: I haven't thought
+    // of one that I like just yet.
 
     void Client::beginClientLoad(const StringData &ns, const vector<BSONObj> &indexes,
                                  const BSONObj &options) {

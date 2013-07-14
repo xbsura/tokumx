@@ -54,33 +54,6 @@ var testIndexSpecNs = function() {
     assert.eq('test.loadindexspecns', t.getIndexes()[2].ns);
 }();
 
-var testBackToBackLoads = function() {
-    t1 = db.testb2bloads1;
-    t2 = db.testb2bloads2;
-    t1.drop();
-    t2.drop();
-    begin();
-    beginLoad('testb2bloads1', [ ], { });
-    commitLoad();
-    beginLoad('testb2bloads2', [ ], { });
-    commitLoad();
-    commit();
-    assert.eq(1, db.system.namespaces.count({ "name" : "test.testb2bloads1" }));
-    assert.eq(1, db.system.namespaces.count({ "name" : "test.testb2bloads2" }));
-
-    // Test rollback
-    t1.drop();
-    t2.drop();
-    begin();
-    beginLoad('testb2bloads1', [ ], { });
-    commitLoad();
-    beginLoad('testb2bloads2', [ ], { });
-    commitLoad();
-    rollback();
-    assert.eq(0, db.system.namespaces.count({ "name" : "test.testb2bloads1" }));
-    assert.eq(0, db.system.namespaces.count({ "name" : "test.testb2bloads2" }));
-}();
-
 var testSimpleInsert = function() {
     t = db.loadsimpleinsert;
     t.drop();
@@ -101,4 +74,17 @@ var testSimpleInsert = function() {
     rollback();
     assert.eq(0, t.count());
     assert.eq(0, t.count({ bulkLoaded: 1 }));
+}();
+
+var testIndexedInsert = function() {
+    t = db.loaderindexedinsert;
+    t.drop();
+
+    begin();
+    beginLoad('loaderindexedinsert', [ { key: { a: 1 }, name: "a_1" } ], { } );
+    t.insert({ a: 700 } );
+    commitLoad();
+    commit();
+    assert.eq(1, t.count({ a: 700 }));
+    assert.eq(1, t.find({a : 700}).hint({ a: 1 }).itcount());
 }();

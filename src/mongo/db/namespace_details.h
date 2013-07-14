@@ -255,13 +255,6 @@ namespace mongo {
         // Find the first object that matches the query. Force index if requireIndex is true.
         bool findOne(const BSONObj &query, BSONObj &result, const bool requireIndex = false) const;
 
-        // @return true if the collection appears to be empty. Only 100% accurate
-        //         (because of MVCC) if the calling transaction has a table lock.
-        bool isEmpty() const {
-            BSONObj result;
-            return !findOne(BSONObj(), result);
-        }
-
         // Find by primary key (single element bson object, no field name).
         bool findByPK(const BSONObj &pk, BSONObj &result) const;
 
@@ -626,11 +619,10 @@ namespace mongo {
                 return NULL;
             }
 
-            NamespaceDetails *d = NULL;
             {
                 // Try to find the ns in a shared lock. If it's there, we're done.
                 SimpleRWLock::Shared lk(_openRWLock);
-                d = find_ns_locked(ns);
+                NamespaceDetails *d = find_ns_locked(ns);
                 if (d != NULL) {
                     d->validateConnectionId(cc().getConnectionId());
                     return d;
@@ -640,7 +632,7 @@ namespace mongo {
             // The ns doesn't exist, or it's not opened. Grab an exclusive lock
             // and do the open if we still can't find it.
             SimpleRWLock::Exclusive lk(_openRWLock);
-            d = find_ns_locked(ns);
+            NamespaceDetails *d = find_ns_locked(ns);
             return d != NULL ? d->validateConnectionId(cc().getConnectionId()), d :
                                open_ns(ns);
         }

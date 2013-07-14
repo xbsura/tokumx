@@ -67,7 +67,12 @@ namespace mongo {
                 }
             }
 
+            // We disallow clients from _explicitly_ creating child transactions.
+            // If we ever change this, we'll have to make sure that the child
+            // transaction created by the 'beginLoad' command isn't improperly
+            // handled by clients.
             uassert(16787, "transaction already exists", !cc().hasTxn());
+
             cc().beginClientTxn(iso_flags);
             result.append("status", "transaction began");
             return true;
