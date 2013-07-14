@@ -2,16 +2,6 @@
 
 load('jstests/loader_helpers.js');
 
-var testPrematureTxnCommit = function() {
-    t = db.loadprematurecommit;
-    t.drop();
-    begin();
-    beginLoad('loadprematurecommit', [ ] , { });
-    assert.throws(db.runCommand({ 'commitTransaction' : 1 }));
-    commitLoad();
-    commit();
-}();
-
 var testValidOptions = function() {
     t = db.loadvalidoptions;
     t.drop();
@@ -69,20 +59,46 @@ var testBackToBackLoads = function() {
     t2 = db.testb2bloads2;
     t1.drop();
     t2.drop();
+    begin();
     beginLoad('testb2bloads1', [ ], { });
     commitLoad();
     beginLoad('testb2bloads2', [ ], { });
     commitLoad();
     commit();
-    assert(1, t1.count());
-    assert(1, t2.count());
-}
+    assert.eq(1, db.system.namespaces.count({ "name" : "test.testb2bloads1" }));
+    assert.eq(1, db.system.namespaces.count({ "name" : "test.testb2bloads2" }));
+
+    // Test rollback
+    t1.drop();
+    t2.drop();
+    begin();
+    beginLoad('testb2bloads1', [ ], { });
+    commitLoad();
+    beginLoad('testb2bloads2', [ ], { });
+    commitLoad();
+    rollback();
+    assert.eq(0, db.system.namespaces.count({ "name" : "test.testb2bloads1" }));
+    assert.eq(0, db.system.namespaces.count({ "name" : "test.testb2bloads2" }));
+}();
 
 var testSimpleInsert = function() {
     t = db.loadsimpleinsert;
     t.drop();
+    begin();
     beginLoad('loadsimpleinsert', [ ], { });
     t.insert({ bulkLoaded: 1 });
+    commitLoad();
     commit();
-    assert(1, t.count());
-}
+    assert.eq(1, t.count());
+    assert.eq(1, t.count({ bulkLoaded: 1 }));
+    
+    // Test rollback
+    t.drop();
+    begin();
+    beginLoad('loadsimpleinsert', [ ], { });
+    t.insert({ bulkLoaded: 1 });
+    commitLoad();
+    rollback();
+    assert.eq(0, t.count());
+    assert.eq(0, t.count({ bulkLoaded: 1 }));
+}();

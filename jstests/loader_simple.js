@@ -2,11 +2,13 @@
 
 load("jstests/loader_helpers.js");
 
-var testNoTransaction = function() {
-    t = db.loadnotxn;
-    t.drop();
-    beginLoadShouldFail('loadnotxn', [ ] , { });
-}
+var testCommitLoadNoBegin = function() {
+    commitLoadShouldFail();
+}();
+
+var testAbortLoadNoBegin = function() {
+    abortLoadShouldFail();
+}();
 
 var testSimpleCommit = function() {
     t = db.loadcommit;
