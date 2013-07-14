@@ -2,6 +2,16 @@
 
 load('jstests/loader_helpers.js');
 
+var testPrematureTxnCommit = function() {
+    t = db.loadprematurecommit;
+    t.drop();
+    begin();
+    beginLoad('loadprematurecommit', [ ] , { });
+    assert.throws(db.runCommand({ 'commitTransaction' : 1 }));
+    commitLoad();
+    commit();
+}();
+
 var testValidOptions = function() {
     t = db.loadvalidoptions;
     t.drop();
@@ -53,3 +63,26 @@ var testIndexSpecNs = function() {
     assert.eq('test.loadindexspecns', t.getIndexes()[1].ns);
     assert.eq('test.loadindexspecns', t.getIndexes()[2].ns);
 }();
+
+var testBackToBackLoads = function() {
+    t1 = db.testb2bloads1;
+    t2 = db.testb2bloads2;
+    t1.drop();
+    t2.drop();
+    beginLoad('testb2bloads1', [ ], { });
+    commitLoad();
+    beginLoad('testb2bloads2', [ ], { });
+    commitLoad();
+    commit();
+    assert(1, t1.count());
+    assert(1, t2.count());
+}
+
+var testSimpleInsert = function() {
+    t = db.loadsimpleinsert;
+    t.drop();
+    beginLoad('loadsimpleinsert', [ ], { });
+    t.insert({ bulkLoaded: 1 });
+    commit();
+    assert(1, t.count());
+}

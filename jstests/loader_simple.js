@@ -23,9 +23,21 @@ var testSimpleAbort = function() {
     t.drop();
     begin();
     beginLoad('loadabort', [ ] , { });
-    rollback();
+    abortLoad();
+    commit();
     assert.eq(0, db.system.namespaces.count({ "name" : "test.loadabort" }));
     t.insert({});
     assert.eq(1, t.count()); // should be re-created by insert aborted load
 }();
 
+var testSimpleAbortRollback = function() {
+    t = db.loadabort;
+    t.drop();
+    begin();
+    beginLoad('loadabort', [ ] , { });
+    abortLoad();
+    rollback();
+    assert.eq(0, db.system.namespaces.count({ "name" : "test.loadabort" }));
+    t.insert({});
+    assert.eq(1, t.count()); // should be re-created by insert aborted load
+}();

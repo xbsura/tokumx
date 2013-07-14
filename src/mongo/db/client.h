@@ -272,8 +272,14 @@ namespace mongo {
         void beginClientLoad(const StringData &ns, const vector<BSONObj> &indexes,
                              const BSONObj &options);
 
-        /** Commit any load in progress. */
+        /** Commit the client load. uasserts if none is in progress. */
         void commitClientLoad();
+
+        /** Abort the client load. uasserts if none is in progress. */
+        void abortClientLoad();
+
+        /** @return true if a load is in progress. */
+        bool loadInProgress() const;
 
     private:
         Client(const char *desc, AbstractMessagingPort *p = 0);

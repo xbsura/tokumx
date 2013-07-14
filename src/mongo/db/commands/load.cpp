@@ -57,6 +57,8 @@ namespace mongo {
                             !cmdObj["options"].ok() || cmdObj["options"].type() == mongo::Object );
             LOG(0) << "Beginning bulk load, cmd: " << cmdObj << endl;
 
+            const string ns = db + "." + cmdObj["ns"].String();
+            const BSONObj &optionsObj = cmdObj["options"].Obj();
             vector<BSONElement> indexElements = cmdObj["indexes"].Array();
             vector<BSONObj> indexes;
             for (vector<BSONElement>::const_iterator i = indexElements.begin(); i != indexElements.end(); i++) {
@@ -67,12 +69,9 @@ namespace mongo {
                 indexes.push_back(obj.copy());
             }
 
-            Client::Transaction transaction(DB_SERIALIZABLE);
-            const string ns = db + "." + cmdObj["ns"].String();
-            cc().beginClientLoad(ns, indexes, cmdObj["options"].Obj());
+            cc().beginClientLoad(ns, indexes, optionsObj);
             result.append("status", "load began");
             result.append("ok", true);
-            transaction.commit();
             return true;
         }
     } beginLoadCmd;
@@ -105,4 +104,35 @@ namespace mongo {
             return true;
         }
     } commitLoadCmd;
-}
+
+    class AbortLoadCmd : public InformationCommand {
+    public:
+        virtual bool adminOnly() const { return false; }
+        virtual bool requiresAuth() { return true; }
+        virtual LockType locktype() const { return OPLOCK; }
+        virtual bool needsTxn() const { return false; }
+        virtual bool logTheOp() { return true; }
+        virtual bool slaveOk() const { return false; }
+        virtual void help( stringstream& help ) const {
+            help << "abort load" << endl <<
+                "Aborts a load in progress." << endl <<
+                "{ abortLoad }" << endl;
+        }
+        AbortLoadCmd() : InformationCommand("abortLoad") {}
+
+        virtual bool run(const string& db, 
+                         BSONObj& cmdObj, 
+                         int options, 
+                         string& errmsg, 
+                         BSONObjBuilder& result, 
+                         bool fromRepl) 
+        {
+            cc().abortClientLoad();
+            result.append("status", "load aborted");
+            result.append("ok", true);
+            return true;
+        }
+    } abortLoadCmd;
+
+} // namespace mongo
+

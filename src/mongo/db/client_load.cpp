@@ -27,28 +27,61 @@
 
 namespace mongo {
 
-    // The client begin/commit/abort load functions handles locking, context,
-    // and ensuring that only one load exists at a time for this client.
+    // The client begin/commit/abort load functions handle locking/context,
+    // creating a child transaction for the load, and ensuring that this client
+    // only loads one ns at a time.
 
     void Client::beginClientLoad(const StringData &ns, const vector<BSONObj> &indexes,
                                  const BSONObj &options) {
         uassert( 16864, "Cannot begin load, one is already in progress",
-                        _bulkLoadNS.empty() );
+                        !loadInProgress() );
 
-        Client::WriteContext ctx(ns);
-        beginBulkLoad(ns, indexes, options);
-        _bulkLoadNS = ns.toString();
+        beginClientTxn(0);
+        try {
+            Client::WriteContext ctx(ns);
+            beginBulkLoad(ns, indexes, options);
+            _bulkLoadNS = ns.toString();
+        } catch (...) {
+            abortTopTxn();
+            _bulkLoadNS.clear();
+            throw;
+        }
     }
 
     void Client::commitClientLoad() {
         uassert( 16876, "Cannot commit client load, none in progress.",
-                        !_bulkLoadNS.empty() );
+                        loadInProgress() );
         const string ns = _bulkLoadNS;
         _bulkLoadNS.clear();
 
-        verify(cc().hasTxn());
-        Client::WriteContext ctx(ns);
-        commitBulkLoad(ns);
+        try {
+            Client::WriteContext ctx(ns);
+            commitBulkLoad(ns);
+        } catch (...) {
+            abortTopTxn();
+            throw;
+        }
+        commitTopTxn();
+    }
+
+    void Client::abortClientLoad() {
+        uassert( 16888, "Cannot abort client load, none in progress.",
+                        loadInProgress() );
+        const string ns = _bulkLoadNS;
+        _bulkLoadNS.clear();
+
+        try {
+            Client::WriteContext ctx(ns);
+            abortBulkLoad(ns);
+        } catch (...) {
+            abortTopTxn();
+            throw;
+        }
+        abortTopTxn();
+    }
+
+    bool Client::loadInProgress() const {
+        return !_bulkLoadNS.empty();
     }
 
 } // namespace mongo

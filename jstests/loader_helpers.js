@@ -1,11 +1,8 @@
 // Common helper functions for loader tests.
 
 function checkError(e, doAssert) {
-    if (e) {
-        //printjson(e);
-        if (doAssert) {
-            assert(!e);
-        }
+    if (e && doAssert) {
+        assert(!e);
     }
 }
 function begin() {
@@ -16,12 +13,12 @@ function begin() {
 function commit() {
     db.runCommand({ 'commitTransaction' : 1 });
     e = db.getLastError();
-    checkError(e, true);
+    checkError(e);
 }
 function rollback() {
     db.runCommand({ 'rollbackTransaction' : 1 });
     e = db.getLastError();
-    checkError(e, true);
+    checkError(e);
 }
 
 // begin/commit load wrappers that may or may not assert on failure
@@ -31,10 +28,17 @@ function _beginLoad(ns, indexes, options, shouldFail) {
     if (e) {
         printjson(e);
     }
-    checkError(e, !shouldFail);
+    if (!shouldFail) {
+        checkError(e);
+    }
 }
 function _commitLoad(shouldFail) {
     db.runCommand({ 'commitLoad' : 1 });
+    e = db.getLastError();
+    checkError(e, !shouldFail);
+}
+function _abortLoad(shouldFail) {
+    db.runCommand({ 'abortLoad' : 1 });
     e = db.getLastError();
     checkError(e, !shouldFail);
 }
@@ -49,6 +53,12 @@ function commitLoad() {
 }
 function commitLoadShouldFail() {
     _commitLoad(true);
+}
+function abortLoad() {
+    _abortLoad(false);
+}
+function abortLoadShouldFail() {
+    _abortLoad(true);
 }
 
 // No indexes, no options.

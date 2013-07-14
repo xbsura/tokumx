@@ -1757,6 +1757,14 @@ namespace mongo {
         verify(closed);
     }
 
+    void abortBulkLoad(const StringData &ns) {
+        NamespaceIndex *ni = nsindex(ns);
+        // Close the ns with aborting = true, which will hint to the
+        // BulkLoadedCollection that it should abort the load.
+        const bool closed = ni->close_ns(ns, true);
+        verify(closed);
+    }
+
     bool legalClientSystemNS( const StringData& ns , bool write ) {
         if( ns == "local.system.replset" ) return true;
 
