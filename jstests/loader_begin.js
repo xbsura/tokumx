@@ -16,6 +16,17 @@ var testNSAlreadyExists = function() {
     assert.eq(1, db.system.namespaces.count({ "name" : "test.loadnsexists" }));
 }();
 
+var testNSProvisionallyExists = function() {
+    t = db.loadnsprovexists;
+    t.drop();
+    begin();
+    s = startParallelShell('db.runCommand({ beginTransaction: 1 });' +
+                           'db.loadnsprovexists.insert({ prov: 1 });' +
+                           'sleep(2000); db.runCommand({ commitTransaction: 1 })');
+    beginLoadShouldFail('loadnsprovexists', [ ], { });
+    commit();
+}();
+
 var testBadIndexes = function() {
     t = db.loadbadindexes;
     t.drop();

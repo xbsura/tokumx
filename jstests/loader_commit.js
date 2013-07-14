@@ -27,7 +27,7 @@ var testValidOptions = function() {
     assert.eq(options.compression, t.stats().indexDetails[0].compression);
 }();
 
-var testValidIndexes = function() {
+var testValidIndex = function() {
     t = db.loadvalidindexes;
     t.drop();
     begin();
@@ -87,15 +87,82 @@ var testIndexSpecNs = function() {
     assert.eq('test.loadindexspecns', t.getIndexes()[2].ns);
 }();
 
-var testIndexedInsert = function() {
-    t = db.loaderindexedinsert;
+var testIndexedInsertCommit = function() {
+    t = db.loaderindexedinsertcommit;
     t.drop();
 
     begin();
-    beginLoad('loaderindexedinsert', [ { key: { a: 1 }, name: "a_1" } ], { } );
+    beginLoad('loaderindexedinsertcommit', [ { key: { a: 1 }, name: "a_1" } ], { } );
     t.insert({ a: 700 } );
     commitLoad();
     commit();
     assert.eq(1, t.count({ a: 700 }));
     assert.eq(1, t.find({a : 700}).hint({ a: 1 }).itcount());
+}();
+
+var testUsableAfterCommit = function() {
+    t = db.loaderusablecommit;
+    t.drop();
+    begin();
+    beginLoad('loaderusablecommit', [ ], { });
+    t.insert({ duringLoad: 1 });
+    assert(!db.getLastError());
+    commitLoad();
+    commit();
+    assert.eq(1, t.count());
+    assert.eq(1, t.count({ duringLoad: 1 }));
+
+    t.insert({ afterLoad: 1 });
+    assert.eq(2, t.count());
+    assert.eq(1, t.count({ duringLoad: 1 }));
+    assert.eq(1, t.count({ afterLoad: 1 }));
+    t.remove({ duringLoad: 1 });
+    assert.eq(1, t.count());
+}();
+
+var testExternallyUsableAfterCommit = function() {
+    t = db.loaderusablecommit1;
+    t.drop();
+    begin();
+    beginLoad('loaderusablecommit1', [ ], { });
+    t.insert({ duringLoad: 1 });
+    assert(!db.getLastError());
+    commitLoad();
+    commit();
+    assert.eq(1, t.count());
+    assert.eq(1, t.count({ duringLoad: 1 }));
+
+    s = startParallelShell('k = db.loaderusablecommit1.count(); assert.eq(1, k); db.loaderusablecommit1.insert({ success: 1 });')
+    s();
+    assert.eq(1, t.count({ success: 1 }));
+}();
+
+var testUniquenessConstraint = function() {
+    t = db.loaderunique;
+    t.drop();
+    begin();
+    beginLoad('loaderunique', [ { key: { a: 1 }, name: "a_1", unique: true } ], { } );
+    t.insert({ a: 1 });
+    assert(!db.getLastError());
+    t.insert({ a: 2 });
+    assert(!db.getLastError());
+    t.insert({ a: 2 });
+    assert(!db.getLastError());
+    commitLoadShouldFail();
+    commit();
+    assert.eq(0, t.count());
+
+    // Test rollback (should be the same result)
+    t.drop();
+    begin();
+    beginLoad('loaderunique', [ { key: { a: 1 }, name: "a_1", unique: true } ], { } );
+    t.insert({ _id: 1 });
+    assert(!db.getLastError());
+    t.insert({ _id: 2 });
+    assert(!db.getLastError());
+    t.insert({ _id: 2 });
+    assert(!db.getLastError());
+    commitLoadShouldFail();
+    rollback();
+    assert.eq(0, t.count());
 }();

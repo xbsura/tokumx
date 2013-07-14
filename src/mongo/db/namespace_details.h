@@ -123,6 +123,9 @@ namespace mongo {
         // @return whether or the the index was just built.
         bool ensureIndex(const BSONObj &info);
 
+        // Acquire a full table lock on each index.
+        void acquireTableLock();
+
         int nIndexes() const {
             return _nIndexes;
         }
@@ -338,6 +341,7 @@ namespace mongo {
         NamespaceDetails(const StringData& ns, const BSONObj &pkIndexPattern, const BSONObj &options);
         explicit NamespaceDetails(const BSONObj &serialized);
 
+        void checkIndexUniqueness(const IndexDetails &idx);
         void buildIndex(shared_ptr<IndexDetails> &index);
 
         void insertIntoIndexes(const BSONObj &pk, const BSONObj &obj, uint64_t flags);

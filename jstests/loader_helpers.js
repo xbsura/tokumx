@@ -20,23 +20,17 @@ function rollback() {
 function _beginLoad(ns, indexes, options, shouldFail) {
     db.runCommand({ 'beginLoad' : 1, 'ns' : ns, 'indexes' : indexes, 'options' : options });
     e = db.getLastError();
-    if (!shouldFail) {
-        assert(!e);
-    }
+    shouldFail ? assert(e) : assert(!e);
 }
 function _commitLoad(shouldFail) {
     db.runCommand({ 'commitLoad' : 1 });
     e = db.getLastError();
-    if (!shouldFail) {
-        assert(!e);
-    }
+    shouldFail ? assert(e) : assert(!e);
 }
 function _abortLoad(shouldFail) {
     db.runCommand({ 'abortLoad' : 1 });
     e = db.getLastError();
-    if (!shouldFail) {
-        assert(!e);
-    }
+    shouldFail ? assert(e) : assert(!e);
 }
 function beginLoad(ns, indexes, options) {
     _beginLoad(ns, indexes, options, false);

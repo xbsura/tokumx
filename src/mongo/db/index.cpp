@@ -208,6 +208,13 @@ namespace mongo {
         }
     }
 
+    void IndexDetails::acquireTableLock() {
+        const int r = _db->pre_acquire_table_lock(_db, cc().txn().db_txn());
+        if (r != 0) {
+            storage::handle_ydb_error(r);
+        }
+    }
+
     enum toku_compression_method IndexDetails::getCompressionMethod() const {
         enum toku_compression_method ret;
         int r = _db->get_compression_method(_db, &ret);

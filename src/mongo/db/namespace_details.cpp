@@ -717,6 +717,13 @@ namespace mongo {
                 // TODO: This is where we call _loader->abort()
             } else {
                 // TODO: This is where we call _loader->close()
+                for (IndexVector::iterator it = _indexes.begin(); it != _indexes.end(); ++it) {
+                    IndexDetails &idx = *it->get();
+                    // The PK's uniqueness is verified on loader close, so we should not check it again.
+                    if (!isPKIndex(idx) && idx.unique()) {
+                        checkIndexUniqueness(idx);
+                    }
+                }
             }
             NamespaceDetails::close();
         }
@@ -1097,6 +1104,19 @@ namespace mongo {
         NamespaceDetailsTransient::get(thisns).clearQueryCache();
     }
 
+    void NamespaceDetails::checkIndexUniqueness(const IndexDetails &idx) {
+        IndexScanCursor c(this, idx, 1);
+        BSONObj prevKey = c.currKey().getOwned();
+        c.advance();
+        for ( ; c.ok(); c.advance() ) {
+            BSONObj currKey = c.currKey(); 
+            if (currKey == prevKey) {
+                idx.uassertedDupKey(currKey);
+            }
+            prevKey = currKey.getOwned();
+        }
+    }
+
     void NamespaceDetails::buildIndex(shared_ptr<IndexDetails> &index) {
         _indexBuildInProgress = true;
 
@@ -1104,7 +1124,7 @@ namespace mongo {
 
         const int indexNum = idxNo(*index);
         for ( shared_ptr<Cursor> cursor(BasicCursor::make(this));
-              cursor->ok(); cursor->advance()) {
+              cursor->ok(); cursor->advance() ) {
             BSONObj pk = cursor->currPK();
             BSONObj obj = cursor->current();
             BSONObjSet keys;
@@ -1122,16 +1142,7 @@ namespace mongo {
 
         // If the index is unique, check all adjacent keys for a duplicate.
         if (index->unique()) {
-            IndexScanCursor c(this, *index, 1);
-            BSONObj prevKey = c.currKey().getOwned();
-            c.advance();
-            for ( ; c.ok(); c.advance()) {
-                BSONObj currKey = c.currKey(); 
-                if (currKey == prevKey) {
-                    index->uassertedDupKey(currKey);
-                }
-                prevKey = currKey.getOwned();
-            }
+            checkIndexUniqueness(*index);
         }
 
         _indexBuildInProgress = false;
@@ -1379,6 +1390,13 @@ namespace mongo {
         createIndex(info);
         addIndexToCatalog(info);
         return true;
+    }
+
+    void NamespaceDetails::acquireTableLock() {
+        for (IndexVector::iterator it = _indexes.begin(); it != _indexes.end(); ++it) {
+            IndexDetails &idx = *it->get();
+            idx.acquireTableLock();
+        }
     }
 
     /* ------------------------------------------------------------------------- */
@@ -1726,6 +1744,7 @@ namespace mongo {
 
         NamespaceIndex *ni = nsindex(ns);
         NamespaceDetails *d = ni->details(ns);
+        d->acquireTableLock();
         for (vector<BSONObj>::const_iterator i = indexes.begin(); i != indexes.end(); i++) {
             BSONObj index = *i;
             const BSONElement &e = index["ns"];
