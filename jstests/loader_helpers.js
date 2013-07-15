@@ -20,6 +20,7 @@ function rollback() {
 function _beginLoad(ns, indexes, options, shouldFail) {
     db.runCommand({ 'beginLoad' : 1, 'ns' : ns, 'indexes' : indexes, 'options' : options });
     e = db.getLastError();
+    printjson(e);
     shouldFail ? assert(e) : assert(!e);
 }
 function _commitLoad(shouldFail) {

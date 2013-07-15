@@ -23,8 +23,24 @@ var testNSProvisionallyExists = function() {
     s = startParallelShell('db.runCommand({ beginTransaction: 1 });' +
                            'db.loadnsprovexists.insert({ prov: 1 });' +
                            'sleep(2000); db.runCommand({ commitTransaction: 1 })');
+    sleep(500);
     beginLoadShouldFail('loadnsprovexists', [ ], { });
     commit();
+    s();
+}();
+
+var testNSProvisionallyDropped = function() {
+    t = db.loadnsprovdropped;
+    t.drop();
+    t.insert({ prov: 1 });
+    begin();
+    s = startParallelShell('db.runCommand({ beginTransaction: 1 });' +
+                           'db.loadnsprovdropped.drop(); ' +
+                           'sleep(2000); db.runCommand({ commitTransaction: 1 })');
+    sleep(500);
+    beginLoadShouldFail('loadnsprovdropped', [ ], { });
+    commit();
+    s();
 }();
 
 var testBadIndexes = function() {
