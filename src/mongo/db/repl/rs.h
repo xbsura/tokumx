@@ -363,8 +363,6 @@ namespace mongo {
         bool _replOplogPurgeRunning;
         bool _replBackgroundShouldRun;
 
-        // protected by the RSLock
-        bool _initialSyncDone;
 
         // for purge thread
         boost::mutex _purgeMutex;
@@ -502,6 +500,8 @@ namespace mongo {
         unsigned selfId() const { return _id; }
         Manager *mgr;
         GhostSync *ghost;
+        // protected by the RSLock
+        bool _initialSyncDone;
         /**
          * This forces a secondary to go into recovering state and stay there
          * until this is called again, passing in "false".  Multiple threads can
