@@ -50,7 +50,7 @@ var testMultiStatementCommit = function() {
     begin();
     t.insert({});
     assert.eq(1, t.count());
-    beginLoad({ 'loadermstcommit2'}, [ ], { });
+    beginLoad('loadermstcommit2', [ ], { });
     commitLoad();
     assert.eq(1, t.count());
     t.insert({});
@@ -64,7 +64,7 @@ var testMultiStatementCommit = function() {
     begin();
     t.insert({});
     assert.eq(1, t.count());
-    beginLoad({ 'loadermstcommit2'}, [ ], { });
+    beginLoad('loadermstcommit2', [ ], { });
     commitLoad();
     assert.eq(1, t.count());
     t.insert({});
@@ -81,7 +81,7 @@ var testMultiStatementAbort = function() {
     begin();
     t.insert({});
     assert.eq(1, t.count());
-    beginLoad({ 'loadermstabort2'}, [ ], { });
+    beginLoad('loadermstabort2', [ ], { });
     abortLoad();
     assert.eq(1, t.count());
     t.insert({});
@@ -95,11 +95,42 @@ var testMultiStatementAbort = function() {
     begin();
     t.insert({});
     assert.eq(1, t.count());
-    beginLoad({ 'loadermstabort2'}, [ ], { });
+    beginLoad('loadermstabort2', [ ], { });
     abortLoad();
     assert.eq(1, t.count());
     t.insert({});
     assert.eq(2, t.count());
+    rollback();
+    assert.eq(0, t.count());
+}();
+
+var testUnrelatedOpsDuringLoad = function() {
+    t = db.loaderunrelated;
+    t2 = db.loaderunrelated2;
+    t.drop();
+    t2.drop();
+    begin();
+    beginLoad('loaderunrelated2', [ ], { });
+    t.insert({});
+    assert.eq(1, t.count());
+    commitLoad();
+    assert.eq(1, t.count());
+    t.insert({});
+    assert.eq(2, t.count());
+    commit();
+    assert.eq(2, t.count());
+
+    // Test rollback
+    t.drop();
+    t2.drop();
+    begin();
+    beginLoad('loaderunrelated2', [ ], { });
+    t.insert({});
+    assert.eq(1, t.count());
+    abortLoad();
+    assert.eq(0, t.count());
+    t.insert({});
+    assert.eq(1, t.count());
     rollback();
     assert.eq(0, t.count());
 }();

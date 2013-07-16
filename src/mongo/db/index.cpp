@@ -99,7 +99,7 @@ namespace mongo {
             }
 
             if (!StringData(pns).endsWith(".system.indexes")) {
-                int n = removeFromSysIndexes(pns, indexName());
+                const int n = removeFromSysIndexes(pns, indexName());
                 wassert( n == 1 );
             }
         }

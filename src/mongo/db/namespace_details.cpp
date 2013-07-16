@@ -272,6 +272,11 @@ namespace mongo {
         // strip out the _id field before inserting into a system collection
         void insertObject(BSONObj &obj, uint64_t flags) {
             obj = beautify(obj);
+            BSONObj result;
+            const bool exists = findOne(obj, result);
+            massert( 16891, str::stream() << "bug: system catalog tried to insert " <<
+                            obj << ", but similar object exists: " << result,
+                            !exists);
             NaturalOrderCollection::insertObject(obj, flags);
         }
 
@@ -760,7 +765,6 @@ namespace mongo {
         // namespace has been closed / re-opened.
         ConnectionId _bulkLoadConnectionId;
     };
-
 
     /* ------------------------------------------------------------------------- */
 
@@ -1388,7 +1392,6 @@ namespace mongo {
             return false;
         }
         createIndex(info);
-        addIndexToCatalog(info);
         return true;
     }
 
@@ -1746,8 +1749,8 @@ namespace mongo {
         NamespaceDetails *d = ni->details(ns);
         d->acquireTableLock();
         for (vector<BSONObj>::const_iterator i = indexes.begin(); i != indexes.end(); i++) {
-            BSONObj index = *i;
-            const BSONElement &e = index["ns"];
+            BSONObj info = *i;
+            const BSONElement &e = info["ns"];
             if (e.ok()) {
                 uassert( 16886, "Each index spec's ns field, if provided, must match the loaded ns.",
                                 e.type() == mongo::String && e.Stringdata() == ns );
@@ -1755,12 +1758,13 @@ namespace mongo {
                 // Add the ns field if it wasn't provided.
                 BSONObjBuilder b;
                 b.append("ns", ns);
-                b.appendElements(index);
-                index = b.obj();
+                b.appendElements(info);
+                info = b.obj();
             }
             uassert( 16887, "Each index spec must have a string name field.",
-                            index["name"].ok() && index["name"].type() == mongo::String );
-            d->ensureIndex(index);
+                            info["name"].ok() && info["name"].type() == mongo::String );
+            d->ensureIndex(info);
+            addIndexToCatalog(info);
         }
 
         // Now the ns exists. Close it and re-open it in "bulk load" mode.
