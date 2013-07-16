@@ -421,7 +421,6 @@ namespace mongo {
         _replInfoUpdateRunning(false),
         _replOplogPurgeRunning(false),
         _replBackgroundShouldRun(true),
-        _initialSyncDone(false),
         elect(this),
         _forceSyncTarget(0),
         _blockSync(false),
@@ -429,7 +428,8 @@ namespace mongo {
         _self(0),
         _maintenanceMode(0),
         mgr( new Manager(this) ),
-        ghost( new GhostSync(this) ) {
+        ghost( new GhostSync(this) ),
+        _initialSyncDone(false) {
 
         _cfg = 0;
         memset(_hbmsg, 0, sizeof(_hbmsg));
@@ -462,7 +462,6 @@ namespace mongo {
         _replInfoUpdateRunning(false),
         _replOplogPurgeRunning(false),
         _replBackgroundShouldRun(true),
-        _initialSyncDone(false),
         elect(this),
         _forceSyncTarget(0),
         _blockSync(false),
@@ -471,7 +470,9 @@ namespace mongo {
         _maintenanceMode(0),
         mgr(0),
         ghost(0),
-        oplogVersion(0) {
+        _initialSyncDone(false),
+        oplogVersion(0)
+        {
     }
 
     ReplSet::ReplSet(ReplSetCmdline& replSetCmdline) : ReplSetImpl(replSetCmdline) {}
