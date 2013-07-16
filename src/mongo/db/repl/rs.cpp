@@ -421,6 +421,7 @@ namespace mongo {
         _replInfoUpdateRunning(false),
         _replOplogPurgeRunning(false),
         _replBackgroundShouldRun(true),
+        _initialSyncDone(false),
         elect(this),
         _forceSyncTarget(0),
         _blockSync(false),
@@ -458,6 +459,10 @@ namespace mongo {
     }
 
     ReplSetImpl::ReplSetImpl() :
+        _replInfoUpdateRunning(false),
+        _replOplogPurgeRunning(false),
+        _replBackgroundShouldRun(true),
+        _initialSyncDone(false),
         elect(this),
         _forceSyncTarget(0),
         _blockSync(false),
@@ -569,11 +574,17 @@ namespace mongo {
             boost::unique_lock<boost::mutex> lock(stateChangeMutex);
             RSBase::lock lk(this);
             Lock::GlobalWrite writeLock;
-            // temporarily change state to secondary to follow pattern
-            // that all threads going live as secondary are transitioning
-            // from RS_RECOVERING.
-            changeState(MemberState::RS_RECOVERING);
-            tryToGoLiveAsASecondary();
+            _initialSyncDone = true;
+            // if we are no longer in the startup2 state, because
+            // we have been shunned by a new config, don't start replication
+            // we should be waiting on another thread on a new config
+            if (box.getState().startup2()) {
+                // temporarily change state to secondary to follow pattern
+                // that all threads going live as secondary are transitioning
+                // from RS_RECOVERING.
+                changeState(MemberState::RS_RECOVERING);
+                tryToGoLiveAsASecondary();
+            }
         }
     }
 
@@ -956,9 +967,14 @@ namespace mongo {
             }
             // if necessary, restart replication
             if (isSecondary()) {
-                log() << "starting replication because we have a new config" << endl;
-                startReplication();
-                log() << "started replication because we have a new config" << endl;
+                if (_initialSyncDone) {
+                    log() << "starting replication because we have a new config" << endl;
+                    startReplication();
+                    log() << "started replication because we have a new config" << endl;
+                }
+                else {
+                    log() << "NOT starting replication because we have a new config, but initial sync is not yet done" << endl;
+                }
             }
             else {
                 log() << "NOT starting replication because we have a new config" << endl;

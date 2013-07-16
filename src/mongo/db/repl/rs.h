@@ -363,6 +363,9 @@ namespace mongo {
         bool _replOplogPurgeRunning;
         bool _replBackgroundShouldRun;
 
+        // protected by the RSLock
+        bool _initialSyncDone;
+
         // for purge thread
         boost::mutex _purgeMutex;
         boost::condition _purgeCond;
