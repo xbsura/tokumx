@@ -73,6 +73,7 @@ namespace mongo {
         // for master/slave replication
         std::string source;    // --source
         std::string only;      // --only
+        std::string rsSyncFrom; //  --syncFrom
 
         bool quiet;            // --quiet
         bool noTableScan;      // --notablescan no table scans allowed

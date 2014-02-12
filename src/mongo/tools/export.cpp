@@ -41,6 +41,9 @@ public:
         add_options()
         ("query,q" , po::value<string>() , "query filter, as a JSON string" )
         ("csv","export to csv instead of json")
+        ("noheaders", "don't output csv column names")
+        ("fields-terminated-by,y",po::value<string>()->default_value(",") ,"Use in conjunction with the --csv option to specify a delimiter" )
+        ("lines-terminated-by,l",po::value<string>()->default_value("\n") ,"Use in conjunction with the --csv option to specify end of line" )
         ("out,o", po::value<string>(), "output file; if not specified, stdout is used")
         ("jsonArray", "output to a json array rather than one object per line")
         ("slaveOk,k", po::value<bool>()->default_value(true) , "use secondaries for export if available, default true")
@@ -134,8 +137,20 @@ public:
 
     int run() {
         string ns;
+        string delimiter,lines_terminal;
+        if( hasParam("fields-terminated-by"))
+        	delimiter =getParam( "fields-terminated-by" );
+        else
+        	delimiter=",";
+        if( hasParam("lines-terminated-by"))
+        	lines_terminal =getParam( "lines-terminated-by" );
+        else
+        	lines_terminal="\n";	
+        	
         const bool csv = hasParam( "csv" );
+        const bool showHeaders = ! hasParam( "noheaders" );
         const bool jsonArray = hasParam( "jsonArray" );
+        
         ostream *outPtr = &cout;
         string outfile = getParam( "out" );
         auto_ptr<ofstream> fileStream;
@@ -198,7 +213,7 @@ public:
 
         auto_ptr<DBClientCursor> cursor = conn().query( ns.c_str() , q , 0 , 0 , fieldsToReturn , ( slaveOk ? QueryOption_SlaveOk : 0 ) | QueryOption_NoCursorTimeout );
 
-        if ( csv ) {
+        if ( csv && showHeaders ) {
             for ( vector<string>::iterator i=_fields.begin(); i != _fields.end(); i++ ) {
                 if ( i != _fields.begin() )
                     out << ",";
@@ -217,13 +232,13 @@ public:
             if ( csv ) {
                 for ( vector<string>::iterator i=_fields.begin(); i != _fields.end(); i++ ) {
                     if ( i != _fields.begin() )
-                        out << ",";
+                        out << delimiter;
                     const BSONElement & e = obj.getFieldDotted(i->c_str());
                     if ( ! e.eoo() ) {
                         out << csvString(e);
                     }
                 }
-                out << endl;
+                out << lines_terminal;
             }
             else {
                 if (jsonArray && num != 1)
@@ -239,7 +254,7 @@ public:
         if (jsonArray)
             out << ']' << endl;
 
-        cerr << "exported " << num << " records" << endl;
+        cout << "exported " << num << " records" << endl;
 
         return 0;
     }

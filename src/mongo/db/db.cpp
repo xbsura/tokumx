@@ -727,6 +727,7 @@ static void buildOptionsDescriptions(po::options_description *pVisible,
     rs_options.add_options()
     ("replSet", po::value<string>(), "arg is <setname>[/<optionalseedhostlist>]")
     ("replIndexPrefetch", po::value<string>(), "specify index prefetching behavior (if secondary) [none|_id_only|all]")
+    ("syncFrom", po::value<string>(),"specify sync target when doing initial sync")
     ;
 
     sharding_options.add_options()
@@ -1026,6 +1027,9 @@ static void processCommandLineOptions(const std::vector<std::string>& argv) {
         }
         if (params.count("replIndexPrefetch")) {
             out() << " replIndexPrefetch is a deprecated parameter" << endl;
+        }
+        if (params.count("syncFrom")) {
+        cmdLine.rsSyncFrom = params["syncFrom"].as<string>();
         }
         if (params.count("only")) {
             cmdLine.only = params["only"].as<string>().c_str();

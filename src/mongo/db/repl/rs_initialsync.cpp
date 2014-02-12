@@ -380,6 +380,16 @@ namespace mongo {
             sethbmsg("I'm already primary, no need for initial sync",0);
             return true;
         }
+        
+        //set initial syncFrom
+        string syncfrom=cmdLine.rsSyncFrom;
+        string errmsg;
+        BSONObjBuilder result;
+        if (!syncfrom.empty()) { 
+          log()<<"sync from:"<<syncfrom<<endl;
+	        bool ok=theReplSet->forceSyncFrom(syncfrom,errmsg,result);
+	        if( !ok ) log()<<"sync from not ok"<<endl;
+        }
 
         const Member *source = NULL;
         OplogReader r;
